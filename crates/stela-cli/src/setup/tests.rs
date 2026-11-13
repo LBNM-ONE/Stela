@@ -5052,7 +5052,7 @@ fn a_usb_made_without_an_nvidia_gpu_needs_no_firmware_step() {
         lines.push(line);
     }
     assert_eq!(lines[0], lines[1]);
-    assert!(lines[0].contains("64 files, 115.7 MiB"), "{}", lines[0]);
+    assert!(lines[0].contains("75 files, 118.4 MiB"), "{}", lines[0]);
     f.host.nvidia_gpus.borrow_mut().clear();
     let report = setup(&environment(&f.host), installed_command(&f)).unwrap();
     assert!(!report.contains("NVIDIA"), "{report}");
