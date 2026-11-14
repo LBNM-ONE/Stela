@@ -1,5 +1,6 @@
 //! Linux: sysfs gives each block device's disk, size and serial number;
-//! `lsblk` lists the partitions with their GPT types, GUIDs and mounts;
+//! `lsblk` lists the partitions with their GPT types, GUIDs and mounts, and
+//! the kernel's uevent gives a GUID udev's probe left out;
 //! `udisksctl` mounts and unmounts where it runs, `mount` and `umount`
 //! otherwise. Partitions are read and written through `/dev`, and a USB is
 //! erased by writing setup's own layout to its whole disk.
@@ -197,6 +198,24 @@ fn checked(name: &str, partition: bool) -> Result<()> {
     Ok(())
 }
 
+/// The value of `key` in a sysfs `uevent` file's `KEY=value` lines.
+fn uevent_value(text: &str, key: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// The GPT partition GUID the kernel read from the table, from the
+/// partition's uevent. lsblk takes it from udev's probe of the partition,
+/// which can be missing: after setup erased a USB, udev's blkid probe of the
+/// new data partition can fail and leave it without one.
+fn kernel_partuuid(name: &str) -> Option<String> {
+    let path = Path::new("/sys/class/block").join(name).join("uevent");
+    uevent_value(&fs::read_to_string(path).ok()?, "PARTUUID")
+}
+
 fn read_trimmed(path: &Path) -> Option<String> {
     fs::read_to_string(path)
         .ok()
@@ -346,6 +365,9 @@ impl Host for System {
             guid: device
                 .partuuid
                 .as_deref()
+                .filter(|guid| !guid.is_empty())
+                .map(str::to_owned)
+                .or_else(|| kernel_partuuid(identifier))
                 .unwrap_or_default()
                 .to_ascii_uppercase(),
             bytes: device.size,
@@ -677,5 +699,20 @@ mod tests {
             removal,
             [Removal::Fixed, Removal::Fixed, Removal::Typed, Removal::Usb]
         );
+    }
+
+    #[test]
+    fn a_partition_udev_did_not_probe_has_the_kernels_guid() {
+        // A freshly erased USB's data partition, as this kernel describes it.
+        let uevent = "MAJOR=8\nMINOR=18\nDEVNAME=sdb2\nDEVTYPE=partition\nDISKSEQ=184\n\
+                      PARTN=2\nPARTNAME=STELA\nPARTUUID=f8034ebf-6546-4b15-9734-a7f1f424430f\n";
+        assert_eq!(
+            uevent_value(uevent, "PARTUUID").as_deref(),
+            Some("f8034ebf-6546-4b15-9734-a7f1f424430f")
+        );
+        assert_eq!(uevent_value(uevent, "PARTN").as_deref(), Some("2"));
+        // A partition without a GUID, as on an MBR disk, has none.
+        assert_eq!(uevent_value("PARTN=1\n", "PARTUUID"), None);
+        assert_eq!(uevent_value("PARTUUID=\n", "PARTUUID"), None);
     }
 }
