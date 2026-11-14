@@ -809,7 +809,35 @@ aggiunge a `choices.cfg` duplicando quella di Install macOS con
   remapping (AMD-Vi), quindi rifiuta il framebuffer del firmware e ogni
   requester. Corretto in `e71e33aaf`: il contenimento accetta quel bit sui
   bridge ISA di AMD e ATI, e il log lo dice con «HOST PCI 0000:00:14.3
-  keeps Bus Master set». La terza prova è da fare.
+  keeps Bus Master set».
+- Terza prova (2026-11-15): il log sulla chiavetta finisce a «Taking
+  control of the other processors», e sul disco interno non ce n'è copia.
+  Lo schermo (foto dell'utente) mostra l'avvio dei dispositivi fallito:
+  `0000:04:00.0 failed: device timeout` (NVMe), «xHCI host controller died»
+  sul controller USB `0f:00.0`, «Disks found: none». Nella seconda prova,
+  senza IOMMU, gli stessi dispositivi partivano: con il contenimento ora
+  riuscito Stela ha preso per la prima volta l'unità AMD-Vi di questo PC
+  (dedotto, non registrato), e il DMA che passa da lei non arriva. Un'unità
+  AMD-Vi si avvelena al primo evento nel suo registro o al primo bit di
+  stato inatteso e da lì rifiuta ogni lavoro, ma nessuno leggeva quel
+  registro. `7ede21755` lo legge e, quando dischi e USB non partono, mostra
+  sullo schermo lo stato dell'unità e i primi quattro eventi (tipo,
+  requester, indirizzo, flag). La quarta prova, con questa immagine, deve
+  fotografare quelle righe.
+
+**Upstream (verificato il 2026-11-15).** tylertms/Stela è alla 0.4.1
+(`984088526`), 404 commit dopo `f39ffb345`, la base di questo branch. Tra
+quelli: il Bus Master fisso dei bridge ISA nel contenimento (`4f8d5b58c`),
+diverse correzioni alla presa delle unità AMD-Vi sui PC reali
+(`88eb7eef2`, `01010759f`, `8fa130a50`, `80a246966`), l'RTL8125 che fermava
+l'avvio senza messaggi (`2029f5101`) e correzioni al ripristino
+(`bb170b834`, `1b8a40d18`). Un'unione di prova (`git merge-tree`) dà
+conflitti in 13 file: README, `gpu_status.rs`, `engine/gpu.rs`,
+`engine/start.rs`, i due `containment.rs`, `setup/firmware.rs`,
+`setup/tests.rs`, il modello di test AMD-Vi, `cold.rs` e i suoi test,
+`recipes.rs` e i test del bundle. Il 2026-11-15 l'utente ha scelto di fare
+prima la quarta prova con l'immagine attuale; l'unione di upstream è il
+passo dopo.
 
 ## Controlli sul PC (Linux)
 
@@ -949,7 +977,13 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   con amdgpu ricostruita. Non pushati quando è stata scritta questa nota.
   Restano aperti, nel cuore di Stela: il blocco sull'RTL8125D, il motore
   fermo a circa 110 s durante Install macOS e il panic di `--serialized`.
+- 2026-11-15, sessione locale sul PC: terza prova del GPU check, fallita
+  sull'IOMMU AMD-Vi (vedi «Prova sul PC: risultati»). Un commit di codice,
+  `7ede21755`, che mostra gli eventi dell'unità; test di
+  `stela-driver-base` (1021) e clippy puliti, immagine release diagnostica
+  con amdgpu ricostruita. Non pushato quando è stata scritta questa nota.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
-  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la terza prova del GPU
-  check (vedi «Prova sul PC: risultati»). Sentire l'upstream resta
-  consigliato prima degli strati che costano mesi (RADV, Metal, display).
+  passi 1, 2 e 3. Il passo 4 è fatto; i prossimi sono la quarta prova del
+  GPU check, poi l'unione di upstream 0.4.1 (vedi «Prova sul PC:
+  risultati»). Sentire l'upstream resta consigliato prima degli strati che
+  costano mesi (RADV, Metal, display).
