@@ -81,6 +81,39 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
         }
         Ok(())
     }
+    pub(super) fn evidence(&self) -> Result<Evidence, Error> {
+        let event_head = self.read(EVENT_HEAD)?;
+        let event_tail = self.read(EVENT_TAIL)?;
+        let mut events = Vec::new();
+        events
+            .try_reserve_exact(EVIDENCE_EVENTS)
+            .map_err(|_| Error::Exhausted)?;
+        let mut at = ring_offset(event_head);
+        while at != ring_offset(event_tail) && events.len() < EVIDENCE_EVENTS {
+            let entry = self.resources.event.pointer(at, EVENT_BYTES)?.cast::<u32>();
+            let words = core::array::from_fn(|index| {
+                // SAFETY: an aligned slot of this unit's coherent event ring,
+                // which only the unit writes; no Rust reference aliases it.
+                u32::from_le(unsafe { entry.as_ptr().add(index).read_volatile() })
+            });
+            events.push(Event(words));
+            at = (at + EVENT_BYTES) % RING_BYTES;
+        }
+        Ok(Evidence {
+            status: self.read(STATUS)?,
+            control: self.read(CONTROL)?,
+            written_control: self.control,
+            event_head,
+            event_tail,
+            hardware_events: if self.hardware_errors {
+                Some(self.read(HARDWARE_EVENT_STATUS)?)
+            } else {
+                None
+            },
+            poisoned: self.poisoned.get(),
+            events,
+        })
+    }
     pub(super) fn health(&self) -> Result<(), Error> {
         if self.poisoned.get() || self.retired.get() {
             return Err(Error::Poisoned);

@@ -717,9 +717,27 @@ impl Remappers {
         }
     }
 
+    /// Each AMD-Vi unit's account ([`amd::Taken::account`]) in the log and
+    /// on the screen, for a device start that failed: a fault in a unit
+    /// stops every requester's DMA through it, and the USB's log may be out
+    /// of reach.
+    pub(super) fn show_amd_units(&self) {
+        for taken in &self.amd {
+            for line in taken.account() {
+                output::arguments(format_args!("HOST {line}\n"));
+                crate::status::info(&line);
+            }
+        }
+    }
+
     /// Report the faults each taken unit recorded: DMA a device sent outside
-    /// its domain.
+    /// its domain. An AMD-Vi unit's account gives its state and first events.
     pub(super) fn report_faults(&self) {
+        for taken in &self.amd {
+            for line in taken.account() {
+                output::arguments(format_args!("HOST {line}\n"));
+            }
+        }
         for taken in &self.taken {
             match taken.unit.pending_faults() {
                 Ok(faults) => {

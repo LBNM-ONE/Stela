@@ -5,7 +5,7 @@
 use super::{CLAIMED_DISPLAYS, InactiveFirmwareUnits};
 use crate::Result;
 use crate::{native_mmio, output};
-use alloc::{boxed::Box, format, rc::Rc, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, format, rc::Rc, string::String, sync::Arc, vec, vec::Vec};
 use core::{cell::RefCell, mem::ManuallyDrop, ops::Range, ptr::NonNull};
 use stela_boot_core::remapping::initial::{self, Candidate, Left, Mode};
 use stela_boot_core::remapping::{self, Present};
@@ -580,6 +580,52 @@ pub(super) unsafe fn take(
 }
 
 impl Taken {
+    /// The unit in a few lines, for the log, and for the screen when a
+    /// device start failed: how it started, its status and control, and its
+    /// event log's first entries. One fault poisons the unit, which then
+    /// refuses every requester's work, so the first event names the cause.
+    pub(super) fn account(&self) -> Vec<String> {
+        let name = format!("IOMMU AMD-Vi {}", self.own);
+        let evidence = match self.unit.try_borrow() {
+            Ok(unit) => unit.evidence(),
+            Err(_) => Err(Error::Busy),
+        };
+        let evidence = match evidence {
+            Ok(evidence) => evidence,
+            Err(error) => return vec![format!("{name}: its state cannot be read ({error:?})")],
+        };
+        let start = if self.claims.is_some() {
+            "started blocked"
+        } else {
+            "started with the drivers' window"
+        };
+        let requesters = self.requesters.try_borrow().map_or(0, |found| found.len());
+        let hardware = evidence.hardware_events.map_or(String::new(), |status| {
+            format!(", hardware event status {status:#x}")
+        });
+        let mut lines = vec![format!(
+            "{name} ({start}, {requesters} requesters): status {:#x}, control {:#x} \
+             (written {:#x}){hardware}, {} events logged{}",
+            evidence.status,
+            evidence.control,
+            evidence.written_control,
+            evidence.logged(),
+            if evidence.poisoned {
+                ", refusing all work after a fault"
+            } else {
+                ""
+            },
+        )];
+        lines.extend(
+            evidence
+                .events
+                .iter()
+                .enumerate()
+                .map(|(index, event)| format!("{name} event {}: {event}", index + 1)),
+        );
+        lines
+    }
+
     pub(super) fn read_original_config(
         &self,
         address: Address,

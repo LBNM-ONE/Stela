@@ -34,6 +34,9 @@ const SPACE: AddressSpace = AddressSpace {
 };
 const PHYSICAL: u64 = 0x000f_ffff_ffff_f000;
 const FEATURES: u64 = (1 << 6) | (1 << 8);
+/// The entry Mode::Event logs: an IO_PAGE_FAULT for a write by requester
+/// 0x20 to 0x1000, outside its domain.
+pub(super) const PAGE_FAULT: [u32; 4] = [0x20, 2 << 28 | 0x20 << 16, 0x1000, 0];
 
 struct Registers {
     cpu: NonNull<u8>,
@@ -482,6 +485,13 @@ impl DevicePeer {
             }
             Mode::Event => {
                 self.registers.write(COMMAND_HEAD, head as u64);
+                let ring = self.registers.read(EVENT_BASE) & PHYSICAL;
+                assert_eq!(self.registers.read(EVENT_BASE) >> 56, 9);
+                let cpu = pointer(&state, ring, EVENT_BYTES).cast::<u32>();
+                for (index, word) in PAGE_FAULT.into_iter().enumerate() {
+                    // SAFETY: the first slot of the unit's kept event ring.
+                    unsafe { cpu.add(index).write_volatile(word.to_le()) };
+                }
                 self.registers.write(EVENT_TAIL, 16);
             }
             Mode::Overflow => {

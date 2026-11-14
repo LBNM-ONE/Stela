@@ -43,6 +43,7 @@ use alloc::{rc::Rc, sync::Arc, vec::Vec};
 use buffer::Buffer;
 use core::{
     cell::{Cell, RefCell},
+    fmt,
     mem::ManuallyDrop,
     ops::Range,
     ptr::NonNull,
@@ -72,6 +73,9 @@ const RUNNING: u64 = EVENT_RUNNING | COMMAND_RUNNING;
 const RING_BYTES: usize = 8192;
 const RING_LENGTH: u64 = 9 << 56;
 const COMMAND_BYTES: usize = 16;
+const EVENT_BYTES: usize = 16;
+/// The most event log entries an [`Evidence`] holds.
+const EVIDENCE_EVENTS: usize = 4;
 static QUARANTINED_UNITS: AtomicU64 = AtomicU64::new(0);
 
 /// Exposed cold-unit owners kept on uncertain Drop. Not reset evidence.
@@ -153,6 +157,90 @@ pub unsafe trait ColdPlatform: PageSource + TableVisibility {
         crate::waiting();
         core::hint::spin_loop();
     }
+}
+
+/// One event log entry as the unit wrote it (AMD 48882 rev. 3.11 section
+/// 2.5): a code, the requester it names, flags that depend on the code and
+/// an address. Linux's iommu_print_event reads the same fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Event(pub [u32; 4]);
+
+impl Event {
+    pub fn code(&self) -> u8 {
+        (self.0[1] >> 28) as u8
+    }
+    /// The requester ID, for the codes that name one.
+    pub fn device(&self) -> u16 {
+        self.0[0] as u16
+    }
+    pub fn flags(&self) -> u16 {
+        (self.0[1] >> 16) as u16 & 0xfff
+    }
+    pub fn address(&self) -> u64 {
+        u64::from(self.0[3]) << 32 | u64::from(self.0[2])
+    }
+    /// The code's name in the specification.
+    pub fn name(&self) -> &'static str {
+        match self.code() {
+            1 => "ILLEGAL_DEV_TABLE_ENTRY",
+            2 => "IO_PAGE_FAULT",
+            3 => "DEV_TAB_HARDWARE_ERROR",
+            4 => "PAGE_TAB_HARDWARE_ERROR",
+            5 => "ILLEGAL_COMMAND_ERROR",
+            6 => "COMMAND_HARDWARE_ERROR",
+            7 => "IOTLB_INV_TIMEOUT",
+            8 => "INVALID_DEVICE_REQUEST",
+            _ => "unknown event",
+        }
+    }
+}
+
+impl fmt::Display for Event {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let device = self.device();
+        let [first, second, third, fourth] = self.0;
+        write!(
+            f,
+            "{} requester {:02x}:{:02x}.{} address {:#x} flags {:#05x} \
+             (words {first:08x} {second:08x} {third:08x} {fourth:08x})",
+            self.name(),
+            device >> 8,
+            device >> 3 & 31,
+            device & 7,
+            self.address(),
+            self.flags(),
+        )
+    }
+}
+
+/// A unit's registers and event log as [`Unit::evidence`] read them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Evidence {
+    pub status: u64,
+    pub control: u64,
+    /// The control this owner wrote, which `control` reads while healthy.
+    pub written_control: u64,
+    pub event_head: u64,
+    pub event_tail: u64,
+    /// Hardware Event Status, where the unit implements it.
+    pub hardware_events: Option<u64>,
+    /// Whether this owner refuses all work after a fault.
+    pub poisoned: bool,
+    /// The event log's entries from its head, at most [`EVIDENCE_EVENTS`].
+    pub events: Vec<Event>,
+}
+
+impl Evidence {
+    /// The entries the unit logged between the event log's head and tail.
+    pub fn logged(&self) -> usize {
+        (ring_offset(self.event_tail) + RING_BYTES - ring_offset(self.event_head)) % RING_BYTES
+            / EVENT_BYTES
+    }
+}
+
+/// The byte offset an event log head or tail register holds.
+fn ring_offset(pointer: u64) -> usize {
+    pointer as usize & (RING_BYTES - EVENT_BYTES)
 }
 
 /// Bounded translation and wait resources; no implicit host-sized allocation.
@@ -645,6 +733,14 @@ impl<P: ColdPlatform, C: UnitConfig> Unit<P, C> {
     pub fn check_health(&self) -> Result<(), Error> {
         let _guard = self.engine.resources.platform.enter().map_err(Error::Dma)?;
         self.engine.health()
+    }
+
+    /// The unit's status, control and first logged events, for a report
+    /// after a requester's DMA failed. It only reads: no event is cleared,
+    /// and a poisoned owner stays poisoned.
+    pub fn evidence(&self) -> Result<Evidence, Error> {
+        let _guard = self.engine.resources.platform.enter().map_err(Error::Dma)?;
+        self.engine.evidence()
     }
 
     /// Drain the original window/blocked path before a private attachment.

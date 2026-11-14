@@ -295,6 +295,49 @@ fn queue_wrap_and_completion_store() {
 }
 
 #[test]
+fn evidence_reads_the_event_that_poisoned_the_unit() {
+    let (mut unit, peer) = model::unit();
+    let evidence = unit.evidence().unwrap();
+    assert_eq!(evidence.status, RUNNING);
+    assert_eq!(evidence.control, evidence.written_control);
+    assert!(!evidence.poisoned && evidence.events.is_empty());
+    assert_eq!(evidence.logged(), 0);
+    // SAFETY: The function comes from this peer's owned PCI fixture. No requester
+    // submits DMA or work, and the unit keeps the matching configuration/root epoch.
+    let mut requester = unsafe { unit.attach(function(0x20)) }.unwrap();
+    peer.mode(Mode::Event);
+    assert!(
+        requester
+            .map(
+                peer.pages(4096).into(),
+                Direction::FromDevice,
+                u32::MAX as u64
+            )
+            .is_err()
+    );
+    let evidence = unit.evidence().unwrap();
+    assert!(evidence.poisoned);
+    assert_eq!((evidence.event_head, evidence.event_tail), (0, 16));
+    assert_eq!(evidence.logged(), 1);
+    assert_eq!(evidence.events, [Event(PAGE_FAULT)]);
+    let event = evidence.events[0];
+    assert_eq!(
+        (event.name(), event.device(), event.address(), event.flags()),
+        ("IO_PAGE_FAULT", 0x20, 0x1000, 0x20)
+    );
+    assert_eq!(
+        alloc::format!("{event}"),
+        "IO_PAGE_FAULT requester 00:04.0 address 0x1000 flags 0x020 \
+         (words 00000020 20200000 00001000 00000000)"
+    );
+    assert_eq!(peer.register(EVENT_TAIL), 16, "reading clears no event");
+    assert_eq!(unit.evidence().unwrap(), evidence);
+    // SAFETY: The synchronous requester has no DMA, IRQ or deferred work in flight.
+    // Its bindings keep payload pins until unmap; failed detach leaves the owner intact.
+    assert_eq!(unsafe { requester.detach() }, Err(Error::Poisoned));
+}
+
+#[test]
 fn failed_unmap_keeps_payload() {
     let (mut unit, peer) = model::unit();
     // SAFETY: The function comes from this peer's owned PCI fixture. No requester
