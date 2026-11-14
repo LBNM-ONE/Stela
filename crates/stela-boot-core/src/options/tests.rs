@@ -39,9 +39,14 @@ fn diagnostic_options_are_typed() {
             "--system --native-cores 2 --native-shared-check",
             "--native-shared-check",
         ),
+        ("--system --gpu-check", "--gpu-check"),
     ] {
         assert_eq!(System::parse(text).unwrap().diagnostic_option(), Some(flag));
     }
+    // The check's flag survives the option line a startup choice holds.
+    let checked = System::parse("--system --gpu-check").unwrap();
+    assert!(checked.gpu_check);
+    assert!(System::parse(&checked.to_string()).unwrap().gpu_check);
 }
 
 #[test]

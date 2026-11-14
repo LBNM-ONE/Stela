@@ -301,6 +301,10 @@ pub struct System {
     pub audio_check: Option<AudioCheck>,
     /// Explicit whole-controller handoff for the audio check's physical clock.
     pub audio_own_hpet: bool,
+    /// Claim the GPUs and start them in the host's Linux environment, as a
+    /// macOS boot does after the disks, then stop: the boot log holds what
+    /// their drivers did (`--gpu-check`).
+    pub gpu_check: bool,
     /// Exclusive handoff of the original IOAPICs through shutdown.
     pub native_pci_own_ioapic: bool,
     /// Whole host disks, by serial, that the guest sees as USB mass
@@ -400,6 +404,7 @@ impl Default for System {
             network_check: None,
             audio_check: None,
             audio_own_hpet: false,
+            gpu_check: false,
             native_pci_own_ioapic: false,
             usb_storage: Vec::new(),
             usb4_approved: Vec::new(),
@@ -642,6 +647,7 @@ impl System {
             (self.audio_check.is_some(), "--audio-check"),
             (self.audio_own_hpet, "--audio-own-hpet"),
             (self.network_check.is_some(), "--network-check"),
+            (self.gpu_check, "--gpu-check"),
         ]
         .into_iter()
         .find_map(|(enabled, flag)| enabled.then_some(flag))
@@ -818,6 +824,7 @@ impl fmt::Display for System {
         line.value("--network-check", self.network_check.as_deref())?;
         line.value("--audio-check", self.audio_check.map(AudioCheck::name))?;
         line.flag("--audio-own-hpet", self.audio_own_hpet)?;
+        line.flag("--gpu-check", self.gpu_check)?;
         line.flag("--native-pci-own-ioapic", self.native_pci_own_ioapic)?;
         if self.dram_explicit {
             line.value("--dram-base", Some(Hex(self.dram_base)))?;

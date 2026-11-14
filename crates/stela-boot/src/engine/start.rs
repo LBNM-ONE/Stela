@@ -410,6 +410,13 @@ fn open_host(
             .map_err(alloc::string::String::as_str),
     );
     remappers.report_faults();
+    // `--gpu-check`: the GPUs' start in `start_devices` was the whole run,
+    // and the boot log on the USB holds it.
+    #[cfg(feature = "diagnostics")]
+    if options.gpu_check {
+        output::arguments(format_args!("GPU CHECK done\n"));
+        output::fatal("the GPU check is done: the boot log on the USB holds the GPUs' start");
+    }
     // An install without staged signing answers cannot finish without
     // Apple's signing server: stop before the restore changes the Mac's
     // disk, not at its first signing request.
@@ -2849,14 +2856,18 @@ fn start_devices(
             if let Some(log) = log {
                 crate::log_file::resume(log);
             }
+            // `--gpu-check` starts them as a macOS boot does, and serves
+            // nothing: the boot stops once they have started.
+            let gpus_wanted = options.boots_macos() || options.gpu_check;
             let work = kernel_work.inspect_err(|reason| {
-                if options.boots_macos() {
+                if gpus_wanted {
                     crate::status::warn(&stela_boot_core::work_status::gpu_without_work(reason));
                 }
             });
-            if options.boots_macos()
+            if gpus_wanted
                 && let Ok(work) = work
                 && open_gpus(work, mmio, remappers, handoff, host_firmware, gpus)
+                && !options.gpu_check
             {
                 gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
             }
