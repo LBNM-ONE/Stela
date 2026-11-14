@@ -106,6 +106,16 @@ fn choose(handle: Handle, gop: &mut GraphicsOutput) {
         .collect();
     let edid = edid(handle);
     let native = edid.as_ref().and_then(|(bytes, _)| display::native(bytes));
+    if let Some(all) = handles::<GraphicsOutput>().filter(|all| all.len() > 1) {
+        let index = all
+            .iter()
+            .position(|&other| other == handle)
+            .map_or(0, |i| i + 1);
+        output::arguments(format_args!(
+            "DISPLAY GOP {index} of {}: the first with a monitor's EDID, else the first\n",
+            all.len()
+        ));
+    }
     output::arguments(format_args!("DISPLAY firmware mode {}\n", describe(&info)));
     let mut line = String::from("DISPLAY modes");
     for mode in &listed {
@@ -172,6 +182,21 @@ fn choose(handle: Handle, gop: &mut GraphicsOutput) {
     }
 }
 
+/// The EDID on `handle` itself: the active one, else the discovered one.
+fn own_edid(handle: Handle) -> Option<(Vec<u8>, &'static str)> {
+    read::<EdidActive>(handle, EdidActive::edid)
+        .map(|edid| (edid, "active"))
+        .or_else(|| {
+            read::<EdidDiscovered>(handle, EdidDiscovered::edid).map(|edid| (edid, "discovered"))
+        })
+}
+
+/// Whether a monitor is on the display of the GOP on `handle`: the firmware
+/// read an EDID from one there, or runs the display with one.
+pub(super) fn has_monitor(handle: Handle) -> bool {
+    own_edid(handle).is_some()
+}
+
 /// The EDID of the display on `handle`, and which it is: the active one,
 /// else the discovered one, from the GOP's own handle or, when that has
 /// none (a console splitter's), from the only display that has one.
@@ -182,9 +207,7 @@ fn edid(handle: Handle) -> Option<(Vec<u8>, &'static str)> {
         Some(&[handle]) => Some(handle),
         _ => None,
     };
-    active(handle)
-        .map(|edid| (edid, "active"))
-        .or_else(|| discovered(handle).map(|edid| (edid, "discovered")))
+    own_edid(handle)
         .or_else(|| {
             active(only(handles::<EdidActive>())?).map(|edid| (edid, "active, the only display's"))
         })

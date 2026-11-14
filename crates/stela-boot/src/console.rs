@@ -24,7 +24,7 @@ use stela_boot_core::screen::{Access, Permit};
 use stela_soc::machine::ScanoutMasks;
 use uefi::{
     Handle,
-    boot::{self, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol},
+    boot::{self, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol, SearchType},
     proto::console::gop::{GraphicsOutput, ModeInfo, PixelFormat},
 };
 
@@ -83,10 +83,18 @@ fn encoding(mode: &ModeInfo) -> Option<Encoding> {
     }
 }
 
-/// The first GOP, read-only (see [`Framebuffer::from_firmware`]), and its
-/// handle.
+/// The GOP Stela draws on, read-only (see [`Framebuffer::from_firmware`]),
+/// and its handle: the first whose display has a monitor, by the EDID the
+/// firmware read from it, else the first. With two GPUs, such as a Ryzen's
+/// integrated one made the first display beside a discrete one, the firmware
+/// gives each a GOP, and the first it lists can be the one without a monitor.
 fn gop() -> Option<(Handle, ScopedProtocol<GraphicsOutput>)> {
-    let handle = boot::get_handle_for_protocol::<GraphicsOutput>().ok()?;
+    let handles = boot::locate_handle_buffer(SearchType::from_proto::<GraphicsOutput>()).ok()?;
+    let handle = handles
+        .iter()
+        .copied()
+        .find(|&handle| mode::has_monitor(handle))
+        .or_else(|| handles.first().copied())?;
     // SAFETY: the protocol is only used while boot services run.
     let gop = unsafe {
         boot::open_protocol::<GraphicsOutput>(
