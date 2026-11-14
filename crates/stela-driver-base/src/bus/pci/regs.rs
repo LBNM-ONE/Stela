@@ -35,6 +35,8 @@ pub const fn intx_disable_required(interrupt_pin: u8) -> bool {
 /// COMMAND bits a stop asks for that a function may leave clear without
 /// any effect on containment: INTx Disable when no INTx pin is implemented.
 /// Bus Master is never among them: a function that keeps it set can DMA.
+/// Containment's one exception, a bridge whose hardware holds the bit set,
+/// is requester::containment's.
 pub const fn command_optional_bits(interrupt_pin: u8) -> u16 {
     if intx_disable_required(interrupt_pin) {
         0

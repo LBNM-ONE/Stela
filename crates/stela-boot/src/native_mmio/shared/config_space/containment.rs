@@ -1156,7 +1156,15 @@ impl Source {
                 crate::apic::rdtsc().wrapping_sub(started) >= limit
             })?;
             plan.check_disabled(|offset| config.try_read16(offset))?;
-            config.seal_bus_master()?;
+            if plan.bus_master_held() && config.try_read16(COMMAND)? & COMMAND_MASTER != 0 {
+                crate::output::arguments(format_args!(
+                    "HOST PCI {} keeps Bus Master set: its hardware holds the bit, as an AMD LPC \
+                     bridge's does\n",
+                    config.address()
+                ));
+            } else {
+                config.seal_bus_master()?;
+            }
             if header.bridge.is_some() {
                 config.seal_bus_routing()?;
             }

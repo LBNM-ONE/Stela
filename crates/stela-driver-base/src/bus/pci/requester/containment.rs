@@ -16,9 +16,26 @@ struct Control {
     offset: u16,
     original: u16,
     disabled: u16,
-    /// Bits of `disabled` the function may leave clear (see
-    /// regs::command_optional_bits); every other bit must read back exactly.
+    /// Bits of `disabled` the function may not hold (see
+    /// regs::command_optional_bits and holds_bus_master); every other bit
+    /// must read back exactly.
     optional: u16,
+}
+
+/// The base class and subclass of an ISA bridge, class code 0601h.
+const ISA_BRIDGE: u16 = 0x0601;
+
+/// The LPC bridges of AMD's FCH, and of ATI's southbridges before it, hold
+/// COMMAND's Bus Master set. AMD's SB600 register reference documents the
+/// bit as "Hardcoded to 1 to enable bus master, since LPC bridge handles
+/// legacy DMA cycles", and the Ryzen FCH's 1022:790e reads it back set after
+/// a stop clears it. That DMA comes from the legacy 8237 controller and LPC
+/// bus masters, which move data only on a channel software has programmed
+/// and unmasked. A stop accepts the bit as it reads on this function alone;
+/// the AMD remapping units taken after containment start with every device
+/// table entry blocked.
+fn holds_bus_master(vendor: u16, class: u16) -> bool {
+    matches!(vendor, 0x1002 | 0x1022) && class == ISA_BRIDGE
 }
 
 /// This plan describes PCI-level controls only. It conveys no physical
@@ -37,13 +54,21 @@ impl Plan {
             });
         }
         // INTx Disable is asked of every function and required of those
-        // with an INTx pin; Bus Master must read back clear on all of them.
+        // with an INTx pin; Bus Master must read back clear on all of them
+        // but a bridge whose hardware holds it set.
         let pin = read(regs::INTERRUPT_PIN, 1)? as u8;
+        let vendor = read(regs::VENDOR_ID, 2)? as u16;
+        let class = read(regs::CLASS_REVISION + 2, 2)? as u16;
+        let held = if holds_bus_master(vendor, class) {
+            regs::COMMAND_MASTER
+        } else {
+            0
+        };
         plan.push(
             regs::COMMAND,
             command,
             command & !regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
-            regs::command_optional_bits(pin),
+            regs::command_optional_bits(pin) | held,
         )?;
 
         let mut express = false;
@@ -140,6 +165,15 @@ impl Plan {
         Ok(())
     }
 
+    /// Whether the function's hardware holds Bus Master set (see
+    /// holds_bus_master): its stop may leave the bit set, which no seal can
+    /// keep clear and no write can change.
+    pub fn bus_master_held(&self) -> bool {
+        self.0.iter().any(|control| {
+            control.offset == regs::COMMAND && control.optional & regs::COMMAND_MASTER != 0
+        })
+    }
+
     /// Does this exact write narrow one observed control?
     pub fn permits(&self, offset: u16, width: usize, value: u32) -> bool {
         width == 2
@@ -209,7 +243,7 @@ fn record_capability(
 
 impl Control {
     /// A stopped control reads back its disabled value; an optional bit may
-    /// read back clear instead.
+    /// read back either way.
     fn verify_disabled(&self, observed: u16) -> Result<(), ConfigError> {
         verify(self.offset, self.disabled, self.optional, observed)
     }

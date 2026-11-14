@@ -826,6 +826,7 @@ fn containment_refuses_bus_master_that_stays_set_without_a_pin() {
     config.write16(regs::COMMAND, 4).unwrap();
     config.command_fixed = regs::COMMAND_MASTER;
     let plan = containment_plan(config).unwrap();
+    assert!(!plan.bus_master_held());
     let failure = plan.apply(config).unwrap_err();
     assert!(matches!(
         failure.reason,
@@ -835,6 +836,70 @@ fn containment_refuses_bus_master_that_stays_set_without_a_pin() {
             ..
         }
     ));
+}
+
+#[test]
+fn containment_accepts_the_bus_master_an_amd_lpc_bridge_holds_set() {
+    use crate::bus::pci::ConfigEffect;
+
+    // The Ryzen FCH LPC bridge as a B850 board reads it: 1022:790e rev 51,
+    // I/O, Memory, Bus Master and Special Cycles set, no INTx pin.
+    let mut function = endpoint();
+    let config = function.config();
+    config.write32(0, 0x790e_1022).unwrap();
+    config.write32(8, 0x0601_0051).unwrap();
+    config.write8(regs::INTERRUPT_PIN, 0).unwrap();
+    config.write16(regs::COMMAND, 0x000f).unwrap();
+    config.command_fixed = regs::COMMAND_MASTER;
+    let plan = containment_plan(config).unwrap();
+    assert!(plan.bus_master_held());
+    assert!(plan.permits(4, 2, 0x040b));
+    assert_eq!(
+        plan.apply(config),
+        Ok(ConfigEffect::WriteMayHaveApplied {
+            offset: regs::COMMAND,
+            width: 2
+        })
+    );
+    assert_eq!(config.read16(regs::COMMAND), Ok(0x040f));
+    assert_eq!(plan.check_disabled(|offset| config.read16(offset)), Ok(()));
+    // The bit it holds excuses no other: Memory Space read back clear is
+    // refused.
+    config.write16(regs::COMMAND, 0x040d).unwrap();
+    assert!(plan.check_disabled(|offset| config.read16(offset)).is_err());
+}
+
+#[test]
+fn containment_refuses_bus_master_held_by_any_other_function() {
+    use crate::bus::pci::ConfigFailure;
+
+    // An Intel ISA bridge, the RX 9070 under ATI's vendor ID and AMD's FCH
+    // SMBus.
+    for (identity, class_revision) in [
+        (0x7a06_8086, 0x0601_0011),
+        (0x7550_1002, 0x0300_00c3),
+        (0x790b_1022, 0x0c05_0071),
+    ] {
+        let mut function = endpoint();
+        let config = function.config();
+        config.write32(0, identity).unwrap();
+        config.write32(8, class_revision).unwrap();
+        config.write8(regs::INTERRUPT_PIN, 0).unwrap();
+        config.write16(regs::COMMAND, 0x000f).unwrap();
+        config.command_fixed = regs::COMMAND_MASTER;
+        let plan = containment_plan(config).unwrap();
+        assert!(!plan.bus_master_held());
+        let failure = plan.apply(config).unwrap_err();
+        assert!(matches!(
+            failure.reason,
+            ConfigFailure::Readback {
+                offset: regs::COMMAND,
+                expected: 0x040b,
+                observed: 0x040f,
+                ..
+            }
+        ));
+    }
 }
 
 #[test]
