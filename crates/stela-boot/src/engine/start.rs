@@ -1315,16 +1315,22 @@ fn open_gpus(
         .iter()
         .map(|region| region.physical..region.physical + region.bytes)
         .collect();
+    // Each refusal is logged too: with no step running, the screen's
+    // warning has no line to end.
     let Some(window) = mmio.and_then(|mmio| mmio.window()) else {
-        crate::status::warn("this PC cannot map a GPU's memory, so it is left unused");
+        let why = "this PC cannot map a GPU's memory, so it is left unused";
+        output::arguments(format_args!("GPU not started: {why}\n"));
+        crate::status::warn(why);
         return false;
     };
     let Some(mmio) = mmio else { return false };
     if let Err(error) = work.service_clock().and_then(|clock| clock.epoch()) {
-        crate::status::warn(&stela_boot_core::work_status::gpu_without_clock(
+        let why = stela_boot_core::work_status::gpu_without_clock(
             crate::cpu::INVARIANT_TSC.present(),
             &format!("{error:?}"),
-        ));
+        );
+        output::arguments(format_args!("GPU not started: {why}\n"));
+        crate::status::warn(&why);
         return false;
     }
     let tsc_hz = handoff.tsc_hz;
@@ -2507,7 +2513,9 @@ fn start_platform(
         }
         _ => None,
     };
-    let clock = if options.boots_macos() {
+    // The GPUs' Linux environment runs on this clock: a macOS boot's, and
+    // `--gpu-check`'s, which starts them the same way.
+    let clock = if options.boots_macos() || options.gpu_check {
         // SAFETY: this BSP owns the existing timer/IDT before any driver,
         // and the HPET only after its whole-controller handoff above.
         unsafe { service_clock(handoff, host_owner, native_mmio) }
@@ -2864,12 +2872,15 @@ fn start_devices(
                     crate::status::warn(&stela_boot_core::work_status::gpu_without_work(reason));
                 }
             });
-            if gpus_wanted
-                && let Ok(work) = work
-                && open_gpus(work, mmio, remappers, handoff, host_firmware, gpus)
-                && !options.gpu_check
-            {
-                gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
+            if gpus_wanted && let Ok(work) = work {
+                let started = open_gpus(work, mmio, remappers, handoff, host_firmware, gpus);
+                if options.gpu_check {
+                    output::arguments(format_args!("GPU CHECK started={started}\n"));
+                } else if started {
+                    gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
+                }
+            } else if let (true, Err(reason)) = (options.gpu_check, work) {
+                output::arguments(format_args!("GPU CHECK no Linux work: {reason}\n"));
             }
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {
