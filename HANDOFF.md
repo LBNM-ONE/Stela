@@ -665,7 +665,8 @@ l'avvio normale di macOS si ferma prima di partire, e macOS va avviato in
 single-user: quell'avvio passa comunque dal claim della GPU. macOS va
 installato su una partizione del disco interno; la chiavetta serve ad
 avviare Stela e all'installazione. Procedura concordata con l'utente il
-2026-11-13, non ancora eseguita.
+2026-11-13; com'è andata, e cosa è cambiato, è in «Prova sul PC:
+risultati».
 
 Prima di toccare le partizioni serve un backup. Il disco del PC
 (`nvme0n1`, 1,8 TB, letto il 2026-11-13) non ha spazio non partizionato:
@@ -689,7 +690,9 @@ Windows NTFS da 861,6 GiB, `p5` ripristino di Windows. I «125 GB liberi» di
    iGPU. Nel BIOS la prima uscita video va sulla grafica integrata, di
    solito «Settings → IO Ports → Initial Display Output → IGD Video» sulle
    Gigabyte AM5, con la grafica integrata attiva. Se lo schermo del firmware
-   resta sulla 9070, il claim la rifiuta.
+   resta sulla 9070, il claim la rifiuta. Sempre nel BIOS, «Onboard LAN
+   Controller» va su Disabled: con l'Ethernet RTL8125D attiva l'avvio di
+   Stela si blocca.
 4. **Immagine e CLI** di questo branch:
 
    ```sh
@@ -718,7 +721,7 @@ Windows NTFS da 861,6 GiB, `p5` ripristino di Windows. I «125 GB liberi» di
    è ammessa solo per certe revisioni del chip. `--erase-target` serve
    perché la partizione nuova contiene probabilmente vecchi dati di
    Windows, e senza `installed::check` la rifiuta; cancella solo quella
-   partizione.
+   partizione. Su questo PC è servito anche `--initialize-nor`.
 6. **Install macOS.** Si riavvia, si preme F12, si sceglie la chiavetta e
    nel menu di Stela «Install macOS», che scrive macOS nella partizione
    nuova. Non è un avvio di macOS per `boots_macos`, che vuole `--preboot`,
@@ -745,6 +748,68 @@ chiavetta montata, e l'aggiornamento completa anche il bundle:
 ```sh
 sudo target/release/stela setup update stela --usb USB --efi target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
 ```
+
+## Prova sul PC: risultati (2026-11-13 e 14)
+
+La procedura qui sopra è stata seguita fino al passo 6, con le differenze e
+gli intoppi che seguono. Nessun avvio ha ancora raggiunto il probe di
+amdgpu.
+
+**Preparazione (verificato).**
+- La partizione per macOS l'ha creata l'utente con GParted da una chiavetta
+  live: `nvme0n1p6`, 120 GB, nome «Stela MacOS», senza file system.
+- Setup ha chiesto `--initialize-nor`: lo stato macchina in coda alla
+  partizione non era né vuoto né quello di Stela.
+- Su Ubuntu, dopo la cancellazione della chiavetta, udev non riportava il
+  GUID GPT della partizione dati e setup si fermava («sdb2 has no GPT
+  partition GUID»). Corretto in `a9031f549`: setup lo legge dall'`uevent`
+  del kernel.
+- Il menu di Stela nasconde le voci di macOS finché macOS non è installato,
+  e i tasti numerano solo le voci mostrate: con quelle di ora, 1 è Install
+  macOS e 2 il GPU check.
+
+**Schermo (verificato, corretto).** Con due GPU Stela disegnava sul GOP
+della 9070, che non ha monitor, anche con il monitor sulla scheda madre e
+l'uscita iniziale sulla iGPU. Corretto in `04d0b97fe`: Stela sceglie il
+primo GOP con l'EDID di un monitor, qui «DISPLAY GOP 2 of 2» a 2560×1440.
+
+**Ethernet (verificato, non corretto).** L'avvio dei dispositivi si blocca
+sulla Realtek RTL8125D della scheda madre (`0a:00.0`, XID 688), e i
+dispositivi dopo di lei, USB compreso, non partono; il limite di 30 s per
+dispositivo non scatta. Il driver di Stela vorrebbe `rtl_nic/rtl8125d-1.fw`,
+che non è nel bundle, ma il punto esatto del blocco non è noto. Si aggira
+con «Onboard LAN Controller» su Disabled nel BIOS.
+
+**Install macOS (verificato, non corretto).** Con la LAN disattivata
+l'installer parte. Lo schermo smette di aggiornarsi a circa 87 s
+dall'accensione, quando il modello DCP del Mac prende lo schermo, ed è
+previsto. Il log invece si ferma a circa 110 s, dopo «ramrod_sync_NVRAM»
+di `restored_external`, senza il riepilogo del motore dei 115 s e senza
+errori: si ferma il motore. La causa non è nota; il coordinamento tra i
+core è un sospetto, non provato. Con `--serialized` il Mac emulato va in
+panic dopo 17 s in `AppleT8110PMGR::setCPUCoreEnergyAccumulator` («core <
+num_cpus», con «PEs=1 … removed=7» nel log): è un limite di quella
+modalità e non dice nulla sul blocco. Sono problemi del cuore di Stela,
+non del port AMD.
+
+**GPU check.** Per provare amdgpu senza macOS, l'opzione `--gpu-check`
+(`0d090bc69`), accettata solo dalle immagini `--diagnostics`, avvia le GPU
+come un avvio di macOS dopo dischi e USB, scrive `GPU CHECK started=…` e
+`GPU CHECK done` nel log e ferma Stela. L'immagine si costruisce con
+`cargo xtask boot build --release --amdgpu --diagnostics`, e la voce si
+aggiunge a `choices.cfg` duplicando quella di Install macOS con
+`--gpu-check` in fondo.
+- Prima prova: nessuna riga sulla GPU, perché l'orologio di servizio su cui
+  gira l'ambiente Linux c'era solo negli avvii di macOS. Corretto in
+  `33425c16c`, che scrive anche nel log perché una GPU non parte.
+- Seconda prova: la 9070 rifiutata prima del claim. Il contenimento PCI
+  falliva sul bridge LPC dell'FCH (`00:14.3`, 1022:790e), che rilegge
+  COMMAND come `0x040f` dove Stela scrive `0x040b`: il suo Bus Master è
+  fisso a 1 in hardware. Senza contenimento Stela non prende le unità di
+  remapping (AMD-Vi), quindi rifiuta il framebuffer del firmware e ogni
+  requester. Corretto in `e71e33aaf`: il contenimento accetta quel bit sui
+  bridge ISA di AMD e ATI, e il log lo dice con «HOST PCI 0000:00:14.3
+  keeps Bus Master set». La terza prova è da fare.
 
 ## Controlli sul PC (Linux)
 
@@ -876,7 +941,15 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
     su questo PC Mesa non è costruito (`cargo xtask gpu nvk`): il codice
     che solo lei compila è stato riletto, non compilato. Committato in tre
     commit di codice e uno di documentazione.
+- 2026-11-13 e 14, sessione locale sul PC: la prova sul PC, vedi «Prova
+  sul PC: risultati». Cinque commit di codice: `a9031f549` (setup su
+  Linux), `04d0b97fe` (GOP con il monitor), `0d090bc69` e `33425c16c` (GPU
+  check), `e71e33aaf` (bridge LPC di AMD). Per ognuno test e clippy puliti
+  sui crate toccati e sull'immagine UEFI, e l'immagine release diagnostica
+  con amdgpu ricostruita. Non pushati quando è stata scritta questa nota.
+  Restano aperti, nel cuore di Stela: il blocco sull'RTL8125D, il motore
+  fermo a circa 110 s durante Install macOS e il panic di `--serialized`.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
-  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la prova sul PC
-  (vedi «Prova sul PC (tappa 2)»). Sentire l'upstream resta consigliato
-  prima degli strati che costano mesi (RADV, Metal, display).
+  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la terza prova del GPU
+  check (vedi «Prova sul PC: risultati»). Sentire l'upstream resta
+  consigliato prima degli strati che costano mesi (RADV, Metal, display).
