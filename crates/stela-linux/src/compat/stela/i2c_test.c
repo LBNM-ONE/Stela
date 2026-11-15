@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* Linux's I2C core on the fixture's real Runtime task, which its bus lock
- * needs: adapters, transfers with Linux's retries, and unbound clients. */
+ * needs: adapters, transfers with Linux's retries and within an adapter's
+ * quirks, and unbound clients. */
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/jiffies.h>
@@ -31,6 +32,17 @@ static const struct i2c_algorithm algorithm = {.xfer = transfer, .functionality 
 
 static struct i2c_adapter adapter = {.algo = &algorithm, .retries = 1, .name = "test"};
 static struct i2c_adapter managed = {.algo = &algorithm, .name = "managed"};
+
+/* The quirks an RX 9070's SMU sets on its I2C controller
+ * (smu_v14_0_2_i2c_control_quirks), with its 24-command limit. */
+static const struct i2c_adapter_quirks smu_quirks = {
+	.flags = I2C_AQ_COMB | I2C_AQ_COMB_SAME_ADDR | I2C_AQ_NO_ZERO_LEN,
+	.max_read_len = 24,
+	.max_write_len = 24,
+	.max_comb_1st_msg_len = 2,
+	.max_comb_2nd_msg_len = 22,
+};
+static struct i2c_adapter quirked = {.algo = &algorithm, .quirks = &smu_quirks, .name = "smu"};
 
 static void parent_released(struct device *dev)
 {
@@ -76,4 +88,32 @@ void stela_linux_i2c_test(void)
 	assert(!strcmp(dev_name(&managed.dev), "i2c-1"));
 	stela_linux_devres_release(&parent);
 	put_device(&parent);
+
+	/* An adapter with quirks is added, and a transfer they do not admit
+	 * never reaches it. */
+	assert(!i2c_add_adapter(&quirked));
+	u8 offset[2] = {0}, data[24] = {0};
+	struct i2c_msg read[2] = {
+		{.addr = 0x50, .len = 2, .buf = offset},
+		{.addr = 0x50, .flags = I2C_M_RD, .len = 22, .buf = data},
+	};
+	transfers = 0;
+	results[0] = 2;
+	assert(i2c_transfer(&quirked, read, 2) == 2 && transfers == 1);
+	read[1].addr = 0x51;
+	assert(i2c_transfer(&quirked, read, 2) == -EOPNOTSUPP);
+	read[1].addr = 0x50;
+	read[1].len = 23;
+	assert(i2c_transfer(&quirked, read, 2) == -EOPNOTSUPP && transfers == 1);
+	struct i2c_msg single = {.addr = 0x50, .flags = I2C_M_RD, .len = 24, .buf = data};
+	transfers = 0;
+	results[0] = 1;
+	assert(i2c_transfer(&quirked, &single, 1) == 1 && transfers == 1);
+	single.len = 25;
+	assert(i2c_transfer(&quirked, &single, 1) == -EOPNOTSUPP);
+	single.len = 0;
+	assert(i2c_transfer(&quirked, &single, 1) == -EOPNOTSUPP);
+	struct i2c_msg three[3] = {read[0], read[0], read[0]};
+	assert(i2c_transfer(&quirked, three, 3) == -EOPNOTSUPP && transfers == 1);
+	i2c_del_adapter(&quirked);
 }
