@@ -732,9 +732,11 @@ Windows NTFS da 861,6 GiB, `p5` ripristino di Windows. I «125 GB liberi» di
    duplica la riga della scelta macOS (nome, tab, opzioni) e si aggiunge
    `--single-user` in fondo alla copia; si può fare già dopo il setup.
    All'avvio di Stela si sceglie quella voce.
-8. **Log.** Da Ubuntu, `sudo target/release/stela setup boot-log`, che
-   senza `--usb` legge ogni disco, oppure il file `EFI/stela/boot.log` della
-   chiavetta. Le righe da cercare:
+8. **Log.** Da Ubuntu, `sudo target/release/stela log`, che legge ogni
+   disco e salva `log.txt` nella cartella corrente, oppure
+   `target/release/stela log COPIA -o FILE` su una copia di
+   `EFI/stela/boot.log` della chiavetta, che non chiede sudo. Fino al
+   2026-11-14 il comando era `stela setup boot-log`. Le righe da cercare:
    - `HOST FIRMWARE BUNDLE USE amdgpu/…`: gli 11 file letti;
    - `GPU 0000:03:00.0 …`: il claim, o il motivo del rifiuto;
    - `LINUX <n> amdgpu 0000:03:00.0: …`: il probe di amdgpu;
@@ -742,12 +744,20 @@ Windows NTFS da 861,6 GiB, `p5` ripristino di Windows. I «125 GB liberi» di
    - `GPU START claim_ms=… probe_ms=…`.
 
 Con una chiavetta Stela già fatta e macOS già installato bastano i passi 3,
-4, 7 e 8, con questo comando al posto del 5. `USB` è la partizione EFI della
-chiavetta montata, e l'aggiornamento completa anche il bundle:
+4, 7 e 8, con questo comando al posto del 5. L'aggiornamento trova da solo
+la chiavetta inserita e completa anche il bundle; `--efi` è un'opzione
+nascosta di `stela update`:
 
 ```sh
-sudo target/release/stela setup update stela --usb USB --efi target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+sudo target/release/stela update --efi target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
 ```
+
+Dal 2026-11-15 il branch contiene upstream 0.4.1, la cui CLI ha sostituito
+`stela setup` con `create`, `update`, `repair`, `status`, `settings` e `log`
+(`0387fd59a`): i passi 5 e 8 qui sopra e i comandi più vecchi di questo
+documento usano la sintassi di prima. Fino al 2026-11-14 l'aggiornamento era
+`stela setup update stela --usb USB --efi …`. Dopo ogni aggiornamento la voce
+«GPU check» va aggiunta di nuovo a `choices.cfg`.
 
 ## Prova sul PC: risultati (2026-11-13 e 14)
 
@@ -838,6 +848,48 @@ conflitti in 13 file: README, `gpu_status.rs`, `engine/gpu.rs`,
 `recipes.rs` e i test del bundle. Il 2026-11-15 l'utente ha scelto di fare
 prima la quarta prova con l'immagine attuale; l'unione di upstream è il
 passo dopo.
+- Quarta prova (2026-11-15, immagine `89d1e7ae97062424`, con `7ede21755`):
+  stesso schermo della terza, ma senza le righe «IOMMU AMD-Vi». La funzione
+  che le stampa è chiamata proprio prima dello stop («host storage could
+  not be opened»), quindi l'elenco delle unità AMD-Vi prese era vuoto:
+  Stela non ha preso l'IOMMU, e il DMA non moriva nella sua traduzione. Il
+  sospetto più forte, dal codice: dopo un contenimento riuscito Stela
+  ferma anche i bridge PCI, e `forward_pci_bridges` li riapre solo con
+  un'unità presa o con le unità dichiarate spente; altrimenti scrive
+  «bridge forwarding withheld», e il DMA dei dispositivi dietro i bridge
+  (NVMe dietro `00:01.2`, xHCI dietro `00:02.1`) non arriva. Non
+  verificato, perché il log non arriva alla chiavetta. Upstream ha corretto
+  proprio questi punti, quindi la quinta prova si fa sull'unione.
+
+**Unione di upstream 0.4.1 (2026-11-15, `f880bfc9d`).** Unione, non rebase:
+i commit già pushati restano. I conflitti, e come sono stati risolti:
+- contenimento (i due `containment.rs` e i loro test): la versione di
+  upstream, che accetta il Bus Master fisso dei bridge host e ISA sul bus
+  radice (`4f8d5b58c`) al posto di `e71e33aaf`;
+- `cold.rs`: la scelta del reset di upstream (reset della funzione, nessuno
+  se il DMA della GPU è tradotto, altrimenti reset del suo bus) ora ammette
+  anche le GPU AMD. La 9070, che non ha né FLR né soft reset (`reset_method`
+  di Linux: `bus`), parte com'è se tradotta, altrimenti le si resetta il
+  bus. Il test della 9070 sostituisce quello di `Reset::Driver`;
+- `engine/gpu.rs`: il proprietario dello schermo di upstream, più il
+  rifiuto di una GPU AMD che tiene lo schermo del firmware;
+- `engine/start.rs`: `--gpu-check` tiene il suo orologio e il suo avvio
+  delle GPU accanto al passo «clocks» e agli argomenti nuovi di
+  `gpu::serve`;
+- `gpu_status.rs`: il consiglio `stela repair` di upstream, anche per i
+  firmware AMD mancanti;
+- ricette, bundle e test di setup: i test di tutte e due le parti, e i
+  totali di 97 file e 124.284.312 byte (118,5 MiB), cioè gli 86 di upstream
+  più gli 11 di amdgpu;
+- il modello di test AMD-Vi e README: le due parti affiancate.
+
+Verificato dopo l'unione: `cargo xtask gpu fetch` ha riapplicato i
+sorgenti con le patch Linux di upstream (pin di Linux, Mesa e LLVM
+invariati); test superati su `stela-driver-base` (1074), `stela-boot-core`
+(741), `stela-loader` (345), `stela-cli` (290) e, con tutte le feature, su
+`stela-driver-gpu` e `stela-linux` (751); clippy pulito su quei crate e
+sull'immagine UEFI con amdgpu e diagnostica, con diagnostica e di default;
+l'immagine release diagnostica con amdgpu (31,7 MB) e la CLI linkano.
 
 ## Controlli sul PC (Linux)
 
@@ -982,8 +1034,11 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   `7ede21755`, che mostra gli eventi dell'unità; test di
   `stela-driver-base` (1021) e clippy puliti, immagine release diagnostica
   con amdgpu ricostruita. Non pushato quando è stata scritta questa nota.
+- 2026-11-15, stessa sessione: quarta prova (nessuna unità AMD-Vi presa),
+  poi unione di upstream 0.4.1 in `f880bfc9d` (vedi «Prova sul PC:
+  risultati»). Non pushata quando è stata scritta questa nota.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
-  passi 1, 2 e 3. Il passo 4 è fatto; i prossimi sono la quarta prova del
-  GPU check, poi l'unione di upstream 0.4.1 (vedi «Prova sul PC:
+  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la quinta prova del
+  GPU check, sull'unione con upstream 0.4.1 (vedi «Prova sul PC:
   risultati»). Sentire l'upstream resta consigliato prima degli strati che
   costano mesi (RADV, Metal, display).
