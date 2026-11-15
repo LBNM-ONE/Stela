@@ -918,6 +918,38 @@ cui `rtl_nic/rtl8125d-1.fw` e `rtl8125d-2.fw` dell'Ethernet di questo PC
 - Il driver GOP del firmware sulla 9070 impiega 8 s
   (`FIRMWARE slow driver start on 0000:03:00.0`).
 
+**Sesta prova (2026-11-15, immagine `79db7701a1c2011e`).** La 9070 supera
+il reset del bus e il controllo dei registri, e **amdgpu gira per la prima
+volta** sulla 9070 (62,85 s). Dal log:
+- IP discovery con 10 blocchi IP (`soc24_common`, `gmc_v12_0`, `ih_v7_0`,
+  `psp`, `smu`, `gfx_v12_0`, `sdma_v7_0`, `vcn_v5_0_0`, `jpeg_v5_0_0`,
+  `mes_v12_0`); VBIOS letto dalla ROM (`113-4E490TX-UP5`, 2025/04/08);
+  VRAM 16304M GDDR6 a 256 bit, BAR 256M; GART di 512M attiva.
+- Avvisi, per ora innocui: «System can't access extended configuration
+  space» (la compatibilità PCI non dà ad amdgpu lo spazio di
+  configurazione esteso) e il WARN `dma-mapping.h:668 !dev->dma_parms`.
+- L'errore: `unsupported: I2C adapter quirks`, poi `Failed to register hw
+  i2c, err: -95`, `Failed to sw init smc table!`, `sw_init of IP block
+  <smu> failed -95` e `Fatal error during GPU init`. L'SMU 14.0.2 registra
+  il suo controller I2C con delle quirks (`smu_v14_0_2_i2c_control_quirks`),
+  e la nostra `i2c_add_adapter` le rifiutava. Corretto in `741c1bd17`: le
+  quirks si accettano e `__i2c_transfer` rifiuta solo i trasferimenti che
+  le violano, con `i2c_check_for_quirks` di Linux; il test I2C usa le
+  quirks dell'SMU.
+- Lo smontaggio dopo l'errore (`amdgpu_device_fini_hw` →
+  `amdgpu_irq_fini_hw` → `free_irq`) chiede di ritirare l'interrupt della
+  GPU, il lato nativo non lo sa fare (`interrupt 0 action retained:
+  Unsupported`), e `stela_linux_fatal` ferma Stela con `ud2` (vector 6)
+  invece di rischiare un uso dopo la liberazione. Simboli dallo stack,
+  letti con `llvm-symbolizer --obj=stela.efi --relative-address` e il PDB
+  accanto: `stela_linux_fatal`, `amdgpu_irq_fini_hw`,
+  `amdgpu_device_fini_hw`, `amdgpu_pci_probe`, `bind` (`pci.c`). Succede
+  solo dopo un init fallito; aperto.
+- Tra lo stop (62,9 s) e la riga di stato finale (114,5 s) passano 51 s
+  senza righe di log. L'utente ha visto lo schermo fermo, ha collegato un
+  monitor HDMI alla 9070 e Stela è ripartita fino al messaggio d'errore.
+  Il nesso con il cavo non è provato; aperto.
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1064,10 +1096,11 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
 - 2026-11-15, stessa sessione: quarta prova (nessuna unità AMD-Vi presa),
   poi unione di upstream 0.4.1 in `f880bfc9d`, poi quinta prova, fermata
   dal controllo dei registri dopo il reset del bus della 9070, e la sua
-  correzione (vedi «Prova sul PC: risultati»). Non pushato quando è stata
-  scritta questa nota.
+  correzione; sesta prova, con amdgpu che parte e si ferma sulle quirks
+  I2C dell'SMU, corrette in `741c1bd17` (vedi «Prova sul PC: risultati»).
+  Non pushato quando è stata scritta questa nota.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
-  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la sesta prova del
-  GPU check, sull'unione con upstream 0.4.1 e con il controllo dei
-  registri corretto per AMD (vedi «Prova sul PC: risultati»). Sentire l'upstream resta consigliato prima degli strati che
+  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la settima prova del
+  GPU check, con le quirks I2C dell'SMU accettate (vedi «Prova sul PC:
+  risultati»). Sentire l'upstream resta consigliato prima degli strati che
   costano mesi (RADV, Metal, display).
