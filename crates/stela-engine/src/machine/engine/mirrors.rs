@@ -136,6 +136,18 @@ pub(super) struct Mirrors {
     /// counter read computes the count where only its cell's value went
     /// stale.
     pub(super) instructions: register_read::InstructionCounter,
+    /// What native WFEs counted of their spins since native code was
+    /// entered, which the engine takes when it returns
+    /// ([`Machine::take_event_spins`]).
+    pub(super) spin: register_read::EventSpin,
+    /// The board's fast-IPI table as this PE's native IPI writes use it,
+    /// all 0 until the engine installs one ([`Machine::enter_fast_ipi`]),
+    /// and the PEs they found halted, which the engine wakes when native
+    /// code returns ([`Machine::take_fast_ipi_wakes`]).
+    pub(super) fast_ipi: register_read::FastIpi,
+    /// The plain device reads native device sites complete again
+    /// ([`DEVICE_READ_KEY`]), a slot per site.
+    pub(super) device_reads: [register_read::DeviceRead; register_read::DEVICE_READS],
 }
 
 /// Where native code finds the cell at `index` of the PE's state.
@@ -209,6 +221,7 @@ pub(super) const TIMER: register_read::TimerPlaces = register_read::TimerPlaces 
     compare: cell_place(TIMER_COMPARE),
     control: cell_place(TIMER_CONTROL),
     lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
+    interrupt_status: INTERRUPT_STATUS,
     count: Place::new(Anchor::Count, 0),
 };
 
@@ -284,8 +297,59 @@ pub(super) fn permission_write_word(word: u32) -> Option<(usize, u8)> {
     Some((kept, (word & 31) as u8))
 }
 
+/// The cell open where a WFE that finds the event register clear waits,
+/// taking no trap, and other PEs run meanwhile on cores of their own, any of
+/// which may set it: there native WFE spins for the register
+/// (`x86_64::register_read::event_wait_thunk`). A WFE that waits in the
+/// engine opens it ([`Machine::wait`]); the trap controls are System
+/// registers, whose change closes every cell.
+pub(super) const EVENT_WAITS: usize = PERMISSION_KEPT[1] + 1;
+
+/// Where native WFE finds the event register and what ends its spin.
+pub(super) const EVENT_WAIT: register_read::EventWaitPlaces = register_read::EventWaitPlaces {
+    events: EVENTS,
+    waits: cell_place(EVENT_WAITS),
+    monitor: Place::new(Anchor::Mirrors, offset_of!(Mirrors, monitor)),
+    control: Place::new(Anchor::Control, 0),
+    lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
+    count: Place::new(Anchor::Count, 0),
+    spin: Place::new(Anchor::Mirrors, offset_of!(Mirrors, spin)),
+};
+
+/// The cell open where MSR IPI_RR_LOCAL, IPI_RR_GLOBAL and IPI_SR
+/// complete plainly through the board, taking no trap
+/// (`x86_64::register_read::fast_ipi_request_thunk`, `fast_ipi_status_thunk`):
+/// a board fast-IPI write the engine completed opens it
+/// ([`Machine::board_register`]). The traps (EL0, HCR_EL2.TIDCP, HACR_EL2)
+/// follow from PSTATE and System registers, whose change closes every cell.
+pub(super) const FAST_IPI_WRITES: usize = EVENT_WAITS + 1;
+
+/// Where native fast-IPI writes find their words.
+pub(super) const FAST_IPI: register_read::FastIpiPlaces = register_read::FastIpiPlaces {
+    cell: cell_place(FAST_IPI_WRITES),
+    ipi: Place::new(Anchor::Mirrors, offset_of!(Mirrors, fast_ipi)),
+    control: Place::new(Anchor::Control, 0),
+    interrupt_status: INTERRUPT_STATUS,
+};
+
+/// The cell whose `value` is the key ([`register_read::device_read_key`])
+/// native device reads of the state match
+/// (`x86_64::register_read::device_read_thunk`): open on the PE's device
+/// read generation once the engine kept a plain device read in the state
+/// ([`Machine::keep_device_read`]). A translation that may have changed
+/// moves the generation ([`Machine::forget_device_reads`]); any other change
+/// of derived state closes every cell.
+pub(super) const DEVICE_READ_KEY: usize = FAST_IPI_WRITES + 1;
+
+/// Where native device reads find theirs.
+pub(super) const DEVICE_READ: register_read::DeviceReadPlaces = register_read::DeviceReadPlaces {
+    reads: Place::new(Anchor::Mirrors, offset_of!(Mirrors, device_reads)),
+    key: cell_place(DEVICE_READ_KEY),
+    count: Place::new(Anchor::Count, 0),
+};
+
 /// The cell of the first of the [`STORED_WRITES`].
-const STORED_WRITE_CELLS: usize = PERMISSION_KEPT[1] + 1;
+const STORED_WRITE_CELLS: usize = DEVICE_READ_KEY + 1;
 
 /// The IMPLEMENTATION DEFINED registers that a store completes writes of
 /// that get a cell of their own the first time code naming them is installed
@@ -394,6 +458,9 @@ impl Default for Mirrors {
             monitor: 0,
             cycles: register_read::CycleCounter::default(),
             instructions: register_read::InstructionCounter::default(),
+            spin: register_read::EventSpin::default(),
+            fast_ipi: register_read::FastIpi::default(),
+            device_reads: [register_read::DeviceRead::default(); register_read::DEVICE_READS],
         }
     }
 }
@@ -827,6 +894,18 @@ pub(super) fn event_instruction(pc: u64, word: u32) -> Option<bool> {
         } => Some(false),
         _ => None,
     }
+}
+
+/// The fast-IPI register MSR `word` at `pc` writes, and Rt, if it writes
+/// one native code completes: IPI_RR_LOCAL, IPI_RR_GLOBAL or IPI_SR.
+pub(super) fn fast_ipi_write(
+    pc: u64,
+    word: u32,
+) -> Option<(crate::machine::fast_ipi::Register, u8)> {
+    use crate::machine::fast_ipi::Register;
+    let access = msr_access(pc, word)?;
+    let register = Register::decode(access.encoding())?;
+    (register != Register::Countdown).then_some((register, access.rt()))
 }
 
 /// Xt of the IC IVAU `word`, if it is one.

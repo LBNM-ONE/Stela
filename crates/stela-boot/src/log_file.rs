@@ -1,5 +1,5 @@
 //! The USB's own boot log, [`BOOT_LOG_FILE`] beside Stela on its volume,
-//! which `stela setup` preallocates: the loader writes it through the
+//! which `stela` preallocates: the loader writes it through the
 //! firmware's file system from its first line until boot services end
 //! ([`open`]), and the system engine writes on to the same clusters, wherever
 //! they lie, through Stela's own drivers ([`resume`]), so the stick keeps the
@@ -16,6 +16,7 @@ use stela_drivers::block::{BlockDevice, BlockError, Features, Identity, Shared, 
 use stela_loader::mount_interface::BOOT_LOG_FILE;
 use stela_runtime::pc::{
     boot_log::{self, LOG_BYTES, Writer},
+    device_starts::{self, Skips},
     fat32::Fat32,
     gpt::Guid,
 };
@@ -41,9 +42,12 @@ pub fn open() -> Option<Guid> {
     status::begin("Opening the boot log on the USB");
     let opened = firmware_file().and_then(|(device, partition)| {
         let mut device: Box<dyn BlockDevice> = Box::new(device);
+        // The earlier boots' account, before this boot's marker joins it.
+        read_device_skips(&mut *device);
         let writer = Writer::open(&mut *device)
             .map_err(|error| refuse!("firmware boot log: {error}", %error))?;
         report(&writer, "firmware");
+        crate::stop_record::set_boot(writer.boots());
         output::add_log(writer, device, Log::Firmware)
             .map_err(|error| refuse!("firmware boot log output: {error}", %error))?;
         Ok(partition)
@@ -51,11 +55,56 @@ pub fn open() -> Option<Guid> {
     finish(opened).flatten()
 }
 
+/// The PCI functions an earlier boot did not finish starting, or skipped
+/// since (`device_starts`), as [`open`] read them from the log.
+static DEVICE_SKIPS: output::Global<Skips> = output::Global(core::cell::RefCell::new(Skips::EMPTY));
+
+/// The skips [`open`] read: none when the log was not opened.
+pub fn device_skips() -> Skips {
+    DEVICE_SKIPS
+        .0
+        .try_borrow()
+        .map_or(Skips::EMPTY, |skips| *skips)
+}
+
+/// Read the log on `device` back from its newest line until it holds a
+/// whole boot with a device-start marker, and keep the skips it gives.
+fn read_device_skips(device: &mut dyn BlockDevice) {
+    let Ok(newest) = boot_log::read_newest(device, 64 * 1024, device_starts::settled) else {
+        output::arguments(format_args!(
+            "BOOT LOG FILE unreadable for its device-start record: no device is skipped\n"
+        ));
+        return;
+    };
+    let skips = device_starts::read(&newest);
+    for function in skips.iter() {
+        output::arguments(format_args!(
+            "{}\n",
+            function.line("BOOT LOG FILE device start record:")
+        ));
+    }
+    if let Ok(mut kept) = DEVICE_SKIPS.0.try_borrow_mut() {
+        *kept = skips;
+    }
+}
+
 /// Write on to the loader's log in its file on `partition`, the volume
 /// [`open`] found it on.
 pub fn resume(partition: Box<dyn BlockDevice>) {
     status::begin("Opening the boot log on the USB again");
     finish(engine_file(partition));
+}
+
+/// [`resume`] from inside the device start, which keeps its step on the
+/// screen: the log only says whether the file is written on to.
+pub fn resume_quietly(partition: Box<dyn BlockDevice>) -> bool {
+    match engine_file(partition) {
+        Ok(()) => true,
+        Err(why) => {
+            output::arguments(format_args!("BOOT LOG FILE off: {why}\n"));
+            false
+        }
+    }
 }
 
 /// End the step: the log is kept, or why not, which the boot goes on

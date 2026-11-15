@@ -303,6 +303,198 @@ pub struct SystemExits {
     pub devices: DeviceExits,
     pub floating: [u64; FloatingReason::COUNT],
     pub floating_words: FloatingWords,
+    pub barriers: BarrierWaits,
+    pub regimes: RegimeSyncs,
+    /// WKDMC, then WKDMD ([`Compression`]).
+    pub compression: [Compression; 2],
+}
+
+/// The host's regime changes ([`super::Host::set_regime`]) and prediction
+/// isolations ([`super::Host::isolate_predictions`]) under step timing: how
+/// many and their profile ticks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RegimeSyncs {
+    pub syncs: u64,
+    pub sync_ticks: u64,
+    pub isolations: u64,
+    pub isolation_ticks: u64,
+    /// The syncs that gave the host the regime it had and isolated nothing.
+    pub unchanged: u64,
+    /// The syncs by what asked for them ([`SyncSource`]).
+    pub sources: [u64; SyncSource::COUNT],
+}
+
+/// What asked for a regime sync ([`RegimeSyncs::sources`]): a PAN change by
+/// MSR in the engine, a PAN change native code made, a translation change
+/// (an SPRR_PERM write and others), a TTBR0 write, an exception entry or
+/// return or GXF transition the engine made, a change of derived state, and
+/// anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncSource {
+    Pan,
+    NativePan,
+    Translation,
+    TableBase,
+    Transition,
+    Derived,
+    Other,
+}
+
+impl SyncSource {
+    pub const COUNT: usize = Self::Other as usize + 1;
+    pub const NAMES: [&str; Self::COUNT] = [
+        "pan",
+        "native_pan",
+        "translation",
+        "table_base",
+        "transition",
+        "derived",
+        "other",
+    ];
+}
+
+impl RegimeSyncs {
+    /// Add every change `other` counts.
+    pub fn merge(&mut self, other: &Self) {
+        self.syncs += other.syncs;
+        self.sync_ticks += other.sync_ticks;
+        self.isolations += other.isolations;
+        self.isolation_ticks += other.isolation_ticks;
+        self.unchanged += other.unchanged;
+        for (count, more) in self.sources.iter_mut().zip(other.sources) {
+            *count += more;
+        }
+    }
+}
+
+/// The [`BarrierWaits`] blocker of a PE in native code.
+pub const BLOCKER_NATIVE: u64 = 1;
+/// The [`BarrierWaits`] blocker of a PE that entered a fetched block and
+/// prepares its native run, or takes the fetch's exception or checked
+/// instruction.
+pub const BLOCKER_ENTERING: u64 = 2;
+/// The [`BarrierWaits`] blocker of a PE whose native run returned, before
+/// it knows the exit.
+pub const BLOCKER_RETURNED: u64 = 3;
+/// Bit 63 of a blocker: a PE completing an exit of the slot in bits 32-62
+/// at the [`system_key`] in bits 0-31 (0 where the exit has no word).
+pub const BLOCKER_EXIT: u64 = 1 << 63;
+/// The blockers [`BarrierWaits`] holds apart.
+pub const BARRIER_BLOCKERS: usize = 32;
+
+/// The blocker of PE in an exit of `slot` at `word`.
+pub fn exit_blocker(slot: usize, word: Option<u32>) -> u64 {
+    BLOCKER_EXIT | (slot as u64) << 32 | u64::from(word.map_or(0, system_key))
+}
+
+/// The waits for one blocker: how many and their ticks.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct BarrierBlocker {
+    pub key: u64,
+    pub count: u64,
+    pub ticks: u64,
+}
+
+/// DSBs that completed maintenance this PE posted, under step timing: how
+/// many, those that found every PE had applied it at the first look
+/// (`quick`), and the profile ticks they spent; and by the last PE they
+/// waited for, what that PE was doing when last seen (its blocker: native
+/// code, [`BLOCKER_NATIVE`], or an exit, [`exit_blocker`]), with the rest in
+/// `other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BarrierWaits {
+    pub waits: u64,
+    pub quick: u64,
+    pub ticks: u64,
+    pub blockers: [BarrierBlocker; BARRIER_BLOCKERS],
+    pub other: BarrierBlocker,
+}
+
+impl Default for BarrierWaits {
+    fn default() -> Self {
+        Self {
+            waits: 0,
+            quick: 0,
+            ticks: 0,
+            blockers: [BarrierBlocker::default(); BARRIER_BLOCKERS],
+            other: BarrierBlocker::default(),
+        }
+    }
+}
+
+impl BarrierWaits {
+    /// Count a wait of `ticks`: one that waited for a PE last seen at
+    /// `blocker`, or `None` when none was waited for.
+    pub fn add(&mut self, blocker: Option<u64>, ticks: u64) {
+        self.waits += 1;
+        self.ticks += ticks;
+        match blocker {
+            None => self.quick += 1,
+            Some(key) => self.add_blocker(key, 1, ticks),
+        }
+    }
+
+    fn add_blocker(&mut self, key: u64, count: u64, ticks: u64) {
+        let entry = match self
+            .blockers
+            .iter()
+            .position(|entry| entry.count == 0 || entry.key == key)
+        {
+            Some(index) => &mut self.blockers[index],
+            None => &mut self.other,
+        };
+        if entry.count == 0 {
+            entry.key = key;
+        }
+        entry.count += count;
+        entry.ticks += ticks;
+    }
+
+    /// Add every wait `other` counts.
+    pub fn merge(&mut self, other: &Self) {
+        self.waits += other.waits;
+        self.quick += other.quick;
+        self.ticks += other.ticks;
+        for entry in other.blockers.iter().filter(|entry| entry.count != 0) {
+            self.add_blocker(entry.key, entry.count, entry.ticks);
+        }
+        self.other.count += other.other.count;
+        self.other.ticks += other.other.ticks;
+    }
+}
+
+/// WKDMC or WKDMD instructions the engine completed under step timing, and
+/// the ticks of their handling split: the whole handler; reading the source
+/// through translated guest memory; the codec; and writing the destination
+/// (the host's publication of the bytes into guest RAM). The rest of the
+/// handler is translation checks and the result; the rest of the exit, in
+/// `SYSTEM WORDS`, is leaving and entering the guest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Compression {
+    pub count: u64,
+    pub whole: u64,
+    pub read: u64,
+    pub codec: u64,
+    pub write: u64,
+}
+
+impl Compression {
+    /// Count one of `whole` ticks: `parts` are its read, codec and write.
+    pub fn add(&mut self, whole: u64, parts: [u64; 3]) {
+        self.count += 1;
+        self.whole += whole;
+        self.read += parts[0];
+        self.codec += parts[1];
+        self.write += parts[2];
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.count += other.count;
+        self.whole += other.whole;
+        self.read += other.read;
+        self.codec += other.codec;
+        self.write += other.write;
+    }
 }
 
 /// What the software completion of a floating-point exit found, which names
@@ -789,6 +981,9 @@ impl Default for SystemExits {
             devices: DeviceExits::default(),
             floating: [0; FloatingReason::COUNT],
             floating_words: FloatingWords::default(),
+            barriers: BarrierWaits::default(),
+            regimes: RegimeSyncs::default(),
+            compression: [Compression::default(); 2],
         }
     }
 }
@@ -822,6 +1017,11 @@ impl SystemExits {
             *count += more;
         }
         self.floating_words.merge(&exits.floating_words);
+        self.barriers.merge(&exits.barriers);
+        self.regimes.merge(&exits.regimes);
+        for (compression, other) in self.compression.iter_mut().zip(&exits.compression) {
+            compression.merge(other);
+        }
     }
 
     /// The keys with exits.
@@ -835,6 +1035,12 @@ impl SystemExits {
             && self.devices.is_empty()
             && self.floating.iter().all(|&count| count == 0)
             && self.floating_words.is_empty()
+            && self.barriers.waits == 0
+            && self.regimes == RegimeSyncs::default()
+            && self
+                .compression
+                .iter()
+                .all(|compression| compression.count == 0)
     }
 }
 
@@ -864,6 +1070,54 @@ impl DeviceExit {
 /// The device pages [`DeviceExits`] holds apart.
 pub const DEVICE_PAGES: usize = 64;
 
+/// One device register's reads or writes the engine completed, with
+/// [`DeviceExit`]'s counts: `register` its physical address, with
+/// [`DEVICE_REGISTER_WRITE`] set for writes, whose ticks also split as
+/// [`DeviceWrites`]' do into the access and the settle after it, and the
+/// settle's transfer and deferred copies; `longest` is the longest exit,
+/// which tells a few long exits (a preempted host thread) from many.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceRegisterExit {
+    pub register: u64,
+    pub count: u64,
+    pub ticks: u64,
+    pub waited: u64,
+    pub access: u64,
+    pub settle: u64,
+    pub transfer: u64,
+    pub copies: u64,
+    pub released: u64,
+    pub longest: u64,
+}
+
+impl DeviceRegisterExit {
+    fn add(&mut self, other: &Self) {
+        self.count += other.count;
+        self.ticks += other.ticks;
+        self.waited += other.waited;
+        self.access += other.access;
+        self.settle += other.settle;
+        self.transfer += other.transfer;
+        self.copies += other.copies;
+        self.released += other.released;
+        self.longest = self.longest.max(other.longest);
+    }
+}
+
+/// The parts a device write's exit is timed in: its access, its settle,
+/// its gate call, and of the settle the transfer under the devices' lock,
+/// the deferred DMA copies after the lock's release and the host work the
+/// release did on the writing core, in the board counter's ticks as a lock
+/// wait is ([`DeviceWrites::add`]).
+pub const WRITE_PARTS: usize = 6;
+
+/// The bit of [`DeviceRegisterExit::register`] that says writes: physical
+/// addresses never reach it.
+pub const DEVICE_REGISTER_WRITE: u64 = 1 << 63;
+
+/// The registers and directions [`DeviceExits`] holds apart.
+pub const DEVICE_REGISTERS: usize = 128;
+
 /// Device writes the engine completed, and the ticks of their exits split:
 /// the whole exit; the access, up to the model's write done (the devices'
 /// lock and the write); the settle after it (in the same locked call every
@@ -879,15 +1133,21 @@ pub struct DeviceWrites {
     pub access: u64,
     pub settle: u64,
     pub call: u64,
+    pub transfer: u64,
+    pub copies: u64,
+    pub released: u64,
 }
 
 impl DeviceWrites {
-    pub fn add(&mut self, exit: u64, parts: [u64; 3]) {
+    pub fn add(&mut self, exit: u64, parts: [u64; WRITE_PARTS]) {
         self.count += 1;
         self.exit += exit;
         self.access += parts[0];
         self.settle += parts[1];
         self.call += parts[2];
+        self.transfer += parts[3];
+        self.copies += parts[4];
+        self.released += parts[5];
     }
 
     fn merge(&mut self, other: &Self) {
@@ -896,6 +1156,9 @@ impl DeviceWrites {
         self.access += other.access;
         self.settle += other.settle;
         self.call += other.call;
+        self.transfer += other.transfer;
+        self.copies += other.copies;
+        self.released += other.released;
     }
 }
 
@@ -910,6 +1173,10 @@ pub struct DeviceExits {
     pub forwarded: u64,
     pub forwarded_ticks: u64,
     pub writes: DeviceWrites,
+    /// The same accesses by register and direction, an open-addressed
+    /// table too, with the rest in `other_registers`.
+    pub registers: [DeviceRegisterExit; DEVICE_REGISTERS],
+    pub other_registers: DeviceRegisterExit,
 }
 
 impl Default for DeviceExits {
@@ -920,6 +1187,8 @@ impl Default for DeviceExits {
             forwarded: 0,
             forwarded_ticks: 0,
             writes: DeviceWrites::default(),
+            registers: [DeviceRegisterExit::default(); DEVICE_REGISTERS],
+            other_registers: DeviceRegisterExit::default(),
         }
     }
 }
@@ -941,10 +1210,37 @@ impl DeviceExits {
         self.other.add(count, ticks, waited);
     }
 
+    /// Count the accesses `exit` holds of its register as [`Self::add`]
+    /// counts its page's.
+    pub fn add_register(&mut self, exit: DeviceRegisterExit) {
+        let register = exit.register;
+        let hash = (register ^ register >> 32).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let start = (hash >> (u64::BITS - DEVICE_REGISTERS.ilog2())) as usize;
+        for probe in 0..DEVICE_REGISTERS {
+            let entry = &mut self.registers[(start + probe) % DEVICE_REGISTERS];
+            if entry.count == 0 {
+                entry.register = register;
+            }
+            if entry.register == register {
+                return entry.add(&exit);
+            }
+        }
+        self.other_registers.add(&exit);
+    }
+
+    /// The registers with accesses.
+    pub fn counted_registers(&self) -> impl Iterator<Item = &DeviceRegisterExit> {
+        self.registers.iter().filter(|entry| entry.count != 0)
+    }
+
     pub fn merge(&mut self, exits: &Self) {
         for entry in exits.counted() {
             self.add(entry.page, entry.count, entry.ticks, entry.waited);
         }
+        for entry in exits.counted_registers() {
+            self.add_register(*entry);
+        }
+        self.other_registers.add(&exits.other_registers);
         let other = exits.other;
         self.other.add(other.count, other.ticks, other.waited);
         self.forwarded += exits.forwarded;
@@ -1283,6 +1579,14 @@ pub struct Levels {
     /// the event register set (native code completes some itself).
     pub wfe: u64,
     pub wfe_at_once: u64,
+    /// WFEs native code completed after spinning for the event register,
+    /// spins that ended without it, WFEs that exited without a spin for an
+    /// exclusive monitor, and the system counts spins spent
+    /// (`x86_64::register_read::event_wait_thunk`).
+    pub wfe_spun: u64,
+    pub wfe_spin_missed: u64,
+    pub wfe_held: u64,
+    pub wfe_spin_counts: u64,
     /// At each WFI, the kernel ticks charged since the PE last ran EL0 code
     /// or reached a WFI: wake-ups that found nothing for user code, idle
     /// paths and kernel threads.
@@ -1326,6 +1630,14 @@ impl Levels {
         self.wfe_at_once += u64::from(at_once);
     }
 
+    /// What native WFEs counted of their spins.
+    pub(super) fn event_spins(&mut self, spin: stela_compiler::x86_64::register_read::EventSpin) {
+        self.wfe_spun += spin.completed;
+        self.wfe_spin_missed += spin.missed;
+        self.wfe_held += spin.held;
+        self.wfe_spin_counts += spin.counts;
+    }
+
     /// The counts since `earlier`; the state is this one's.
     pub fn since(&self, earlier: &Self) -> Self {
         let mut ticks = self.ticks;
@@ -1340,6 +1652,10 @@ impl Levels {
             wfi_at_once: self.wfi_at_once.wrapping_sub(earlier.wfi_at_once),
             wfe: self.wfe.wrapping_sub(earlier.wfe),
             wfe_at_once: self.wfe_at_once.wrapping_sub(earlier.wfe_at_once),
+            wfe_spun: self.wfe_spun.wrapping_sub(earlier.wfe_spun),
+            wfe_spin_missed: self.wfe_spin_missed.wrapping_sub(earlier.wfe_spin_missed),
+            wfe_held: self.wfe_held.wrapping_sub(earlier.wfe_held),
+            wfe_spin_counts: self.wfe_spin_counts.wrapping_sub(earlier.wfe_spin_counts),
             kernel_before_wfi: self
                 .kernel_before_wfi
                 .wrapping_sub(earlier.kernel_before_wfi),
@@ -1622,6 +1938,124 @@ mod tests {
         merged.merge(&exits);
         let first = merged.counted().find(|exit| exit.key == 0).unwrap();
         assert_eq!((first.count, first.closes), (4, 2));
+        assert_eq!(merged.other.count, 4);
+    }
+
+    /// Registers count apart by address and direction, the ones past the
+    /// table in `other_registers`, and merge.
+    #[test]
+    fn device_exits_count_by_register_and_direction() {
+        let mut exits = DeviceExits::default();
+        const REGISTER: u64 = 0x2_3b0c_8000;
+        let exit = |register, ticks, waited, access, settle| DeviceRegisterExit {
+            register,
+            count: 1,
+            ticks,
+            waited,
+            access,
+            settle,
+            ..DeviceRegisterExit::default()
+        };
+        exits.add_register(exit(REGISTER, 10, 2, 0, 0));
+        exits.add_register(exit(REGISTER | DEVICE_REGISTER_WRITE, 20, 0, 6, 9));
+        exits.add_register(exit(REGISTER, 5, 1, 0, 0));
+        for index in 0..DEVICE_REGISTERS as u64 {
+            exits.add_register(exit(0x1000 + index * 4, 1, 0, 0, 0));
+        }
+        let count = |exits: &DeviceExits, register| {
+            exits
+                .counted_registers()
+                .find(|exit| exit.register == register)
+                .map(|exit| {
+                    (
+                        exit.count,
+                        exit.ticks,
+                        exit.waited,
+                        exit.access,
+                        exit.settle,
+                    )
+                })
+        };
+        assert_eq!(count(&exits, REGISTER), Some((2, 15, 3, 0, 0)));
+        assert_eq!(
+            count(&exits, REGISTER | DEVICE_REGISTER_WRITE),
+            Some((1, 20, 0, 6, 9))
+        );
+        assert_eq!(exits.other_registers.count, 2);
+        let mut merged = DeviceExits::default();
+        merged.merge(&exits);
+        merged.merge(&exits);
+        assert_eq!(count(&merged, REGISTER), Some((4, 30, 6, 0, 0)));
+        let total: u64 = merged.counted_registers().map(|exit| exit.count).sum();
+        assert_eq!(
+            total + merged.other_registers.count,
+            2 * (3 + DEVICE_REGISTERS as u64)
+        );
+    }
+
+    #[test]
+    fn regime_syncs_merge() {
+        let regimes = RegimeSyncs {
+            syncs: 3,
+            sync_ticks: 30,
+            isolations: 1,
+            isolation_ticks: 7,
+            unchanged: 2,
+            sources: [1, 0, 0, 0, 2, 0, 0],
+        };
+        let exits = SystemExits {
+            regimes,
+            ..SystemExits::default()
+        };
+        assert!(!exits.is_empty());
+        let mut merged = SystemExits::default();
+        merged.merge(&exits);
+        merged.merge(&exits);
+        assert_eq!(
+            merged.regimes,
+            RegimeSyncs {
+                syncs: 6,
+                sync_ticks: 60,
+                isolations: 2,
+                isolation_ticks: 14,
+                unchanged: 4,
+                sources: [2, 0, 0, 0, 4, 0, 0],
+            }
+        );
+    }
+
+    #[test]
+    fn barrier_waits_count_quick_ones_apart_and_merge_by_blocker() {
+        let system = stela_compiler::block::ExitKind::System as usize;
+        let mut waits = BarrierWaits::default();
+        waits.add(None, 3);
+        waits.add(Some(BLOCKER_NATIVE), 10);
+        let dsb = exit_blocker(system, Some(0xd503_3b9f));
+        assert_eq!(dsb, exit_blocker(system, Some(0xd503_3b80)));
+        waits.add(Some(dsb), 20);
+        for key in 0..BARRIER_BLOCKERS as u64 {
+            waits.add(Some(BLOCKER_EXIT | key << 32), 1);
+        }
+        assert_eq!((waits.waits, waits.quick, waits.ticks), (35, 1, 65));
+        assert_eq!(waits.other.count, 2);
+        let exits = SystemExits {
+            barriers: waits,
+            ..SystemExits::default()
+        };
+        assert!(!exits.is_empty());
+        let mut merged = SystemExits::default();
+        merged.merge(&exits);
+        merged.merge(&exits);
+        let merged = merged.barriers;
+        assert_eq!((merged.waits, merged.quick, merged.ticks), (70, 2, 130));
+        let native = merged
+            .blockers
+            .iter()
+            .find(|b| b.key == BLOCKER_NATIVE)
+            .unwrap();
+        assert_eq!((native.count, native.ticks), (2, 20));
+        let dsb = merged.blockers.iter().find(|b| b.key == dsb).unwrap();
+        assert_eq!((dsb.count, dsb.ticks), (2, 40));
         assert_eq!(merged.other.count, 4);
     }
 

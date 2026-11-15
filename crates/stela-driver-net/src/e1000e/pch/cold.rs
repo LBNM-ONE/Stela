@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright(c) 1999 - 2018 Intel Corporation.
 // Copyright (c) 2026 Stela contributors
-//! Cold, unmanaged PCH MAC/PHY/NVM composition. Linux e1000e at the pinned
-//! revision is the register-sequencing reference; no Linux execution ABI is
-//! used. LPT is restricted to the exact [`lpt`] cohort and ownership contract.
-//! I219 is restricted to the exact [`i219`] and [`mtp`] PCI cohorts. Unlisted MACs, managed
-//! firmware and unimplemented low-power variants remain refused.
+//! Cold PCH MAC/PHY/NVM composition. Linux e1000e at the pinned revision is
+//! the register-sequencing reference; no Linux execution ABI is used. LPT is
+//! restricted to the exact [`lpt`] cohort and ownership contract. I219 is
+//! restricted to the exact [`i219`] and [`mtp`] PCI cohorts. An adapter the
+//! Intel ME manages starts as `e1000_init_phy_workarounds_pchlan` starts it:
+//! the ME takes the PHY out of ULP on request, shares it through the
+//! software flag, and a PHY reset it blocks is left out. Unlisted MACs and
+//! unimplemented low-power variants remain refused.
 use super::{Delay, Fault, Identity, Kind, Phy, Register, Registers, nvm};
 use alloc::{rc::Rc, vec::Vec};
 use core::cell::RefCell;
+use stela_driver_base::stepped::block_on;
 
 pub mod attach;
 pub mod i219;
@@ -68,6 +72,22 @@ const OEM_GBE_DISABLE: u16 = 0x40;
 const OEM_RESTART: u16 = 0x400;
 const PHY_D0_LPLU: u32 = 2;
 const PHY_GBE_DISABLE: u32 = 0x40;
+/// `E1000_H2ME`: requests from the host to the Intel ME.
+const H2ME: u32 = 0x5b50;
+const H2ME_ULP: u32 = 1 << 11;
+const H2ME_ENFORCE_SETTINGS: u32 = 1 << 12;
+/// `E1000_FWSM_ULP_CFG_DONE`: the ME is still configuring ULP.
+const ULP_CONFIG_DONE: u32 = 1 << 10;
+const CTRL_EXT: u32 = 0x18;
+const FORCE_SMBUS: u32 = 1 << 11;
+/// `E1000_CTRL_EXT_LPCD`: the LANPHYPC power cycle is done.
+const POWER_CYCLE_DONE: u32 = 4;
+const LANPHYPC_OVERRIDE: u32 = 1 << 16;
+const LANPHYPC_VALUE: u32 = 1 << 17;
+const SMB_CONTROL: Register = Register {
+    page: 769,
+    index: 23,
+};
 const MSE_THRESHOLD: u16 = 0x084f;
 const MSE_LINK_DOWN: u16 = 0x2411;
 const LPI_UPDATE_TIMER: u16 = 0x4805;
@@ -87,9 +107,19 @@ pub enum Error {
     SmbusMode,
     PowerCycleTimeout,
     UlpState,
+    /// The Intel ME did not take the PHY out of ULP when asked.
+    MeUlpTimeout,
+    /// The PHY does not answer and the Intel ME blocks the LANPHYPC toggle
+    /// that would wake it.
+    RecoveryBlocked,
+    /// The PHY does not answer, even after the LANPHYPC toggle.
+    PhyInaccessible,
+    /// The Intel ME blocked the PHY after its reset.
+    BlockedAfterReset,
     DescriptorFlushRequired,
+    /// A PHY link change was still under way when the adapter had to stop.
+    LinkChangeUnfinished,
     Dma(crate::block::BlockError),
-    QueueStalled,
     Stopped,
     Poisoned,
 }
@@ -126,7 +156,42 @@ impl Error {
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "PCH Ethernet: {self:?}")
+        match self {
+            Self::UnsupportedDevice(device) => write!(f, "device {device:04x} is not supported"),
+            Self::Phy(error) => error.fmt(f),
+            Self::Nvm(error) => write!(f, "its NVM is unreadable ({error})"),
+            Self::MasterTimeout => f.write_str("its DMA master did not stop"),
+            Self::ResetStuck => f.write_str("its reset did not complete"),
+            Self::InitTimeout => f.write_str("its configuration did not finish after reset"),
+            Self::ResetNotObserved => f.write_str("its PHY reset was not observed"),
+            Self::Configuration => f.write_str("its NVM configuration is invalid"),
+            Self::LtrLimit(value) => write!(f, "its LTR limit {value:#06x} is invalid"),
+            Self::HostIdentityNotObserved => {
+                f.write_str("this PC's SMBIOS identity, which it needs, was not read")
+            }
+            Self::SmbusMode => f.write_str("the PHY stays in SMBus mode"),
+            Self::PowerCycleTimeout => f.write_str("the PHY power cycle (LANPHYPC) did not finish"),
+            Self::UlpState => f.write_str("the PHY stays in its ultra-low-power state"),
+            Self::MeUlpTimeout => {
+                f.write_str("the Intel ME did not take the PHY out of its low-power state")
+            }
+            Self::RecoveryBlocked => f.write_str(
+                "the PHY does not answer, and the Intel ME blocks the power cycle that would wake it",
+            ),
+            Self::PhyInaccessible => {
+                f.write_str("the PHY does not answer, even after a power cycle (LANPHYPC)")
+            }
+            Self::BlockedAfterReset => f.write_str("the Intel ME blocked the PHY after its reset"),
+            Self::DescriptorFlushRequired => {
+                f.write_str("the firmware left its rings needing a flush")
+            }
+            Self::LinkChangeUnfinished => {
+                f.write_str("a PHY link change was still under way when it had to stop")
+            }
+            Self::Dma(error) => write!(f, "its DMA memory failed ({error})"),
+            Self::Stopped => f.write_str("it is stopped"),
+            Self::Poisoned => f.write_str("an earlier failure left it unusable"),
+        }
     }
 }
 impl core::error::Error for Error {}
@@ -191,6 +256,8 @@ pub struct Controller<R: Registers + nvm::Registers, D: Delay + Clone> {
     poisoned: bool,
     profile: Profile,
     config_read: Option<ConfigRead<R>>,
+    /// The PHY's ULP exit failed and the start went on without it.
+    ulp_exit_failed: bool,
 }
 impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
     /// # Safety
@@ -200,8 +267,10 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
     /// real reservation/mappings. Native DMA, IRQs, firmware/SMM and all other
     /// users are already excluded/drained. This is a new cold reset epoch;
     /// `delay` and its clones provide real minimum elapsed hardware delays.
-    /// The initial PHY must be accessible; SMBus/LANPHYPC recovery is not yet
-    /// admitted. This does not authorize LPT/SPT by PHY-ID similarity.
+    /// The 82579's initial PHY must be accessible; its SMBus/LANPHYPC
+    /// recovery is not admitted (the I219 cohorts toggle LANPHYPC before
+    /// their first PHY read). This does not authorize LPT/SPT by PHY-ID
+    /// similarity.
     pub unsafe fn new(device: u16, io: R, delay: D) -> Result<Self, Error> {
         if !matches!(device, 0x1502 | 0x1503) {
             return Err(Error::UnsupportedDevice(device));
@@ -224,6 +293,7 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             poisoned: false,
             profile: Profile::I82579,
             config_read: None,
+            ulp_exit_failed: false,
         };
         if let Err(error) = this.initialize() {
             this.poisoned = true;
@@ -243,6 +313,11 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             .minimum_failure
             .or_else(|| self.nvm.minimum_failure())
     }
+    /// Whether the PHY did not leave ULP when asked, which Linux logs as
+    /// "Failed to disable ULP" before it goes on to its PHY access checks.
+    pub fn ulp_exit_failed(&self) -> bool {
+        self.ulp_exit_failed
+    }
     pub fn is_poisoned(&self) -> bool {
         self.poisoned || self.phy.is_poisoned() || self.nvm.is_poisoned()
     }
@@ -253,15 +328,159 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
     fn write(&mut self, at: u32, value: u32) -> Result<(), Error> {
         Ok(self.phy.write_mac(at, value)?)
     }
-    fn qualify(&mut self) -> Result<(), Error> {
-        let fw = self.read(super::FWSM)?;
-        if fw & super::FW_VALID != 0 {
-            return Err(Fault::FirmwareOwned.into());
+    /// Whether the Intel ME manages the adapter (FWSM firmware valid).
+    fn managed(&mut self) -> Result<bool, Error> {
+        Ok(self.read(super::FWSM)? & super::FW_VALID != 0)
+    }
+    /// `e1000_check_reset_block_ich8lan`: whether the Intel ME blocks a PHY
+    /// reset, after waiting up to 300 ms for it to permit one.
+    fn reset_blocked(&mut self) -> Result<bool, Error> {
+        for attempt in 0..=30 {
+            if self.read(super::FWSM)? & super::RESET_PERMITTED != 0 {
+                return Ok(false);
+            }
+            if attempt < 30 {
+                self.phy.wait_minimum(10_000)?;
+            }
         }
-        if fw & super::RESET_PERMITTED == 0 {
-            return Err(Fault::ResetBlocked.into());
+        Ok(true)
+    }
+    /// The PHY hardware reset, unless the Intel ME blocks it, as
+    /// `e1000e_phy_hw_reset_generic` leaves it out. Whether it ran.
+    fn reset_phy(&mut self) -> Result<bool, Error> {
+        if self.reset_blocked()? {
+            return Ok(false);
         }
+        self.phy_reset()?;
+        Ok(true)
+    }
+    /// `e1000_disable_ulp_lpt_lp` for an adapter the Intel ME manages: ask
+    /// the ME to take the PHY out of ULP and wait up to 2.5 s for it.
+    fn me_ulp_exit(&mut self) -> Result<(), Error> {
+        let request = self.read(H2ME)?;
+        self.write(H2ME, (request & !H2ME_ULP) | H2ME_ENFORCE_SETTINGS)?;
+        let mut done = false;
+        for attempt in 0..=250 {
+            if self.read(super::FWSM)? & ULP_CONFIG_DONE == 0 {
+                done = true;
+                break;
+            }
+            if attempt < 250 {
+                self.phy.wait_minimum(10_000)?;
+            }
+        }
+        if !done {
+            return Err(Error::MeUlpTimeout);
+        }
+        let request = self.read(H2ME)?;
+        self.write(H2ME, request & !H2ME_ENFORCE_SETTINGS)
+    }
+    /// `e1000_toggle_lanphypc_pch_lpt`: power-cycle the PHY interconnect,
+    /// which brings a PHY out of SMBus mode.
+    fn toggle_lanphypc(&mut self) -> Result<(), Error> {
+        let lpt = self.profile.is_lpt_or_newer();
+        self.phy.transaction(|p| {
+            let value = p.read_mac(FEXTNVM3)?;
+            p.write_mac(FEXTNVM3, (value & !CONFIG_COUNTER) | CONFIG_50MS)?;
+            let value = (p.read_mac(CTRL)? | LANPHYPC_OVERRIDE) & !LANPHYPC_VALUE;
+            p.write_mac(CTRL, value)?;
+            p.read_mac(STATUS)?;
+            p.wait_minimum(10)?;
+            p.write_mac(CTRL, value & !LANPHYPC_OVERRIDE)?;
+            p.read_mac(STATUS)?;
+            if lpt {
+                for _ in 0..=20 {
+                    p.wait_minimum(5_000)?;
+                    if p.read_mac(CTRL_EXT)? & POWER_CYCLE_DONE != 0 {
+                        break;
+                    }
+                }
+                p.wait_minimum(30_000)?;
+            } else {
+                p.wait_minimum(50_000)?;
+            }
+            Ok(())
+        })?;
         Ok(())
+    }
+    /// `e1000_phy_is_accessible_pchlan`: whether the PHY answers, retried in
+    /// MDIO slow mode on an 82579. On LPT and newer, an answering PHY of an
+    /// adapter the ME does not manage is taken out of forced SMBus mode in
+    /// the PHY and the MAC.
+    fn phy_accessible(&mut self, managed: bool) -> Result<bool, Error> {
+        let mut accessible = self.phy.accessible()?;
+        // `e1000_set_mdio_slow_mode_hv` on a PHY that does not answer fails
+        // too, and Linux then takes the PHY as inaccessible.
+        if !accessible
+            && !self.profile.is_lpt_or_newer()
+            && self
+                .phy
+                .modify_if_answering(Register::new(769, 16)?, 0, MDIO_SLOW)?
+        {
+            accessible = self.phy.accessible()?;
+        }
+        if accessible && self.profile.is_lpt_or_newer() && !managed {
+            self.phy.transaction(|p| {
+                let retry = core::mem::replace(&mut p.retry_enabled, false);
+                // Switching the interface answers with an MDI error, which
+                // the readback below settles.
+                let result = (|| {
+                    let value = p.access(SMB_CONTROL, None)?;
+                    match p.access(SMB_CONTROL, Some(value & !1)) {
+                        Ok(_) | Err(Fault::MdicTimeout | Fault::MdicResponse(_)) => Ok(()),
+                        Err(error) => Err(error),
+                    }
+                })();
+                p.retry_enabled = retry;
+                result
+            })?;
+            let value = self.read(CTRL_EXT)?;
+            self.write(CTRL_EXT, value & !FORCE_SMBUS)?;
+        }
+        Ok(accessible)
+    }
+    /// `e1000_init_phy_workarounds_pchlan` after its ULP exit: a PHY that
+    /// does not answer is looked for again with the MAC forced to SMBus
+    /// mode, then woken with a LANPHYPC toggle unless the Intel ME blocks
+    /// it, then, on LPT and newer, with the MAC back out of SMBus mode.
+    fn recover_phy_access(&mut self, managed: bool) -> Result<(), Error> {
+        let lpt = self.profile.is_lpt_or_newer();
+        if self.phy_accessible(managed)? {
+            return Ok(());
+        }
+        if lpt {
+            let value = self.read(CTRL_EXT)?;
+            self.write(CTRL_EXT, value | FORCE_SMBUS)?;
+            self.phy.wait_minimum(50_000)?;
+            if self.phy_accessible(managed)? {
+                return Ok(());
+            }
+        }
+        if self.reset_blocked()? {
+            return Err(Error::RecoveryBlocked);
+        }
+        self.toggle_lanphypc()?;
+        if !lpt || self.phy_accessible(managed)? {
+            return Ok(());
+        }
+        let value = self.read(CTRL_EXT)?;
+        self.write(CTRL_EXT, value & !FORCE_SMBUS)?;
+        if self.phy_accessible(managed)? {
+            return Ok(());
+        }
+        Err(Error::PhyInaccessible)
+    }
+    /// `e1000_init_phy_workarounds_pchlan`'s close: the PHY is reset unless
+    /// the ME blocks it, and an ME that blocks it right after is a failure.
+    fn reset_phy_after_workarounds(&mut self) -> Result<bool, Error> {
+        let reset = self.reset_phy()?;
+        if reset {
+            self.configuration_done(true)?;
+            if self.reset_blocked()? {
+                return Err(Error::BlockedAfterReset);
+            }
+        }
+        Ok(reset)
     }
     fn gate(&mut self, enabled: bool) -> Result<(), Error> {
         let value = self.read(super::EXTCNF_CTRL)?;
@@ -275,24 +494,26 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         )
     }
     fn initialize(&mut self) -> Result<(), Error> {
-        self.qualify()?;
-        // Refuse inaccessible/foreign PHYs before any recovery pulse. Exact
-        // identity is checked again after both reset kinds have completed.
-        self.identity = self.phy.identify()?;
         self.validate_nvm()?;
         self.station = self.nvm.station()?;
+        // `e1000_init_phy_workarounds_pchlan` for the 82579: gate the PHY's
+        // own configuration, wake a PHY left in SMBus mode, reset it, and
+        // ungate it again only when the ME does not manage the adapter.
+        let managed = self.managed()?;
         self.gate(true)?;
-        self.phy_reset()?;
-        self.configuration_done()?;
-        self.qualify()?;
-        self.phy.wait_minimum(10_000)?;
-        self.gate(false)?;
+        self.recover_phy_access(managed)?;
+        self.identity = self.phy.identify()?;
+        self.reset_phy_after_workarounds()?;
+        if !managed {
+            self.phy.wait_minimum(10_000)?;
+            self.gate(false)?;
+        }
         self.identity = self.phy.identify()?;
         // e1000e_reset sets the ordinary-MTU PCH2 allocation before invoking
         // reset_hw. Hardware derives the complementary TX allocation.
         self.write(PBA, RX_ALLOCATION_KIB)?;
-        self.global_reset()?;
-        self.configuration_done()?;
+        let reset = self.global_reset()?;
+        self.configuration_done(reset)?;
         self.post_reset()?;
         self.write(IMC, u32::MAX)?;
         self.read(ICR)?;
@@ -314,8 +535,9 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         })?;
         Ok(())
     }
-    fn global_reset(&mut self) -> Result<(), Error> {
-        self.qualify()?;
+    /// `e1000_reset_hw_ich8lan`: the full reset, with the PHY's unless the
+    /// Intel ME blocks it. Whether the PHY was reset too.
+    fn global_reset(&mut self) -> Result<bool, Error> {
         let ctrl = self.read(CTRL)?;
         self.write(CTRL, ctrl | MASTER_DISABLE)?;
         let mut drained = false;
@@ -334,9 +556,9 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         self.write(TCTL, PAD_SHORT)?;
         self.read(STATUS)?;
         self.phy.wait_minimum(10_000)?;
-        let ctrl = self.read(CTRL)? | PHY_RESET;
-        self.qualify()?;
-        if !self.profile.is_lpt_or_newer() {
+        let phy = !self.reset_blocked()?;
+        let ctrl = self.read(CTRL)? | if phy { PHY_RESET } else { 0 };
+        if phy && !self.profile.is_lpt_or_newer() && !self.managed()? {
             self.gate(true)?;
         }
         self.phy.acquire()?;
@@ -353,7 +575,7 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             let value = self.read(FEXTNVM3)?;
             self.write(FEXTNVM3, (value & !CONFIG_COUNTER) | CONFIG_50MS)?;
         }
-        Ok(())
+        Ok(phy)
     }
     fn validate_nvm(&mut self) -> Result<(), Error> {
         if self.mtp_family().is_some() {
@@ -367,7 +589,9 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         }
         Ok(())
     }
-    fn configuration_done(&mut self) -> Result<(), Error> {
+    /// `e1000_get_cfg_done_ich8lan` after a reset; a PHY reset is observed
+    /// only when `phy_reset` says one ran.
+    fn configuration_done(&mut self, phy_reset: bool) -> Result<(), Error> {
         self.phy.wait_minimum(10_000)?;
         let mut ready = false;
         for _ in 0..1500 {
@@ -384,27 +608,42 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         let status = self.read(STATUS)?;
         self.write(STATUS, status & !INIT_DONE)?;
         let status = self.read(STATUS)?;
-        if status & PHY_RESET_ASSERTED == 0 {
-            return Err(Error::ResetNotObserved);
+        if phy_reset {
+            if status & PHY_RESET_ASSERTED == 0 {
+                return Err(Error::ResetNotObserved);
+            }
+            self.write(STATUS, status & !PHY_RESET_ASSERTED)?;
         }
-        self.write(STATUS, status & !PHY_RESET_ASSERTED)?;
         // The flash itself is immutable in this exclusive epoch. Validate its
         // selected bank/checksum again after reset; no erased-bank fallback.
         self.validate_nvm()?;
         Ok(())
     }
     fn modify(&mut self, page: u16, index: u16, clear: u16, set: u16) -> Result<(), Error> {
+        block_on(self.modify_steps(page, index, clear, set))
+    }
+    async fn modify_steps(
+        &mut self,
+        page: u16,
+        index: u16,
+        clear: u16,
+        set: u16,
+    ) -> Result<(), Error> {
         let reg = Register::new(page, index)?;
-        let value = self.phy.read(reg)?;
-        Ok(self.phy.write(reg, (value & !clear) | set)?)
+        let value = self.phy.read_steps(reg).await?;
+        Ok(self.phy.write_steps(reg, (value & !clear) | set).await?)
     }
     fn emi(p: &mut Phy<Bus<R>, D>, at: u16, data: u16) -> Result<(), Fault> {
-        p.access(Register { page: 0, index: 16 }, Some(at))?;
-        p.access(Register { page: 0, index: 17 }, Some(data))?;
+        block_on(Self::emi_steps(p, at, data))
+    }
+    async fn emi_steps(p: &mut Phy<Bus<R>, D>, at: u16, data: u16) -> Result<(), Fault> {
+        p.access_steps(Register { page: 0, index: 16 }, Some(at))
+            .await?;
+        p.access_steps(Register { page: 0, index: 17 }, Some(data))
+            .await?;
         Ok(())
     }
     fn post_reset(&mut self) -> Result<(), Error> {
-        self.qualify()?;
         self.phy.wait_minimum(10_000)?;
         if !self.profile.is_lpt_or_newer() {
             self.modify(769, 16, 0, MDIO_SLOW)?;
@@ -416,10 +655,12 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         self.modify(769, 17, HOST_WAKE, 0)?;
         self.lcd()?;
         self.oem()?;
-        if !self.profile.is_lpt_or_newer() {
-            self.qualify()?;
+        // `e1000_post_phy_reset_ich8lan` ungates only an unmanaged 82579.
+        if !self.profile.is_lpt_or_newer() && !self.managed()? {
             self.phy.wait_minimum(10_000)?;
             self.gate(false)?;
+        }
+        if !self.profile.is_lpt_or_newer() {
             self.phy
                 .transaction(|p| Self::emi(p, LPI_UPDATE_TIMER, 0x1387))?;
         }
@@ -510,6 +751,12 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
     fn oem(&mut self) -> Result<(), Error> {
         // Source D0 policy: apply MAC-strapped LPLU/Gbe-disable bits.
         // Never manufacture a faster mode by ignoring an OEM restriction.
+        // Autonegotiation restarts only where the ME permits a PHY reset.
+        let restart = if self.reset_blocked()? {
+            0
+        } else {
+            OEM_RESTART
+        };
         self.phy.transaction(|p| {
             if p.read_mac(FEXTNVM)? & SW_CONFIG == 0 {
                 return Ok(());
@@ -526,14 +773,7 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
             if control & PHY_GBE_DISABLE != 0 {
                 value |= OEM_GBE_DISABLE;
             }
-            let fw = p.read_mac(super::FWSM)?;
-            if fw & super::FW_VALID != 0 {
-                return Err(Fault::FirmwareOwned);
-            }
-            if fw & super::RESET_PERMITTED == 0 {
-                return Err(Fault::ResetBlocked);
-            }
-            p.access(reg, Some(value | OEM_RESTART))?;
+            p.access(reg, Some(value | restart))?;
             Ok(())
         })?;
         Ok(())

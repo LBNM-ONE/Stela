@@ -13,7 +13,7 @@
 //!   size.
 //! - `log`: with `--nor-file`, the persistent boot log in a preallocated
 //!   file on a USB disk's FAT32 volume, laid out as a machine-state
-//!   partition (`pc::boot_log`); `stela boot-log FILE --offset 0` reads it.
+//!   partition (`pc::boot_log`); `stela log FILE --offset 0` reads it.
 //!   Only that file's blocks are written, and only on a USB disk.
 //! - `apic`, `interrupts`: the local APIC timer measured against the TSC,
 //!   then one one-shot and 100 ms of periodic interrupts through the IDT's
@@ -349,7 +349,7 @@ fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
         output::arguments(format_args!("STORAGE UNMAPPED ecam={window:x?}\n"));
     }
     for (address, error) in &devices.failures {
-        crate::storage::report_failure(*address, error);
+        crate::storage::report_failure(&devices, *address, error);
     }
     for (location, error) in &devices.platform_failures {
         output::arguments(format_args!("PLATFORM FAILED {location}: {error}\n"));
@@ -365,8 +365,8 @@ fn disks(machine: &mut Machine, handoff: &Handoff) -> Vec<InputDevice> {
     }
     for (location, error) in &devices.usb_failures {
         output::arguments(format_args!(
-            "USB FAILED {location}: {}\n",
-            stela_drivers::usb::xhci::explain(error)
+            "{}",
+            stela_drivers::usb::xhci::failure_line(location, error)
         ));
     }
     for (location, why) in &devices.usb_unused {

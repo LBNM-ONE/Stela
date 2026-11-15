@@ -61,6 +61,25 @@ pub enum BlockError {
     PciPower(crate::bus::pci::power::Error),
     /// The device needs something these drivers do not implement.
     Unsupported(&'static str),
+    /// `error`, met at this named step of a device's start: the command
+    /// or register wait that failed.
+    Step {
+        step: &'static str,
+        error: Box<BlockError>,
+    },
+}
+impl BlockError {
+    /// This error as met at `step`. One that already names its step keeps
+    /// it: the innermost name is the command that failed.
+    pub fn at(self, step: &'static str) -> Self {
+        match self {
+            Self::Step { .. } => self,
+            error => Self::Step {
+                step,
+                error: Box::new(error),
+            },
+        }
+    }
 }
 impl From<crate::bus::mmio::owned::Error> for BlockError {
     fn from(error: crate::bus::mmio::owned::Error) -> Self {
@@ -223,13 +242,14 @@ impl fmt::Display for BlockError {
             Self::Protocol(what) => write!(f, "transport protocol violation: {what}"),
             Self::Timeout => f.write_str("device timeout"),
             Self::NoDmaMemory => f.write_str("DMA pages exhausted"),
-            Self::Dma(error) => write!(f, "DMA allocation: {error:?}"),
-            Self::Mmio(error) => write!(f, "MMIO mapping: {error:?}"),
-            Self::Irq(error) => write!(f, "IRQ: {error:?}"),
+            Self::Dma(error) => write!(f, "DMA allocation: {error}"),
+            Self::Mmio(error) => write!(f, "MMIO mapping: {error}"),
+            Self::Irq(error) => write!(f, "interrupt: {error}"),
             Self::Config(error) => write!(f, "PCI configuration: {error}"),
-            Self::PciCapability(error) => write!(f, "PCI capability: {error:?}"),
-            Self::PciPower(error) => write!(f, "PCI power/timing: {error:?}"),
+            Self::PciCapability(error) => write!(f, "PCI capability: {error}"),
+            Self::PciPower(error) => write!(f, "PCI power/timing: {error}"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
+            Self::Step { step, error } => write!(f, "{step}: {error}"),
         }
     }
 }
@@ -1094,6 +1114,18 @@ pub trait BlockDevice {
         ))
     }
 
+    /// [`Self::start`], with more commands to follow at once: the device
+    /// may leave telling its hardware of it until [`Self::commit`], so a
+    /// batch costs one notice, as Linux's `commit_rqs` does. Commands still
+    /// run in the order they were started.
+    fn start_more(&mut self, command: Command) -> Result<u32, BlockError> {
+        self.start(command)
+    }
+
+    /// Tell the hardware of every command [`Self::start_more`] started, after
+    /// the last of a batch; every caller of `start_more` calls it.
+    fn commit(&mut self) {}
+
     /// Command `tag`'s result once the device has completed it.
     fn finish(&mut self, _tag: u32) -> Option<Finished> {
         None
@@ -1176,6 +1208,14 @@ impl<D: BlockDevice + ?Sized> BlockDevice for Box<D> {
 
     fn start(&mut self, command: Command) -> Result<u32, BlockError> {
         (**self).start(command)
+    }
+
+    fn start_more(&mut self, command: Command) -> Result<u32, BlockError> {
+        (**self).start_more(command)
+    }
+
+    fn commit(&mut self) {
+        (**self).commit();
     }
 
     fn finish(&mut self, tag: u32) -> Option<Finished> {

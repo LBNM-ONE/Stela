@@ -402,6 +402,15 @@ pub trait Host {
     fn poll_interrupt(&mut self) -> bool {
         false
     }
+    /// Whether work only the host can do is due, outside the board: a host
+    /// disk's completion that its interrupt announced and nobody has taken
+    /// yet. A PE that waits for an interrupt then returns to the host
+    /// ([`Stop::Waiting`]), as for a device's bytes the host feeds
+    /// ([`Devices::take_host_service`]), rather than sleep on until its own
+    /// next wake with the completion in memory.
+    fn host_work_due(&mut self) -> bool {
+        false
+    }
     /// Progress events for the diagnostic log.
     fn report(&mut self, _event: &Event) {}
     /// The persistent translation store blocks are taken from and offered
@@ -429,6 +438,17 @@ pub enum DeviceError {
 pub struct ConsumedPair {
     pub values: [u64; 2],
     pub settlement: Result<(), DeviceError>,
+}
+
+/// A plain read the devices served ([`Devices::take_plain_read`]): its
+/// model's epoch and the count it held, the value, and the count before
+/// which no device deadline comes (`u64::MAX`: none).
+#[derive(Debug, Clone)]
+pub struct PlainRead {
+    pub epoch: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
+    pub seen: u64,
+    pub value: u64,
+    pub until: u64,
 }
 
 /// How [`Devices::read_scalar`] answered a scalar read.
@@ -598,9 +618,13 @@ pub trait Devices {
         let settled = written
             .is_ok()
             .then(|| self.settle_write(cpu, now, &mut processors.memory()));
+        let settled_at = processors.native_host().profile_ticks();
         Some(WriteSettled {
             written,
             written_at,
+            settled_at,
+            unlocked_at: settled_at,
+            released: 0,
             settled,
         })
     }
@@ -794,6 +818,29 @@ pub trait Devices {
     fn device_name(&self, _physical: u64) -> Option<&'static str> {
         None
     }
+    /// The name the model mapped at `physical` gives that register, for
+    /// reports.
+    fn register_name(&self, _physical: u64) -> Option<&'static str> {
+        None
+    }
+    /// The plain read the last [`Self::read_scalar`] served, if it was one
+    /// whose value stays while its epoch holds the count and the count is
+    /// below `until`: native code may serve it again on those terms.
+    fn take_plain_read(&mut self) -> Option<PlainRead> {
+        None
+    }
+    /// For a plain read of `bytes` at `physical`, one that changes nothing
+    /// and whose value follows from its model's state alone, that model's
+    /// epoch and the count it holds now: while the count holds, the value
+    /// such a read gave stays its value, and a PE may serve it again
+    /// without the devices. `None` for any other read.
+    fn plain_epoch(
+        &self,
+        _physical: u64,
+        _bytes: u8,
+    ) -> Option<(alloc::sync::Arc<core::sync::atomic::AtomicU64>, u64)> {
+        None
+    }
     /// Host counter ticks this handle waited for a shared board's lock
     /// since the last call.
     fn take_lock_wait(&mut self) -> u64 {
@@ -823,6 +870,16 @@ pub struct WriteSettled {
     /// The host's profile clock ([`Host::profile_ticks`]) once the write
     /// itself was done, before its settlement.
     pub written_at: u64,
+    /// The profile clock once the settlement's transfer was done.
+    pub settled_at: u64,
+    /// The profile clock once a shared board told the PEs whose lines
+    /// changed and released its lock, before the DMA copies the settlement
+    /// deferred ([`Self::settled_at`] for a board of one).
+    pub unlocked_at: u64,
+    /// The board counter's ticks ([`super::parallel::Kick::ticks`], as a
+    /// lock wait's) the host work the release left took on this core
+    /// ([`super::parallel::Kick::released`]), within the settle.
+    pub released: u64,
     /// The write's settlement, when it succeeded.
     pub settled: Option<Settled>,
 }

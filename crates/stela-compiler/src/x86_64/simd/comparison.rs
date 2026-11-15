@@ -6,6 +6,7 @@ use super::numerical::{
     test_control, vector_exponent_range,
 };
 use super::numerical::{helper_section, jump};
+use super::precision::dword_constant;
 use super::{Host, commit, packed, read_vector};
 use crate::x86_64::asm::FloatLanes;
 use crate::x86_64::asm::{Alu, Code, Cond, Gpr, Rm, ShiftOp, Size};
@@ -13,8 +14,10 @@ use crate::x86_64::flag_word;
 use crate::{
     GuestAddress, TargetCpu,
     aarch64::{
-        flags::{NZCV_C, NZCV_N, NZCV_SHIFT, NZCV_Z},
-        floating::{FPCR_EXCEPTION_ENABLE_MASK, FPCR_NEP, Format, comparison::Predicate},
+        flags::{NZCV_C, NZCV_N, NZCV_SHIFT, NZCV_V, NZCV_Z},
+        floating::{
+            FPCR_EXCEPTION_ENABLE_MASK, FPCR_FZ16, FPCR_NEP, Format, comparison::Predicate,
+        },
         simd::{
             arithmetic::Shape,
             comparison::{CompareSource, Operand},
@@ -48,6 +51,8 @@ const HALF_SIGN_TO_DWORD_TOP: u8 = (u32::BITS - u16::BITS) as u8;
 const COMPARE_EQUAL: u8 = 0;
 const COMPARE_LESS: u8 = 1;
 const COMPARE_LESS_EQUAL: u8 = 2;
+/// The ByteSignMask bits of a scalar Half lane.
+const HALF_SCALAR_MASK: u32 = 0x03;
 const HALF_LOW_MASK: u32 = 0xff;
 const HALF_FULL_MASK: u32 = 0xffff;
 const SINGLE_LOW_MASK: u32 = 0x03;
@@ -205,29 +210,79 @@ fn vector_zero_or_normal_guard(
     helper.push(branch(code, Condition::NotZero));
 }
 
-/// Signed order key for nonzero normal half values. Sign-complementing the
-/// fraction/exponent reverses negative magnitudes without a host FP operation.
-fn half_order_key(code: &mut Code, vector: u8) {
-    packed(code, Host::MoveAligned, TEMP_VECTOR, vector);
-    ShiftOpcode::ArithmeticWord.emit(code, TEMP_VECTOR, HALF_SIGN_SHIFT);
-    ShiftOpcode::RightWord.emit(code, TEMP_VECTOR, SIGN_BITS);
-    packed(code, Host::Xor, vector, TEMP_VECTOR);
-}
-
-/// `register` takes the low Half of `vector` as a signed integer of its
-/// magnitude: both zeros become 0, and finite values and infinities keep
-/// their order. Uses EDX.
-fn half_signed_magnitude(code: &mut Code, register: Gpr, vector: u8) {
-    const MAGNITUDE: i32 = 0x7fff;
-    let mut asm = code.asm();
-    asm.movd_from_xmm(register, vector);
-    asm.mov(Size::Dword, Gpr::Rdx, register);
-    asm.alu_imm32(Alu::And, Size::Dword, register, MAGNITUDE);
-    // EDX becomes all ones for a negative value, then negates the magnitude.
-    asm.shift_imm(ShiftOp::Shl, Size::Dword, Gpr::Rdx, HALF_SIGN_TO_DWORD_TOP);
-    asm.shift_imm(ShiftOp::Sar, Size::Dword, Gpr::Rdx, SINGLE_SIGN_SHIFT);
-    asm.alu(Alu::Xor, Size::Dword, register, Gpr::Rdx);
-    asm.alu(Alu::Sub, Size::Dword, register, Gpr::Rdx);
+/// Replace each Half lane of LEFT_VECTOR and RIGHT_VECTOR by a signed word
+/// key that orders as Arm compares: its magnitude, FZ16 flushing a
+/// subnormal's to zero (without IDC), negated for a negative value unless
+/// `absolute`. Both zeros key as 0 and the infinities sit at the ends. NaN
+/// lanes, whose keys order arbitrarily, go to NAN_VECTOR; R11D takes IOC
+/// when an active lane raises it (any NaN for the ordered predicates, a
+/// signalling one for FCMEQ). Uses ZERO_RESULT_VECTOR, ZERO_VECTOR,
+/// QWORD_EQUAL_VECTOR, TEMP_VECTOR and EAX.
+fn half_keys(code: &mut Code, operation: Predicate, shape: Shape) {
+    const MAGNITUDE: u8 = ZERO_RESULT_VECTOR;
+    const CONSTANT: u8 = ZERO_VECTOR;
+    const SIGNALLING: u8 = QWORD_EQUAL_VECTOR;
+    const INFINITY: u32 = 0x7c00_7c00;
+    /// Moves the quiet bit to the sign.
+    const QUIET_TO_SIGN: u8 = 6;
+    packed(code, Host::Xor, NAN_VECTOR, NAN_VECTOR);
+    packed(code, Host::Xor, SIGNALLING, SIGNALLING);
+    for source in [LEFT_VECTOR, RIGHT_VECTOR] {
+        packed(code, Host::MoveAligned, MAGNITUDE, source);
+        ShiftOpcode::LeftWord.emit(code, MAGNITUDE, SIGN_BITS);
+        ShiftOpcode::RightWord.emit(code, MAGNITUDE, SIGN_BITS);
+        // TEMP_VECTOR: the NaN lanes, magnitudes above the infinity's.
+        dword_constant(code, CONSTANT, INFINITY);
+        packed(code, Host::MoveAligned, TEMP_VECTOR, MAGNITUDE);
+        packed(code, Host::GreaterWord, TEMP_VECTOR, CONSTANT);
+        packed(code, Host::Or, NAN_VECTOR, TEMP_VECTOR);
+        if operation == Predicate::Equal {
+            packed(code, Host::MoveAligned, CONSTANT, source);
+            ShiftOpcode::LeftWord.emit(code, CONSTANT, QUIET_TO_SIGN);
+            ShiftOpcode::ArithmeticWord.emit(code, CONSTANT, HALF_SIGN_SHIFT);
+            packed(code, Host::AndNot, CONSTANT, TEMP_VECTOR);
+            packed(code, Host::Or, SIGNALLING, CONSTANT);
+        }
+        test_control(code, FPCR_FZ16);
+        let kept = branch(code, Condition::Zero);
+        // A zero exponent field: the magnitude becomes zero.
+        packed(code, Host::MoveAligned, TEMP_VECTOR, MAGNITUDE);
+        ShiftOpcode::RightWord.emit(code, TEMP_VECTOR, Format::Half.fraction_bits() as u8);
+        packed(code, Host::Xor, CONSTANT, CONSTANT);
+        packed(code, Host::EqualWord, TEMP_VECTOR, CONSTANT);
+        packed(code, Host::AndNot, TEMP_VECTOR, MAGNITUDE);
+        packed(code, Host::MoveAligned, MAGNITUDE, TEMP_VECTOR);
+        let flushed = code.len();
+        resolve(code, kept, flushed);
+        if !absolute(operation) {
+            packed(code, Host::MoveAligned, TEMP_VECTOR, source);
+            ShiftOpcode::ArithmeticWord.emit(code, TEMP_VECTOR, HALF_SIGN_SHIFT);
+            packed(code, Host::Xor, MAGNITUDE, TEMP_VECTOR);
+            packed(code, Host::SubWord, MAGNITUDE, TEMP_VECTOR);
+        }
+        packed(code, Host::MoveAligned, source, MAGNITUDE);
+    }
+    let raising = if operation == Predicate::Equal {
+        SIGNALLING
+    } else {
+        NAN_VECTOR
+    };
+    Host::ByteSignMask.register(code, 0, raising, TargetCpu::Baseline);
+    let active = if shape == Shape::Scalar {
+        HALF_SCALAR_MASK
+    } else {
+        active_mask(Format::Half, shape)
+    };
+    code.asm().test_imm(Size::Dword, Gpr::Rax, active as i32);
+    let none = branch(code, Condition::Zero);
+    code.asm().alu_imm32(
+        Alu::Or,
+        Size::Dword,
+        Gpr::R11,
+        crate::aarch64::floating::INVALID as i32,
+    );
+    let end = code.len();
+    resolve(code, none, end);
 }
 
 /// EAX takes EDX's flags when `condition` holds.
@@ -274,10 +329,8 @@ fn zero_flags(code: &mut Code, format: Format) {
 
 /// Whether FCMP/FCMPE/FCCMP of S/D registers take [`quick_flags`]: not in
 /// the DIT profile, which keeps its reviewed classification.
-fn quick_flags_supported(format: Format, right: CompareSource, target: TargetCpu) -> bool {
-    format != Format::Half
-        && matches!(right, CompareSource::Register(_))
-        && !target.data_independent_timing()
+fn quick_flags_supported(right: CompareSource, target: TargetCpu) -> bool {
+    matches!(right, CompareSource::Register(_)) && !target.data_independent_timing()
 }
 
 /// With no trap enabled and FZ, FIZ and AH clear, UCOMIS orders every
@@ -315,17 +368,130 @@ fn quick_flags(
     ordered
 }
 
+/// Half FCMP and FCMPE, by register and with zero, for every input under
+/// any AH: FZ16 flushes a subnormal input to its signed zero (without
+/// IDC), the signed magnitudes (both zeros 0) compare
+/// the rest, and a NaN gives the unordered flags, with IOC for FCMPE or a
+/// signalling NaN. Only enabled traps exit.
+fn half_flags(
+    code: &mut Code,
+    left: u8,
+    right: CompareSource,
+    signal_all_nans: bool,
+    pc: GuestAddress,
+) {
+    use crate::aarch64::floating::{FPCR_FZ16, INVALID};
+    const MAGNITUDE: i32 = 0x7fff;
+    const INFINITY: i32 = 0x7c00;
+    const SIGN: i32 = 0x8000;
+    const QUIET_BIT: u8 = 9;
+    let mut helper = Vec::new();
+    exception_guard(code, &mut helper);
+    read_vector(code, left, LEFT_VECTOR);
+    let mut asm = code.asm();
+    asm.movd_from_xmm(Gpr::Rcx, LEFT_VECTOR);
+    asm.alu_imm32(Alu::And, Size::Dword, Gpr::Rcx, 0xffff);
+    match right {
+        CompareSource::Register(right) => {
+            read_vector(code, right, RIGHT_VECTOR);
+            let mut asm = code.asm();
+            asm.movd_from_xmm(Gpr::Rdx, RIGHT_VECTOR);
+            asm.alu_imm32(Alu::And, Size::Dword, Gpr::Rdx, 0xffff);
+        }
+        CompareSource::Zero => code.asm().alu(Alu::Xor, Size::Dword, Gpr::Rdx, Gpr::Rdx),
+    }
+    let operands = [Gpr::Rcx, Gpr::Rdx];
+    test_control(code, FPCR_FZ16);
+    let kept = branch(code, Condition::Zero);
+    for register in operands {
+        let mut asm = code.asm();
+        asm.mov(Size::Dword, Gpr::Rax, register);
+        asm.alu_imm32(Alu::And, Size::Dword, Gpr::Rax, INFINITY);
+        let normal = asm.jcc(Cond::Ne).offset();
+        code.asm().alu_imm32(Alu::And, Size::Dword, register, SIGN);
+        let end = code.len();
+        resolve(code, normal, end);
+    }
+    let flushed = code.len();
+    resolve(code, kept, flushed);
+    let mut nan = Vec::new();
+    for register in operands {
+        let mut asm = code.asm();
+        asm.mov(Size::Dword, Gpr::Rax, register);
+        asm.alu_imm32(Alu::And, Size::Dword, Gpr::Rax, MAGNITUDE);
+        asm.alu_imm32(Alu::Cmp, Size::Dword, Gpr::Rax, INFINITY);
+        nan.push(asm.jcc(Cond::A).offset());
+    }
+    for register in operands {
+        // The signed magnitude: both zeros 0, the order kept.
+        let mut asm = code.asm();
+        asm.mov(Size::Dword, Gpr::Rax, register);
+        asm.alu_imm32(Alu::And, Size::Dword, register, MAGNITUDE);
+        asm.shift_imm(ShiftOp::Shl, Size::Dword, Gpr::Rax, HALF_SIGN_TO_DWORD_TOP);
+        asm.shift_imm(ShiftOp::Sar, Size::Dword, Gpr::Rax, SINGLE_SIGN_SHIFT);
+        asm.alu(Alu::Xor, Size::Dword, register, Gpr::Rax);
+        asm.alu(Alu::Sub, Size::Dword, register, Gpr::Rax);
+    }
+    code.asm().alu(Alu::Cmp, Size::Dword, Gpr::Rcx, Gpr::Rdx);
+    ordered_flags(code, true);
+    let done = jump(code);
+    let nan_start = code.len();
+    for patch in nan {
+        resolve(code, patch, nan_start);
+    }
+    let invalid = |code: &mut Code| {
+        code.asm().alu_imm8(
+            Alu::Or,
+            Size::Dword,
+            super::numerical::state(core::mem::offset_of!(crate::GuestState, fpsr)),
+            INVALID as i8,
+        );
+    };
+    if signal_all_nans {
+        invalid(code);
+    } else {
+        for register in operands {
+            // A signalling NaN: above the infinity, its quiet bit clear.
+            let mut asm = code.asm();
+            asm.mov(Size::Dword, Gpr::Rax, register);
+            asm.alu_imm32(Alu::And, Size::Dword, Gpr::Rax, MAGNITUDE);
+            asm.alu_imm32(Alu::Cmp, Size::Dword, Gpr::Rax, INFINITY);
+            let ordered = asm.jcc(Cond::Be).offset();
+            code.asm().bit_imm(
+                crate::x86_64::asm::BitTest::Bt,
+                Size::Dword,
+                Gpr::Rax,
+                QUIET_BIT,
+            );
+            let quiet = code.asm().jcc(Cond::B).offset();
+            invalid(code);
+            let end = code.len();
+            resolve(code, ordered, end);
+            resolve(code, quiet, end);
+        }
+    }
+    let unordered = flag_word::constant(code, NZCV_C | NZCV_V);
+    flag_word::store_constant(&mut code.asm(), unordered);
+    let end = code.len();
+    resolve(code, done, end);
+    helper_section(code, &helper, pc);
+}
+
 fn emit_flags(
     code: &mut Code,
     format: Format,
     left: u8,
     right: CompareSource,
+    signal_all_nans: bool,
     pc: GuestAddress,
     target: TargetCpu,
 ) {
+    if format == Format::Half {
+        return half_flags(code, left, right, signal_all_nans, pc);
+    }
     let mut helper = Vec::new();
     let quick = match right {
-        CompareSource::Register(register) if quick_flags_supported(format, right, target) => {
+        CompareSource::Register(register) if quick_flags_supported(right, target) => {
             Some(quick_flags(code, format, left, register, &mut helper))
         }
         _ => None,
@@ -334,17 +500,12 @@ fn emit_flags(
     read_vector(code, left, LEFT_VECTOR);
     if let CompareSource::Register(right) = right {
         read_vector(code, right, RIGHT_VECTOR);
-        // UCOMIS, and the signed magnitudes of Half values, order zeros of
-        // either sign and infinities with no host or guest flag; NaNs and
-        // subnormals take the helper.
+        // UCOMIS orders zeros of either sign and infinities with no host or
+        // guest flag; NaNs and subnormals take the helper.
         for source in [LEFT_VECTOR, RIGHT_VECTOR] {
             scalar_zero_guard(code, format, source, &mut helper);
         }
-        if format == Format::Half {
-            half_signed_magnitude(code, Gpr::Rax, LEFT_VECTOR);
-            half_signed_magnitude(code, Gpr::Rcx, RIGHT_VECTOR);
-            code.asm().alu(Alu::Cmp, Size::Dword, Gpr::Rax, Gpr::Rcx);
-        } else if format == Format::Double {
+        if format == Format::Double {
             code.asm().ucomisd(LEFT_VECTOR, Rm::Xmm(RIGHT_VECTOR));
         } else {
             code.asm().ucomiss(LEFT_VECTOR, Rm::Xmm(RIGHT_VECTOR));
@@ -355,7 +516,7 @@ fn emit_flags(
             let mapping = code.len();
             resolve(code, quick, mapping);
         }
-        ordered_flags(code, format == Format::Half);
+        ordered_flags(code, false);
     } else {
         scalar_zero_guard(code, format, LEFT_VECTOR, &mut helper);
         helper_section(code, &helper, pc);
@@ -363,10 +524,12 @@ fn emit_flags(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_conditional_flags(
     code: &mut Code,
     format: Format,
     (left, right): (u8, u8),
+    signal_all_nans: bool,
     condition: u8,
     fallback: u8,
     pc: GuestAddress,
@@ -380,6 +543,7 @@ fn emit_conditional_flags(
         format,
         left,
         CompareSource::Register(right),
+        signal_all_nans,
         pc,
         target,
     );
@@ -413,19 +577,14 @@ fn invert_mask(code: &mut Code, vector: u8) {
     packed(code, Host::Xor, vector, TEMP_VECTOR);
 }
 
+/// The predicate over the [`half_keys`] of the operands, right in XMM0 and
+/// left in XMM1.
 fn half_predicate(code: &mut Code, operation: Predicate) -> u8 {
-    if operation == Predicate::Equal {
-        packed(code, Host::EqualWord, LEFT_VECTOR, RIGHT_VECTOR);
-        return LEFT_VECTOR;
-    }
-    if absolute(operation) {
-        magnitude(code, Format::Half);
-    } else {
-        half_order_key(code, LEFT_VECTOR);
-        half_order_key(code, RIGHT_VECTOR);
-    }
-    // Right is in XMM0, left in XMM1.
     match operation {
+        Predicate::Equal => {
+            packed(code, Host::EqualWord, LEFT_VECTOR, RIGHT_VECTOR);
+            LEFT_VECTOR
+        }
         Predicate::Greater | Predicate::AbsoluteGreater => {
             packed(code, Host::GreaterWord, RIGHT_VECTOR, LEFT_VECTOR);
             RIGHT_VECTOR
@@ -444,7 +603,6 @@ fn half_predicate(code: &mut Code, operation: Predicate) -> u8 {
             invert_mask(code, RIGHT_VECTOR);
             RIGHT_VECTOR
         }
-        Predicate::Equal => unreachable!("equality needs no half order transform"),
     }
 }
 
@@ -593,71 +751,29 @@ fn emit_predicate(code: &mut Code, operand: &Operand, pc: GuestAddress) {
     }
     let mut helper = Vec::new();
     exception_guard(code, &mut helper);
-    if shape != Shape::Scalar
-        && operation == Predicate::Equal
-        && right == CompareSource::Register(left)
-    {
-        // Normal values, both zero signs and infinities equal themselves
-        // without changing FPSR. One guard suffices for the shared source.
-        read_numerical_vector(code, shape, left, LEFT_VECTOR);
-        vector_zero_guard(code, format, shape, &mut helper);
-        helper_section(code, &helper, pc);
-        packed(code, Host::EqualDword, LEFT_VECTOR, LEFT_VECTOR);
-        commit_predicate(code, format, shape, destination, LEFT_VECTOR, false, false);
-        return;
-    }
     let zero = right == CompareSource::Zero;
-    let merge = shape == Shape::Scalar
-        && !zero
-        && (format == Format::Half
-            || absolute(operation)
-            || matches!(operation, Predicate::Less | Predicate::LessEqual));
-    if let CompareSource::Register(right) = right {
-        // Reversed operands let ordered LT/LE implement GT/GE, and keep Vm's
-        // upper bits for the scalar case.
-        read_numerical_vector(code, shape, right, LEFT_VECTOR);
-        read_numerical_vector(code, shape, left, RIGHT_VECTOR);
-        if merge {
-            packed(code, Host::MoveAligned, MERGE_VECTOR, LEFT_VECTOR);
-        }
-        // CMPSS/CMPPS order zeros of either sign and infinities as Arm
-        // does, without a status; NaNs (IOC) and subnormals (FZ) take the
-        // helper. The Half order key holds for normal values alone.
-        if shape == Shape::Scalar {
-            for source in [LEFT_VECTOR, RIGHT_VECTOR] {
-                if format == Format::Half {
-                    scalar_normal_guard(code, format, source, &mut helper);
-                } else {
-                    scalar_zero_guard(code, format, source, &mut helper);
-                }
-            }
-        } else {
-            prepare_vector_input_range(code, format);
-            for source in [LEFT_VECTOR, RIGHT_VECTOR] {
-                if format == Format::Half {
-                    vector_exponent_range(code, format, shape, source);
-                    helper.push(branch(code, Condition::NotZero));
-                } else {
-                    vector_zero_or_normal_guard(code, format, shape, source, &mut helper);
-                }
+    let merge = shape == Shape::Scalar && !zero;
+    // Reversed operands let ordered LT/LE implement GT/GE, and keep Vm's
+    // upper bits for the scalar case. A comparison with zero compares Vn
+    // with +0.
+    match right {
+        CompareSource::Register(right) => {
+            read_numerical_vector(code, shape, right, LEFT_VECTOR);
+            if merge {
+                packed(code, Host::MoveAligned, MERGE_VECTOR, LEFT_VECTOR);
             }
         }
-    } else {
-        read_numerical_vector(code, shape, left, LEFT_VECTOR);
-        if shape == Shape::Scalar {
-            scalar_zero_guard(code, format, LEFT_VECTOR, &mut helper);
-        } else {
-            vector_zero_guard(code, format, shape, &mut helper);
-        }
+        CompareSource::Zero => packed(code, Host::Xor, LEFT_VECTOR, LEFT_VECTOR),
     }
-    let result = if zero {
-        zero_predicate(code, operation, format)
-    } else if format == Format::Half {
-        half_predicate(code, operation)
-    } else {
-        floating_predicate(code, operation, format, shape)
-    };
+    read_numerical_vector(code, shape, left, RIGHT_VECTOR);
+    code.asm().alu(Alu::Xor, Size::Dword, Gpr::R11, Gpr::R11);
+    half_keys(code, operation, shape);
+    let result = half_predicate(code, operation);
+    // A NaN lane compares false.
+    packed(code, Host::AndNot, NAN_VECTOR, result);
+    packed(code, Host::MoveAligned, result, NAN_VECTOR);
     helper_section(code, &helper, pc);
+    super::numerical::commit_flush_status(code);
     commit_predicate(code, format, shape, destination, result, merge, zero);
 }
 
@@ -841,16 +957,25 @@ pub(in crate::x86_64) fn emit(
             format,
             left,
             right,
-            ..
-        } => emit_flags(code, format, left, right, pc, target),
+            signal_all_nans,
+        } => emit_flags(code, format, left, right, signal_all_nans, pc, target),
         Operand::ConditionalFlags {
             format,
             left,
             right,
+            signal_all_nans,
             condition,
             fallback,
-            ..
-        } => emit_conditional_flags(code, format, (left, right), condition, fallback, pc, target),
+        } => emit_conditional_flags(
+            code,
+            format,
+            (left, right),
+            signal_all_nans,
+            condition,
+            fallback,
+            pc,
+            target,
+        ),
         Operand::Predicate { .. } => emit_predicate(code, operand, pc),
     }
 }

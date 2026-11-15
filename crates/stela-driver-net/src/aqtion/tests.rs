@@ -696,6 +696,7 @@ fn hardware(peer: &Rc<Peer>) -> Hardware<Rc<Peer>, Rc<Peer>> {
         registers: peer.clone(),
         timer: peer.clone(),
         reset_ownership: Cell::new(firmware::ResetOwnership::default()),
+        budget: Cell::new(None),
     }
 }
 type Fixture = (
@@ -743,21 +744,42 @@ fn setup_with_memory(device: u16, allocate_memory: bool) -> Fixture {
     (owner, peer, domain, dropped)
 }
 #[test]
-fn exact_profiles_do_not_admit_usb_fiber_or_unimplemented_silicon_families() {
+fn profiles_admit_every_b1_and_antigua_row_and_no_a0_or_usb_part() {
     if crate::test_process::isolate_model() {
         return;
     }
-    for id in [
-        0x07b1, 0x87b1, 0x08b1, 0x88b1, 0x11b1, 0x91b1, 0x12b1, 0x92b1, 0x00c0, 0x94c0, 0x93c0,
-        0x04c0, 0x14c0, 0x34c0,
+    // hw_atl_boards rows on hw_atl_ops_b1 and hw_atl2_ops, with their rates.
+    for (id, rates) in [
+        (0x00b1, 0xf20),
+        (0x80b1, 0xf20),
+        (0x07b1, 0xf20),
+        (0x87b1, 0xf20),
+        (0x08b1, 0x720),
+        (0x88b1, 0x720),
+        (0x11b1, 0x720),
+        (0x91b1, 0x720),
+        (0x09b1, 0x320),
+        (0x89b1, 0x320),
+        (0x12b1, 0x320),
+        (0x92b1, 0x320),
+        (0x00c0, 0xff00),
+        (0x94c0, 0xff00),
+        (0x93c0, 0xff00),
+        (0x04c0, 0xff00),
+        (0x14c0, 0xff00),
+        (0x34c0, 0xff00),
+        (0x12c0, 0x1f00),
+        (0x11c0, 0x0700),
     ] {
-        assert!(Profile::identify(0x1d6a, id).is_some());
+        assert_eq!(Profile::identify(0x1d6a, id).map(|p| p.rates), Some(rates));
     }
+    // A0/B0 engineering IDs (hw_atl_ops_a0/b0), a USB part and other vendors.
     for (vendor, id) in [
-        (0x1d6a, 0x00b1),
+        (0x1d6a, 0x0001),
+        (0x1d6a, 0xd100),
         (0x1d6a, 0xd107),
-        (0x1d6a, 0x12c0),
-        (0x1d6a, 0x11c0),
+        (0x1d6a, 0xd108),
+        (0x1d6a, 0xd109),
         (0x2eca, 0xc101),
         (0x8086, 0x07b1),
     ] {
@@ -769,7 +791,9 @@ fn b1_and_antigua_rings_transfer_and_wrap() {
     if crate::test_process::isolate_model() {
         return;
     }
-    for id in [0x07b1, 0x08b1, 0x11b1, 0x12b1, 0x04c0, 0x93c0] {
+    for id in [
+        0x07b1, 0x08b1, 0x11b1, 0x12b1, 0x09b1, 0x00b1, 0x04c0, 0x93c0, 0x12c0, 0x11c0,
+    ] {
         let (mut net, peer, domain, dropped) = setup(id);
         net.start().unwrap();
         assert_eq!(net.mac(), Mac([2, 0x11, 0x22, 0x33, 0x44, 0x55]));
@@ -792,6 +816,32 @@ fn b1_and_antigua_rings_transfer_and_wrap() {
         assert!(domain.maps.lock().unwrap().is_empty());
         assert_eq!(dropped.load(Ordering::Relaxed), 4);
         assert!(domain.drain_count.load(Ordering::Relaxed) > 0);
+    }
+}
+#[test]
+fn a_missing_or_invalid_permanent_address_is_replaced_by_a_random_one() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    // aq_fw2x_get_mac_permanent without an efuse, an engineering sample's
+    // zero OUI, and Antigua's zero address: aq_nic_ndev_register's random.
+    for (id, unprogram) in [
+        (0x07b1, (|peer: &Peer| peer.set(0x364, 0)) as fn(&Peer)),
+        (0x07b1, |peer: &Peer| {
+            peer.ram.borrow_mut().insert(0x100a0, 0x0000_0012);
+        }),
+        (0x04c0, |peer: &Peer| {
+            peer.set(0x12008, 0);
+            peer.set(0x1200c, 0);
+        }),
+    ] {
+        let (mut net, peer, _, _) = setup(id);
+        unprogram(&peer);
+        net.start().unwrap();
+        let mac = net.mac();
+        assert!(mac.is_valid() && mac.0[0] & 2 != 0, "{id:04x}: {mac}");
+        assert_ne!(mac.0[..3], [0; 3]);
+        net.retire().unwrap();
     }
 }
 #[test]
@@ -1822,6 +1872,73 @@ fn firmware4_reset_store_uncertainty_and_flb_post_first_reset_abort_keep_ownersh
     assert_eq!(peer.reset_count.get(), 1);
 }
 #[test]
+fn a_full_transmit_ring_is_busy_at_once_and_keeps_the_adapter_running() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for id in [0x07b1, 0x04c0] {
+        let (mut net, peer, _domain, _dropped) = setup(id);
+        net.start().unwrap();
+        if peer.profile.generation == Generation::Atlantic {
+            peer.set(0x370, 0x100);
+        } else {
+            peer.set(0x13014, 0x830);
+        }
+        peer.tx_delay.set(true);
+        for _ in 0..COUNT - 1 {
+            net.transmit(&[3; 60]).unwrap();
+        }
+        let waited = peer.elapsed.get();
+        assert_eq!(net.transmit(&[4; 60]), Err(LinkError::Busy));
+        assert_eq!(peer.elapsed.get(), waited);
+        assert_eq!(net.state(), State::Running);
+        assert!(net.carrier());
+    }
+}
+/// Link loss with frames still in the transmit ring only takes the carrier
+/// down, as Linux's aq_nic_update_link_status does: no restart, so no
+/// firmware reset, wait or register write in a link poll, and the queued
+/// frames stay the hardware's until it sends them after the link returns.
+#[test]
+fn link_loss_with_queued_frames_leaves_them_to_the_hardware_and_waits_for_nothing() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    for id in [0x07b1, 0x04c0] {
+        let (mut net, peer, _domain, _dropped) = setup(id);
+        net.start().unwrap();
+        let link = |up: bool| {
+            if peer.profile.generation == Generation::Atlantic {
+                peer.set(0x370, if up { 0x100 } else { 0 });
+            } else {
+                peer.set(0x13014, if up { 0x830 } else { 0 });
+            }
+        };
+        link(true);
+        peer.tx_delay.set(true);
+        for _ in 0..3 {
+            net.transmit(&[3; 60]).unwrap();
+        }
+        let (waited, writes) = (peer.elapsed.get(), peer.writes.borrow().len());
+        link(false);
+        assert!(!net.carrier());
+        assert_eq!(net.transmit(&[4; 60]), Err(LinkError::NoCarrier));
+        assert_eq!(net.receive(), Ok(None));
+        assert_eq!(net.state(), State::Running);
+        assert_eq!(peer.elapsed.get(), waited);
+        assert_eq!(peer.writes.borrow().len(), writes);
+        assert_eq!((net.tx_head, net.tx_tail), (0, 3));
+        assert_eq!(peer.pending_tx.get(), Some(3));
+        link(true);
+        peer.tx_delay.set(false);
+        assert!(net.carrier());
+        net.transmit(&[5; 60]).unwrap();
+        assert_eq!(peer.tx_head.get(), 4);
+        net.transmit(&[6; 60]).unwrap();
+        assert_eq!(net.tx_head, 4);
+    }
+}
+#[test]
 fn restart_after_delayed_traffic_drains_each_epoch_and_rebuilds_device_heads() {
     if crate::test_process::isolate_model() {
         return;
@@ -2567,6 +2684,7 @@ mod registers_oracle {
                 },
                 timer: NoDelay,
                 reset_ownership: Cell::new(firmware::ResetOwnership::default()),
+                budget: Cell::new(None),
             };
             match spec.access {
                 Access::Get(_) => assert_eq!(

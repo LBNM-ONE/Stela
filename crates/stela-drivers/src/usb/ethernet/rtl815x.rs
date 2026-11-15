@@ -167,9 +167,12 @@ impl<C: Control> Chip<C> {
                 "RTL815x unimplemented or changed chip revision",
             ));
         }
+        // A patch must be the one this revision requests; without one the
+        // chip starts unpatched, as rtl8152_apply_firmware skips it.
         if !(1..=5).contains(&speed)
-            || firmware.map(|image| image.revision())
-                != chip.revision.firmware().map(|_| chip.revision)
+            || firmware.is_some_and(|image| {
+                Some(image.revision()) != chip.revision.firmware().map(|_| chip.revision)
+            })
         {
             return Err(BlockError::Unsupported(
                 "RTL815x USB speed or required firmware identity",
@@ -186,9 +189,10 @@ impl<C: Control> Chip<C> {
         };
         let first = chip.read(PLA, station, 4)?.to_le_bytes();
         let last = chip.read(PLA, station + 4, 4)?.to_le_bytes();
-        let mac = Mac([first[0], first[1], first[2], first[3], last[0], last[1]]);
-        if mac.0[0] & 1 != 0 || mac.0.iter().all(|b| *b == 0) {
-            return Err(BlockError::Unsupported("RTL815x invalid station address"));
+        let mut mac = Mac([first[0], first[1], first[2], first[3], last[0], last[1]]);
+        if !mac.is_valid() {
+            // determine_ethernet_addr: "Invalid ether addr", then a random one.
+            mac = Mac::random(&chip.revision.0.to_le_bytes());
         }
         if chip.revision.is_8153a() {
             chip.initialize_8153a(firmware)?;
@@ -202,16 +206,13 @@ impl<C: Control> Chip<C> {
             chip.initialize(matches!(speed, FULL_SPEED | LOW_SPEED))?;
         }
         // set_ethernet_addr leaves revision01 IDR untouched. Later revisions
-        // restore the permanent backup address through the configuration gate.
+        // write the address (the permanent backup one, or the random one)
+        // through the configuration gate.
         if chip.revision.0 != 0x4c00 {
+            let [a, b, c, d, e, f] = mac.0;
             chip.write(PLA, PLA_CRWECR, 1, 0xc0)?;
-            chip.write(PLA, PLA_IDR, 4, u32::from_le_bytes(first))?;
-            chip.write(
-                PLA,
-                PLA_IDR + 4,
-                2,
-                u32::from(u16::from_le_bytes([last[0], last[1]])),
-            )?;
+            chip.write(PLA, PLA_IDR, 4, u32::from_le_bytes([a, b, c, d]))?;
+            chip.write(PLA, PLA_IDR + 4, 2, u32::from(u16::from_le_bytes([e, f])))?;
             chip.write(PLA, PLA_CRWECR, 1, 0)?;
         }
         chip.initialized = true;

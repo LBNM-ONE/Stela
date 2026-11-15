@@ -16,6 +16,13 @@ pub struct Handoff {
     pub magic: u64,
     /// `stela.cfg`.
     pub options: Region,
+    /// The disk work decided before the firmware exited (`pc::disk_writes`,
+    /// encoded), which the engine's drivers do once: the change Install
+    /// macOS's disk picker planned for the `--storage` partition's disk,
+    /// before that partition is looked up, and then the updates of the
+    /// boot's partitions, before anything reads them. Empty when nothing
+    /// is pending. It lives only in this memory.
+    pub disk_writes: Region,
     /// Exclusive 256-bit pre-EBS seed, erased by the engine on consumption.
     /// An empty region means no checked entropy source was available.
     pub random_seed: Region,
@@ -105,6 +112,17 @@ pub struct Handoff {
     pub(crate) inactive_firmware_units: crate::native_dma::InactiveFirmwareUnits,
     /// Exclusive firmware RAM below 4 GiB for AMD-Vi device tables.
     pub(crate) amd_tables: Region,
+    /// The PCI functions an earlier boot did not finish starting, or
+    /// skipped since, as the USB's log gives them (`log_file::device_skips`).
+    pub(crate) device_skips: pc::device_starts::Skips,
+    /// The controllers of the disks this boot cannot continue without,
+    /// which it never skips (`selection::disk_controllers`).
+    pub(crate) device_needs: pc::device_starts::Needed,
+    /// The firmware's variable services, whose regions the loader keeps
+    /// mapped by identity as it does `efi_reset`'s, and this boot's number
+    /// in the USB's log: what a stop the log cannot keep leaves its record
+    /// with (`stop_record`).
+    pub(crate) stop_record: crate::stop_record::Services,
 }
 
 /// A read of the firmware's real-time clock: its time as UTC and its

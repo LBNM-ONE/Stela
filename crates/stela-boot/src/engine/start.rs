@@ -175,6 +175,15 @@ struct Started {
     native_processors: Option<&'static crate::native_smp::firmware::Capture>,
 }
 
+/// This processor's GS base, which names it to a device's start budget:
+/// devices start after the host record is installed, so the starting
+/// processor's base is its own record, which no other processor's base
+/// equals. Read only once an armed budget has passed.
+fn processor_gs() -> u64 {
+    // SAFETY: read-only architectural CPL0 GS context, not device MMIO.
+    unsafe { crate::cpu::msr::GS_BASE.read() }
+}
+
 /// A driver starts on `device`: the boot log names it before the start
 /// begins, so a start that never ends leaves its culprit in the record the
 /// USB log receives when it resumes, and the screen's step shows it.
@@ -192,6 +201,9 @@ fn start(handoff: u64) -> Started {
     if handoff.magic != MAGIC {
         output::fatal("engine handoff has the wrong magic");
     }
+    // From here a stop the USB's log cannot keep leaves its record in the
+    // firmware; an earlier one has only the screen.
+    crate::stop_record::arm(handoff.stop_record, Some(handoff.root));
     layout::set(handoff.placement);
     // Use the physmap directly: its CPU and physical bases have the
     // same alignment phase. A separately placed heap alias cannot in general
@@ -236,6 +248,7 @@ fn start(handoff: u64) -> Started {
     crate::status::set_clock(handoff.tsc_hz);
     stela_drivers::on_wait(crate::status::tick);
     stela_drivers::on_work(device_starting);
+    stela_drivers::budget::on_processor(processor_gs);
     crate::status::take_screen(
         handoff
             .screen
@@ -323,7 +336,9 @@ fn open_host(
     let translation_store = handoff.files[..handoff.file_count]
         .iter()
         .find(|file| file.name() == translations::FILE)
-        .and_then(|file| translations::install(bundle::contents(file)))
+        // SAFETY: the store's file is read here alone, once, and its
+        // region is the store's for the rest of the boot.
+        .and_then(|file| translations::install(unsafe { bundle::contents_mut(file) }))
         .filter(|_| handoff.storage.present);
     // The Metal device's stored pipelines, before any GPU opens.
     #[cfg(feature = "nvk")]
@@ -380,14 +395,14 @@ fn open_host(
         output::arguments(format_args!(
             "INSTALL OFFLINE macOS and Apple's signing answers are on the USB; no network is opened\n"
         ));
-        crate::status::info("Offline install: macOS and Apple's signing answers are on the USB");
     } else if options.install.is_some() {
-        crate::status::info(match remote_image {
-            true => {
-                "Network install: macOS downloads and Apple's signing server is asked during the install"
+        output::arguments(format_args!(
+            "INSTALL NETWORK {}\n",
+            match remote_image {
+                true => "macOS downloads and Apple's signing server is asked during the install",
+                false => "Apple's signing server is asked during the install",
             }
-            false => "Network install: Apple's signing server is asked during the install",
-        });
+        ));
     }
     let wants_network = (options.install.is_some() && !offline) || options.network_check.is_some();
     let mut devices = start_devices(
@@ -423,9 +438,11 @@ fn open_host(
     if options.install.is_some()
         && let Some(Err(reason)) = &devices.host_network
     {
+        // The network step's lines name each adapter; the one stop line
+        // reads them as sentences.
         output::fatal(stela_runtime::restore::tss::no_network(
             remote_image,
-            &reason.to_string(),
+            &reason.to_string().replace('\n', " "),
         ));
     }
     let built = devices.preboot.take().map(|partition| {
@@ -486,7 +503,7 @@ fn open_host(
             Err(stela_runtime::net::NetError::Status(_)) => {
                 output::arguments(format_args!("NETWORK CHECK passed\n"))
             }
-            Err(error) => output::fatal(format_args!("the network check failed: {error:?}")),
+            Err(error) => output::fatal(format_args!("the network check failed: {error}")),
         }
     }
     OpenedHost {
@@ -1327,7 +1344,7 @@ fn open_gpus(
     if let Err(error) = work.service_clock().and_then(|clock| clock.epoch()) {
         let why = stela_boot_core::work_status::gpu_without_clock(
             crate::cpu::INVARIANT_TSC.present(),
-            &format!("{error:?}"),
+            &format!("{error}"),
         );
         output::arguments(format_args!("GPU not started: {why}\n"));
         crate::status::warn(&why);
@@ -1338,9 +1355,9 @@ fn open_gpus(
     let heap_bytes = heap.end - heap.start;
     crate::status::begin("Starting the GPU");
     let gop = if handoff.screen.is_some() {
-        mmio.verified_framebuffer().map(Some)
+        mmio.verified_framebuffer()
     } else {
-        Ok(None)
+        Ok(crate::pci_io::ScreenOwner::NoScreen)
     };
     let firmware = firmware.clone();
     // Named on the screen when no GPU starts; the claim takes `adapters`.
@@ -1414,7 +1431,8 @@ fn open_gpus(
     // even when the start never returns.
     output::flush_log();
     let opening = host::rdtsc();
-    let opened = gpu::open(machine, claimed);
+    // A stop inside the start stores the USB's log from there.
+    let opened = storage::in_gpu_start(|| gpu::open(machine, claimed));
     // `GPU START claim_ms=… linux_ms=… probe_ms=… total_ms=…`: claiming the
     // functions, starting Linux, and the drivers' probe: nouveau's boots the
     // GSP and binds DRM.
@@ -1519,14 +1537,21 @@ fn place_devices(
             })
     };
     // The firmware's scanout keeps its newest frame itself; a GPU's is
-    // wrapped to keep one for `--scanout-mirror`.
+    // wrapped to keep one for `--scanout-mirror`. With neither a GPU's
+    // display nor the firmware's screen, which a bound GPU's reset ended, the
+    // guest keeps that screen's mode and a GPU's display found later shows it.
+    #[cfg(feature = "nvk")]
+    let mirrored = |scanout: alloc::boxed::Box<dyn stela_soc::machine::Scanout>| match options
+        .scanout_mirror
+    {
+        true => alloc::boxed::Box::new(display::MirroredScanout::new(scanout)) as _,
+        false => scanout,
+    };
     #[cfg(feature = "nvk")]
     let scanout = gpu::display::scanout()
-        .map(|scanout| match options.scanout_mirror {
-            true => alloc::boxed::Box::new(display::MirroredScanout::new(scanout)) as _,
-            false => scanout,
-        })
-        .or_else(firmware_scanout);
+        .map(mirrored)
+        .or_else(firmware_scanout)
+        .or_else(|| gpu::display::awaited(handoff.screen?).map(mirrored));
     #[cfg(not(feature = "nvk"))]
     let scanout = firmware_scanout();
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
@@ -2109,7 +2134,8 @@ fn prepare_restore(
     let signer = options.install.is_some().then(|| {
         let ecid = boot_ecid.unwrap_or_else(|| {
             output::fatal(
-                "install: the bundle names no machine ECID; run stela setup repair --fetch",
+                "install: the bundle names no machine ECID; on another computer, plug in this \
+                 USB and run `stela repair`",
             )
         });
         stela_runtime::restore::tss::Signer {
@@ -2350,6 +2376,10 @@ fn start_platform(
     // host it cannot check is reported, and those services refuse.
     // Its time is logged: it walks every mapping the firmware left, which
     // no step's time shows.
+    // A freeze here was a screen that stopped after the step before with
+    // nothing named (issue 36), so this is a step and names its parts.
+    crate::status::begin("Taking over the PC's devices from the firmware");
+    crate::status::progress("memory-mapped registers");
     let activating = host::rdtsc();
     // SAFETY: this boot's capture, on the installed boot processor before
     // the other host processors start.
@@ -2394,6 +2424,7 @@ fn start_platform(
             Err(error) => output::arguments(format_args!("NATIVE PCI HPET unavailable: {error}\n")),
         }
     }
+    crate::status::progress("interrupt vectors");
     match host_owner
         .root_identity()
         .map_err(|_| stela_drivers::bus::irq::IrqError::WrongCpu)
@@ -2413,6 +2444,7 @@ fn start_platform(
     }
     // Retire the configuration census and park the contained function owners
     // before either SCI publication or remapper takeover.
+    crate::status::progress("PCI functions");
     let contained_pci = native_mmio.and_then(|mmio| {
         // SAFETY: firmware is stopped, APs have not started, and native
         // probing has not published any PCI/controller owner yet.
@@ -2456,9 +2488,15 @@ fn start_platform(
                     )),
                 }
             }
-            (Some(_), None) => Some(String::from(
-                "the firmware named no PCI function for its framebuffer",
-            )),
+            (Some(_), None) => {
+                output::arguments(format_args!(
+                    "HOST GOP PCI source unknown: no GOP device path or display function's \
+                     BAR holds the firmware framebuffer; the firmware screen stops before a \
+                     GPU starts\n"
+                ));
+                mmio.framebuffer_owner_unknown();
+                None
+            }
             // The containment failure is kept and logged above.
             (None, _) => None,
         };
@@ -2467,6 +2505,7 @@ fn start_platform(
             mmio.refuse_framebuffer(refusal);
         }
     }
+    crate::status::progress("DMA remapping and interrupt controllers");
     // The remapping units, taken before any host driver starts DMA.
     let mut remappers = match (&contained_pci, handoff.storage.handoff()) {
         // SAFETY: no host driver has started; the loader root maps the ACPI
@@ -2513,6 +2552,7 @@ fn start_platform(
         }
         _ => None,
     };
+    crate::status::progress("clocks");
     // The GPUs' Linux environment runs on this clock: a macOS boot's, and
     // `--gpu-check`'s, which starts them the same way.
     let clock = if options.boots_macos() || options.gpu_check {
@@ -2545,6 +2585,7 @@ fn start_platform(
             Err(error.reason())
         }
     };
+    crate::status::progress("ACPI tables");
     let host_acpi = aml::HostAcpi::start(
         handoff.rsdp,
         handoff.root,
@@ -2561,6 +2602,7 @@ fn start_platform(
     crate::native_idle::install(
         host_acpi.and_then(|acpi| acpi.processor_idle(crate::native_idle::capabilities())),
     );
+    crate::status::done("");
     Platform {
         acpi: host_acpi,
         mmio: native_mmio,
@@ -2621,9 +2663,38 @@ fn wifi_network(
     })
 }
 
+/// The disk work the loader decided before the firmware exited
+/// (`Handoff::disk_writes`): the change Install macOS's disk picker planned
+/// for the `--storage` partition's disk, when the picker ran this boot, and
+/// the updates of the boot's partitions. The host disks' start does it,
+/// once (`storage::prepare`, `storage::update`).
+fn disk_writes(handoff: &Handoff) -> stela_runtime::pc::disk_writes::Pending {
+    let bytes = handoff.disk_writes.bytes as usize;
+    if bytes == 0 {
+        return Default::default();
+    }
+    // SAFETY: the loader left the pending work's bytes allocated, and
+    // nothing writes them.
+    let encoded = unsafe {
+        core::slice::from_raw_parts(
+            layout::physical(handoff.disk_writes.physical) as *const u8,
+            bytes,
+        )
+    };
+    stela_runtime::pc::disk_writes::Pending::decode(encoded).unwrap_or_else(|| {
+        output::fatal(
+            "what this start was to write to the PC's disks did not reach Stela's drivers \
+             whole; nothing was written. Start again",
+        )
+    })
+}
+
 /// The whole disk and USB start's bound, which only a stall outside every
 /// PCI function's own budget reaches.
 const DEVICES_START_US: u64 = 300_000_000;
+/// The most network adapters the screen names when none started; the boot
+/// log has them all.
+const NETWORK_ACCOUNT_LINES: usize = 6;
 
 /// The fail line for a disk and USB start the owned call did not complete.
 fn devices_failed(error: &kernel_work::Error) -> alloc::string::String {
@@ -2685,7 +2756,7 @@ fn start_devices(
     } = wanted;
     let mut fdr_device = None;
     let mut host_usb = None;
-    let mut host_bluetooth = None;
+    let host_bluetooth: Option<bluetooth::HostBluetooth> = None;
     let (services, medium, preboot, host_input, host_network, usb_disks, guest_network, host_disks) =
         if targets.is_empty()
             && options.install_source.is_none()
@@ -2717,8 +2788,10 @@ fn start_devices(
             // Disks that can signal their completions wake the BSP, which
             // runs the engine's devices.
             let bsp = native_processors.expect("validated native roster");
-            storage_handoff.completion =
-                host::completion_signal(bsp.processors[bsp.selected[0] as usize].apic_id);
+            let bsp_apic = bsp.processors[bsp.selected[0] as usize].apic_id;
+            storage_handoff.completion = host::completion_signal(bsp_apic);
+            // A disk step given up to another core's hold wakes it too.
+            storage::ring_owed_steps_at(bsp_apic);
             #[cfg(feature = "diagnostics")]
             if options.audio_check.is_some() {
                 // The audio check keeps the final slice even after shutdown.
@@ -2737,6 +2810,7 @@ fn start_devices(
             let owned_preboot = options.preboot.clone();
             let owned_usb = options.usb_storage.clone();
             let owned_wifi = wifi_network(handoff, options);
+            let owned_writes = disk_writes(handoff);
             let external = options.external_disks.then(|| {
                 stela_soc::machine::UsbCables::disk_ports(options.guest_network, options.input)
                     .saturating_sub(owned_usb.len())
@@ -2751,12 +2825,8 @@ fn start_devices(
             let log_partition = handoff.log_partition.map(Guid);
             let usb4_approved = options.usb4_approved.clone();
             let boot_disk = handoff.boot_disk().map(alloc::string::String::from);
-            // `--nor` naming the `--storage` partition keeps the machine
-            // state in its tail, where a failed start leaves its record.
-            let owned_state = options
-                .storage
-                .clone()
-                .filter(|_| options.nor.is_some() && options.nor == options.storage);
+            let device_skips = handoff.device_skips;
+            let device_needs = handoff.device_needs;
             // Each PCI function's start has its own budget
             // (`stela_drivers::probe::DEVICE_START_US`) and is given up past
             // it; this whole bound only catches a stall outside every
@@ -2781,6 +2851,7 @@ fn start_devices(
                             .map(|native| native as &dyn stela_drivers::probe::NativeServices),
                         &storage::Selection {
                             targets: &targets,
+                            pending: &owned_writes,
                             medium: medium_partition,
                             preboot: owned_preboot.as_ref(),
                             store: translation_store,
@@ -2790,7 +2861,8 @@ fn start_devices(
                             wifi: owned_wifi.as_ref(),
                             external,
                             boot_disk: boot_disk.as_deref(),
-                            state: owned_state.as_ref(),
+                            device_skips,
+                            device_needs,
                         },
                     )
                 }
@@ -2820,6 +2892,7 @@ fn start_devices(
                 fdr,
                 inputs,
                 mut links,
+                network_account,
                 gpus,
                 usb,
                 bluetooth: host_controller,
@@ -2881,7 +2954,14 @@ fn start_devices(
                 if options.gpu_check {
                     output::arguments(format_args!("GPU CHECK started={started}\n"));
                 } else if started {
-                    gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
+                    let firmware = handoff
+                        .screen
+                        .and_then(|screen| screen.pci_source)
+                        .map(|source| format!("{}", source.address));
+                    gpu::serve(
+                        handoff.screen.map(|screen| screen.resolution()),
+                        firmware.as_deref(),
+                    );
                 }
             } else if let (true, Err(reason)) = (options.gpu_check, work) {
                 output::arguments(format_args!("GPU CHECK no Linux work: {reason}\n"));
@@ -2897,8 +2977,33 @@ fn start_devices(
                 crate::status::info(super::firmware_requests::MISSING);
             }
             host_usb = Some(usb);
-            // The guest's controller hangs off the hub of its keyboard.
-            host_bluetooth = host_controller.filter(|_| options.input);
+            // macOS gets no Bluetooth controller. Its bluetoothd picks the
+            // guest's USB controller and never sends it a command, in every
+            // run with a host controller or the model, and Setup's Language
+            // Chooser then waits for bluetoothd with a black screen. Without
+            // a controller bluetoothd restarts and Setup goes on. The host's
+            // controller is released in the loader's root by its drop.
+            if host_controller.is_some() && options.input {
+                output::arguments(format_args!(
+                    "BLUETOOTH UNSUPPORTED the guest gets no controller: macOS does not \
+                     configure the guest's USB Bluetooth controller and its Setup waits for it\n"
+                ));
+            }
+            drop(host_controller);
+            // With no adapter started, the screen names each one found and
+            // why it stayed off, before the steps that need one say so.
+            if links.devices.is_empty() && (wants_network || options.guest_network) {
+                for line in network_account.iter().take(NETWORK_ACCOUNT_LINES) {
+                    crate::status::info(&format!("Network adapter not started: {line}."));
+                }
+                if let Some(rest) = network_account
+                    .len()
+                    .checked_sub(NETWORK_ACCOUNT_LINES)
+                    .filter(|&rest| rest > 0)
+                {
+                    crate::status::info(&format!("{rest} more network adapters not started."));
+                }
+            }
             // The guest's adapter is its own: the mount's client keeps the
             // first one. Without one the Mac boots with no network, which
             // is reported once.
@@ -2926,14 +3031,27 @@ fn start_devices(
                     .map(|network| network::Shared(Rc::new(RefCell::new(network))))
                     .inspect_err(|error| {
                         output::arguments(format_args!("host network refusal: {error}\n"));
-                        crate::status::warn(&error.to_string());
+                        // The step ends with the first line; each adapter's
+                        // line and the advice follow on lines of their own.
+                        let text = error.to_string();
+                        let mut lines = text.lines();
+                        crate::status::warn(lines.next().unwrap_or_default());
+                        lines.for_each(crate::status::info);
                     })
             });
             (
                 services,
                 medium,
                 preboot,
-                options.input.then(|| input::HostInput::new(inputs)),
+                if options.input {
+                    Some(input::HostInput::new(inputs))
+                } else {
+                    // Unused devices are released where their registers and
+                    // DMA pages are mapped, as the adapters are.
+                    let root = inputs.root;
+                    network::in_loader_root(root, || drop(inputs));
+                    None
+                },
                 network,
                 usb_disks,
                 guest_network,

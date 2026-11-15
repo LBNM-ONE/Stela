@@ -1,4 +1,4 @@
-//! What `stela setup` reads from the computer it runs on: each volume's file
+//! What `stela` reads from the computer it runs on: each volume's file
 //! system and free space, the disks with their partitions and serial
 //! numbers, and, for a disk the PC boots itself, its memory and CPU. Each
 //! operating system answers through its own backend: macOS through
@@ -22,13 +22,13 @@ mod unsupported;
 mod windows;
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{ADMIN, DISK_EXAMPLE, System};
+pub(crate) use linux::{ADMIN, DISK_EXAMPLE, DISK_PREFIX, System};
 #[cfg(target_os = "macos")]
-pub(crate) use macos::{ADMIN, DISK_EXAMPLE, System};
+pub(crate) use macos::{ADMIN, DISK_EXAMPLE, DISK_PREFIX, System};
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(crate) use unsupported::{ADMIN, DISK_EXAMPLE, System};
+pub(crate) use unsupported::{ADMIN, DISK_EXAMPLE, DISK_PREFIX, System};
 #[cfg(windows)]
-pub(crate) use windows::{ADMIN, DISK_EXAMPLE, System};
+pub(crate) use windows::{ADMIN, DISK_EXAMPLE, DISK_PREFIX, System};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileSystem {
@@ -120,8 +120,28 @@ pub(crate) enum Removal {
     /// external Thunderbolt disk. Erased only once its model or size is
     /// typed back ([`Disk::confirmed_by`]).
     Typed,
+    /// A USB disk on a computer whose own disks setup cannot tell: erased
+    /// only once its model or size is typed back, since it may be the disk
+    /// this computer runs from. Only Linux can fail to tell.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only the Linux disk listing builds it")
+    )]
+    Unsure,
     /// Part of the computer: never erased.
     Fixed,
+}
+
+impl Removal {
+    /// Why a disk needs its model or size typed back before it is erased.
+    pub(crate) fn why_typed(self) -> &'static str {
+        match self {
+            Removal::Unsure => {
+                "may be the disk this computer runs from: setup cannot tell which disk that is"
+            }
+            Removal::Usb | Removal::Typed | Removal::Fixed => "is not a USB disk",
+        }
+    }
 }
 
 impl DiskFacts {

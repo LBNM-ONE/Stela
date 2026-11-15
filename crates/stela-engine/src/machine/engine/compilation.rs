@@ -49,11 +49,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let el = self.cpu.pstate.el | u8::from(self.cpu.pstate.guarded) << 4;
         let contexts = self.contexts(el, context);
         self.chain.set_contexts(contexts);
-        if !self.dropped_refills.is_empty() {
-            self.refill_dropped(contexts);
-        }
-        if !self.refills.is_empty() {
-            self.refill_pages(el, context);
+        if !self.dropped_refills.is_empty() || !self.refills.is_empty() {
+            let refilling = self.host.counter();
+            if !self.dropped_refills.is_empty() {
+                self.refill_dropped(contexts);
+            }
+            if !self.refills.is_empty() {
+                self.refill_pages(el, context);
+            }
+            self.statistics.refill_ticks += self.host.counter().wrapping_sub(refilling);
         }
         // A fetch elsewhere came between the exit waiting for a block and
         // its target: an exception, an interrupt or another PE's run.
@@ -100,7 +104,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
         self.statistics.fetch_paths[path as usize] += 1;
         let generation = self.translation_generation;
-        let physical = match self.fetch_physical(pc) {
+        let walking = self.host.counter();
+        let walked = self.fetch_physical(pc);
+        self.statistics.walk_ticks += self.host.counter().wrapping_sub(walking);
+        let physical = match walked {
             Ok(physical) => physical,
             Err(Ok(exception)) => return Ok(Fetched::Exception(exception)),
             Err(Err(stop)) => return Err(stop),
@@ -622,10 +629,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // The machine's buffers take the entry's relocated code: an
             // install from the store allocates nothing.
             let mut relocated = core::mem::take(&mut self.relocated);
-            let found = record
+            let entry = record
                 .as_ref()
-                .and_then(|record| record.find(offset as u16, context))
+                .and_then(|record| record.find(offset as u16, context));
+            let found = entry
+                .as_ref()
                 .filter(|entry| entry.relocate(page, source, &mut relocated));
+            if record.is_some() && found.is_none() {
+                self.statistics.record_misses[usize::from(entry.is_some())] += 1;
+            }
             if let Some(entry) = found {
                 if usize::from(entry.source_bytes) > available {
                     self.relocated = relocated;
@@ -789,10 +801,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             );
             self.code.rebases.keep(key, offset as u16, context, entry);
         }
-        // A store keeps an offer's stored form. With memory low it keeps no
-        // more, but the other PEs still take the
-        // block: this one retains the emission anyway, and each reuse saves
-        // a compile and a copy.
+        // A store keeps an offer's stored form within its own bound, and its
+        // pack writer sheds offers before the heap runs short (writer
+        // `govern`): memory low, as the heap rests once
+        // the engine's caches have grown, still keeps it, or the pack would
+        // miss every block compiled after that. The other PEs take the block
+        // either way.
         if let (Some((key, _)), Some(context)) = (stored, context)
             && let low = self.host.memory_low()
             && let Some(translations) = self.host.translations()
@@ -806,12 +820,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 successors,
                 quiet: self.cpu.pstate.el == 0,
             };
-            if low {
-                translations.lend(offer);
-            } else {
-                translations.offer(offer);
-                self.statistics.offered += 1;
-            }
+            translations.offer(offer);
+            self.statistics.offered += 1;
+            self.statistics.offered_low += u64::from(low);
         }
         self.install(
             pc,
@@ -1050,8 +1061,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }))
         .then(|| (code.0 + code_bytes.len() - chain::DYNAMIC_EXIT_BYTES) as u64);
         let first = self.admit(u32::from_le_bytes(source[..4].try_into().expect("a word")));
-        // A device site's stub completes nothing natively.
-        if !single && !self.device_site(physical) {
+        // A device site's stub completes only a plain device load natively.
+        if !single && self.installing_stub {
+            successors.extend(self.complete_device_read_natively(
+                code,
+                code_bytes,
+                terminal_pc,
+                terminal,
+                physical,
+            ));
+        } else if !single && !self.device_site(physical) {
             let (successor, dynamic) = self
                 .complete_pointer_natively(code, code_bytes, terminal_pc, terminal)
                 .unwrap_or_default();
@@ -1388,7 +1407,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if send {
                 register_read::send_event_thunk(GuestAddress(pc), EVENTS)
             } else {
-                register_read::event_wait_thunk(GuestAddress(pc), EVENTS)
+                register_read::event_wait_thunk(GuestAddress(pc), EVENT_WAIT)
             }
         } else if data_barrier(pc, word) {
             register_read::barrier_thunk(GuestAddress(pc), BARRIER)
@@ -1468,6 +1487,20 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 epoch,
                 count,
             )
+        } else if let Some((register, rt)) = fast_ipi_write(pc, word) {
+            use crate::machine::fast_ipi::Register;
+            self.enter_fast_ipi()?;
+            let pc = GuestAddress(pc);
+            match register {
+                Register::RequestLocal => {
+                    register_read::fast_ipi_request_thunk(pc, rt, false, FAST_IPI)
+                }
+                Register::RequestGlobal => {
+                    register_read::fast_ipi_request_thunk(pc, rt, true, FAST_IPI)
+                }
+                Register::Status => register_read::fast_ipi_status_thunk(pc, rt, FAST_IPI),
+                Register::Countdown => return None,
+            }
         } else if let Some((access, rt)) = timer_word(word) {
             self.clock.native(self.host.tsc_counter()?);
             let access = match access {
@@ -1493,6 +1526,41 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 register_read::checked_write_thunk(pc, rt, cell, refused)
             }
         };
+        self.attach_thunk(code, site, pc, thunk)
+    }
+
+    /// Complete the plain device load `word` of the device site stub at
+    /// `pc` and physical `site` natively while the read the engine kept
+    /// there holds (`register_read::device_read_thunk`), on a host whose
+    /// counter native code reads.
+    fn complete_device_read_natively(
+        &mut self,
+        code: NativeCode,
+        native: &[u8],
+        pc: u64,
+        word: u32,
+        site: u64,
+    ) -> Option<Successor> {
+        let load = register_read::DeviceLoad::of(word)?;
+        let at = native.len().checked_sub(chain::DIRECT_EXIT_BYTES)?;
+        if !chain::is_direct_exit(&native[at..], GuestAddress(pc), ExitKind::System) {
+            return None;
+        }
+        self.clock.native(self.host.tsc_counter()?);
+        let thunk = register_read::device_read_thunk(GuestAddress(pc), site, load, DEVICE_READ);
+        self.attach_thunk(code, at, pc, thunk)
+    }
+
+    /// Install `thunk` and jump to it from the System exit at `site` bytes
+    /// into block code `code`, completing the instruction at `pc`: the
+    /// successor its direct exit to the next instruction is, once ready.
+    fn attach_thunk(
+        &mut self,
+        code: NativeCode,
+        site: usize,
+        pc: u64,
+        thunk: x86_64_pointer::Thunk,
+    ) -> Option<Successor> {
         self.install_stream = self.stream_at(code.0 as u64);
         let installed = self.install_native(&thunk.code, true).ok()?;
         let site = code.0 as u64 + site as u64;

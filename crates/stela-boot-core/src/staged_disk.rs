@@ -28,7 +28,7 @@
 use alloc::{boxed::Box, collections::BTreeMap, collections::VecDeque, sync::Arc, vec::Vec};
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use stela_drivers::block::{BlockDevice, BlockError, Command, Finished, Identity};
 
 /// The commands the model may have queued, at the host disk or finished and
@@ -260,10 +260,14 @@ impl Staging {
                 done.push((ours, host.device.execute(command)));
                 break;
             }
-            match host.device.start(command) {
+            // The disk is told of the step's commands once, after the last.
+            match host.device.start_more(command) {
                 Ok(tag) => host.running.push((tag, ours)),
                 Err(error) => done.push((ours, Err(error))),
             }
+        }
+        if queued && started != 0 {
+            host.device.commit();
         }
         let mut queue = self.queue.lock();
         for (ours, result) in done {
@@ -317,6 +321,28 @@ impl DiskWorker {
     /// Whether a command waits for the host disk or runs on it.
     pub fn work(&self) -> bool {
         self.staging.work.load(Ordering::Acquire)
+    }
+
+    /// Whether a step would only start queued commands on the host disk:
+    /// none runs on it to look for, and it queues them rather than running
+    /// each where it is asked. False while another processor holds it.
+    pub fn starts_only(&self) -> bool {
+        self.staging.host.try_lock().is_some_and(|host| {
+            host.running.is_empty()
+                && host.device.depth() > 0
+                && !self.staging.queue.lock().waiting.is_empty()
+        })
+    }
+
+    /// Whether the host disk has posted what a step would take now, a look
+    /// at memory: a disk that moves a command by one device round trip a
+    /// look shows the next part so while the step that took the last made
+    /// no progress the model sees. False while another processor holds it.
+    pub fn posted(&self) -> bool {
+        self.staging
+            .host
+            .try_lock()
+            .is_some_and(|host| !host.running.is_empty() && host.device.posted())
     }
 
     /// One bounded step at time `now`: take the host disk's completions and
@@ -403,6 +429,144 @@ pub fn step_due(
     seen: u64,
 ) -> bool {
     whole || now.saturating_sub(stepped) >= fallback || doorbells != seen
+}
+
+/// A step a core gave up because another core was inside the host drivers.
+///
+/// A step never waits for the host drivers' lock, whose holder (a USB or
+/// network service turn, another disk's call) can keep it for
+/// milliseconds. But the core that gave up is often one whose guest then
+/// waits for that very disk: it sleeps until its next poll, tens of
+/// milliseconds away, and so does every other waiting core, while the
+/// queued command or the completion waits in memory. So the core that
+/// releases the lock rings the engine's doorbell once for the steps owed
+/// meanwhile, as a disk's completion signal does, and the next step,
+/// whoever takes it, settles them.
+#[derive(Debug, Default)]
+pub struct OwedStep {
+    /// The counter when the oldest step still owed was given up; 0 for
+    /// none.
+    since: AtomicU64,
+    /// Whether a release rang for them already.
+    rung: AtomicBool,
+}
+
+impl OwedStep {
+    pub const fn new() -> Self {
+        Self {
+            since: AtomicU64::new(0),
+            rung: AtomicBool::new(false),
+        }
+    }
+
+    /// A step was given up at counter `now`.
+    pub fn owe(&self, now: u64) {
+        let _ = self
+            .since
+            .compare_exchange(0, now.max(1), Ordering::AcqRel, Ordering::Relaxed);
+    }
+
+    /// Whether a step is owed: one was given up and none has settled it.
+    pub fn owed(&self) -> bool {
+        self.since.load(Ordering::Acquire) != 0
+    }
+
+    /// Whether the core that just released the host drivers rings for the
+    /// steps owed: once until the next step settles them.
+    pub fn ring_due(&self) -> bool {
+        self.since.load(Ordering::Acquire) != 0 && !self.rung.swap(true, Ordering::AcqRel)
+    }
+
+    /// A step started at counter `now`: it settles every step owed, and
+    /// answers how long the oldest of them waited, if any was.
+    pub fn stepped(&self, now: u64) -> Option<u64> {
+        let since = self.since.swap(0, Ordering::AcqRel);
+        self.rung.store(false, Ordering::Release);
+        (since != 0).then(|| now.saturating_sub(since))
+    }
+}
+
+/// Whether a core that waits for an interrupt leaves its wait to step the
+/// staged disks: the doorbell count moved past `seen`, the count at the last
+/// step, or a step given up to another core's hold is still owed (`owed`,
+/// [`OwedStep`], whose ring may store to the waiting core's doorbell line
+/// without moving the count), while a command waits for the host disk or
+/// runs on it (`work`), and no core is inside the host drivers (`taken`).
+/// A count moved with no work is another core's doorbell; and a core inside
+/// the drivers looks at the disk in its own step, so a waiting core would
+/// only find them taken, and leave its wait again at once: that core's
+/// release rings for the steps owed meanwhile.
+pub fn signalled(doorbells: u64, seen: u64, owed: bool, work: bool, taken: bool) -> bool {
+    (doorbells != seen || owed) && work && !taken
+}
+
+/// Completions a disk that signals may take without one signal before it is
+/// polled instead.
+pub const SILENT_COMPLETIONS: u32 = 64;
+
+/// Whether a disk that says it signals its completions has been heard.
+///
+/// Its message may never arrive (an interrupt the platform does not route,
+/// a controller that sends none): its commands then still complete, found by
+/// the looks for lost signals, but nothing should wait for a signal.
+///
+/// The check is not per device: the host handoff gives every device that
+/// signals (each disk, a Wi-Fi adapter) the same message, one vector to one
+/// processor, so a signal does not name its source. Telling them apart
+/// would take a vector and a count per device through the handoff and the
+/// drivers, which this check does not justify; so another device's signal
+/// can make a silent disk look heard, which leaves it at the lost-signal
+/// looks' pace, as before.
+#[derive(Debug, Default)]
+pub struct SignalWatch {
+    /// The signal count at the first completion.
+    first: Option<u64>,
+    /// Completions since then with the count unmoved.
+    silent: u32,
+    /// Decided: a signal came, or the disk was found silent.
+    decided: bool,
+}
+
+impl SignalWatch {
+    /// A completion was taken with the signal count at `signals`: true once,
+    /// at the [`SILENT_COMPLETIONS`]th completion with no signal since the
+    /// first.
+    pub fn completed(&mut self, signals: u64) -> bool {
+        if self.decided {
+            return false;
+        }
+        if *self.first.get_or_insert(signals) != signals {
+            self.decided = true;
+            return false;
+        }
+        self.silent += 1;
+        self.decided = self.silent >= SILENT_COMPLETIONS;
+        self.decided
+    }
+}
+
+/// The completion signals a core that runs guest code handed to a sleeping
+/// core: each doorbell count once.
+#[derive(Debug, Default)]
+pub struct SignalHandOff {
+    /// The doorbell count of the last signal handed on.
+    handed: AtomicU64,
+}
+
+impl SignalHandOff {
+    pub const fn new() -> Self {
+        Self {
+            handed: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether a release hands on the signal behind doorbell count
+    /// `doorbells`: no step has seen it (`seen`, the count at the last
+    /// step), no release handed it on yet, and no core is inside the host
+    /// drivers (`taken`), whose step looks at the disk itself.
+    pub fn take(&self, doorbells: u64, seen: u64, taken: bool) -> bool {
+        doorbells != seen && !taken && self.handed.swap(doorbells, Ordering::AcqRel) != doorbells
+    }
 }
 
 impl BlockDevice for StagedDisk {

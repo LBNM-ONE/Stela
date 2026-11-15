@@ -81,6 +81,30 @@ pub trait Kick: Send + Sync {
     fn release_due(&self) -> bool {
         false
     }
+    /// Whether the work [`Self::release_due`] reports only gives a host
+    /// device commands, with nothing to take from it: a start is one
+    /// doorbell write, cheaper than the wake of a sleeping PE, so the
+    /// releasing processor does it at once instead of handing it on.
+    fn release_inline(&self) -> bool {
+        false
+    }
+    /// Runs on the processor that just released the devices' lock: whether
+    /// a host interrupt it takes now brought host work no one has been told
+    /// of (a host disk's completion signal, which a core running guest code
+    /// holds pending until it opens an interrupt window). The release then
+    /// hands that work to a PE that sleeps waiting for an interrupt
+    /// ([`Hub::hand_off_service`]); with none asleep it waits for the
+    /// host's own service between slices. True once for each signal.
+    fn signal_due(&self) -> bool {
+        false
+    }
+    /// With no PE asleep to take the work a [`Self::signal_due`] signal
+    /// brought, one bounded step of it on the releasing processor, outside
+    /// the devices' lock and any lock the step could need. Whether it
+    /// completed something the devices should look at now.
+    fn signal_step(&self) -> bool {
+        false
+    }
 }
 
 /// The halt-poll after a wait that took `blocked` counts, from `poll`, at
@@ -309,6 +333,11 @@ struct Inbox {
     /// change adds one, so a broadcast also sees an exit and entry it did
     /// not catch.
     active: AtomicU64,
+    /// Under step timing, the exit its machine completes while
+    /// [`Self::active`] is odd ([`step_timing::exit_blocker`]), or 0 in
+    /// native code: what a broadcast that waits for it waits for
+    /// ([`step_timing::BarrierWaits`]).
+    doing: AtomicU64,
     /// Stable native chaining allocation, kept even between PE owners.
     chain: Arc<chain_control::Storage>,
     /// Unique owner epoch; zero is free and u64::MAX is detaching.
@@ -383,6 +412,10 @@ pub struct Counts {
     pub page_ticks: u64,
     pub shared_ticks: u64,
     pub install_ticks: u64,
+    /// Counter ticks its fetches spent walking translations and refilling
+    /// pages ([`super::Statistics::walk_ticks`]).
+    pub walk_ticks: u64,
+    pub refill_ticks: u64,
     /// Device transfers whose deadline came and device line queries, with
     /// their profile clock ticks ([`super::Statistics::due_transfers`]).
     pub due_transfers: u64,
@@ -430,11 +463,12 @@ pub struct Counts {
     /// Why its runs ended at branch-kind exits, in kind order
     /// ([`super::Statistics::branch_misses`]).
     pub branch_misses: [[u64; super::reports::BRANCH_REASONS]; super::reports::BRANCH_KINDS],
-    pub itlb_sources: [u64; 12],
+    pub itlb_sources: [u64; super::ItlbSource::COUNT],
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
-    /// the PAC branch exits it gave a predicted tail.
-    pub stamped: [u64; chain::STAMP_COUNTS + 3],
+    /// the PAC branch exits it gave a predicted tail and its probe
+    /// transfers ([`super::Statistics::lookup_hits`]).
+    pub stamped: [u64; chain::STAMP_COUNTS + 4],
     /// PAC results its service computed since boot, each a memo miss.
     pub pac_fills: u64,
     /// TSC ticks in each engine phase ([`step_timing::Phase`]), while
@@ -563,6 +597,7 @@ impl Hub {
                     lower_globals: Arc::new(GlobalSpan::new()),
                     outside: AtomicBool::new(false),
                     active: AtomicU64::new(0),
+                    doing: AtomicU64::new(0),
                     chain: chain_control::Storage::new(),
                     owner: AtomicU64::new(0),
                     parked: AtomicBool::new(false),
@@ -978,6 +1013,21 @@ impl Hub {
     }
 
     /// PE `pe` is done with its fetched block and is between blocks again.
+    /// PE `pe` completes the exit `blocker` names, or 0: runs natively
+    /// ([`Inbox::doing`]).
+    pub(super) fn set_doing(&self, pe: usize, blocker: u64) {
+        self.inboxes[pe].doing.store(blocker, Ordering::Relaxed);
+    }
+
+    /// What PE `pe` was last doing in a fetched block
+    /// ([`step_timing::BarrierWaits`]).
+    fn doing(&self, pe: usize) -> u64 {
+        match self.inboxes[pe].doing.load(Ordering::Relaxed) {
+            0 => step_timing::BLOCKER_NATIVE,
+            blocker => blocker,
+        }
+    }
+
     pub(super) fn leave_active(&self, pe: usize) {
         let inbox = &self.inboxes[pe];
         let active = inbox.active.load(Ordering::Relaxed);
@@ -1258,6 +1308,17 @@ impl Hub {
         if self.board.grace.inside(pe) {
             self.board.grace.pass(pe);
         }
+    }
+
+    /// Whether a PE but `from` acts on a fetched block ([`Inbox::active`]),
+    /// which a broadcast would wait for ([`Self::applied`]).
+    pub(super) fn others_active(&self, from: usize) -> bool {
+        self.others(from).any(|pe| {
+            let inbox = &self.inboxes[pe];
+            inbox.active.load(Ordering::SeqCst) & 1 != 0
+                && !inbox.sleeping.load(Ordering::SeqCst)
+                && !inbox.outside.load(Ordering::SeqCst)
+        })
     }
 
     fn others(&self, from: usize) -> impl Iterator<Item = usize> + '_ {
@@ -2028,15 +2089,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// completes for them at this PE's next DSB, which sends what this PE
     /// kept in one piece of mail and waits for them
     /// ([`Self::complete_maintenance`]): a run of maintenance takes them
-    /// from their code once.
+    /// from their code once. While no other PE acts on a fetched block,
+    /// there is nobody to take from code: the mail goes at once, and once
+    /// every PE it reaches counts as having applied it ([`Hub::applied`]),
+    /// which stays so, the next DSB finds nothing outstanding and completes
+    /// natively ([`Self::open_barrier`]).
     pub(super) fn post(&mut self, maintenance: Maintenance) {
-        if self.parallel.is_none() {
+        let Some(hub) = self.parallel.clone() else {
             return;
-        }
+        };
         self.mirrors.barrier = stela_compiler::x86_64::register_read::Cell::default();
         self.outgoing.push(maintenance);
-        if self.outgoing.len() == OUTGOING {
+        if self.outgoing.len() == OUTGOING || !hub.others_active(self.current) {
             self.send_outgoing();
+            if hub.applied(&mut self.posted) {
+                self.open_barrier();
+            }
         }
     }
 
@@ -2092,6 +2160,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return Ok(());
         };
         let mut posted = core::mem::take(&mut self.posted);
+        let timed = self.timing_start();
+        let mut blocker = None;
         let started = self.host.counter();
         self.observe_parallel_source(SourcePhase::BroadcastEnter);
         let profile = self.observation_inbox(&hub).map(|inbox| &inbox.broadcasts);
@@ -2106,6 +2176,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         while !hub.applied(&mut posted) {
             if profile.is_some() {
                 polls = polls.saturating_add(1);
+            }
+            if self.step_timing.is_some()
+                && let Some(&(pe, _)) = posted.first()
+            {
+                blocker = Some(hub.doing(pe));
             }
             applied = applied.and(self.wait_for_others(&hub));
             self.host.relax();
@@ -2133,6 +2208,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.posted = posted;
         }
         self.statistics.broadcasts += 1;
+        if self.step_timing.is_some() {
+            let ticks = self.timing_since(timed);
+            self.system_exits.barriers.add(blocker, ticks);
+        }
         let elapsed = self.host.counter().wrapping_sub(started);
         self.statistics.sync_ticks += elapsed;
         // Publish only at boundaries, including a returned maintenance error.
@@ -2164,6 +2243,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             page_ticks: statistics.page_ticks,
             shared_ticks: statistics.shared_ticks,
             install_ticks: statistics.install_ticks,
+            walk_ticks: statistics.walk_ticks,
+            refill_ticks: statistics.refill_ticks,
             due_transfers: statistics.due_transfers,
             transfer_ticks: statistics.transfer_ticks,
             line_queries: statistics.line_queries,
@@ -2199,11 +2280,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
             transition_misses: statistics.transition_misses,
             branch_misses: statistics.branch_misses,
             stamped: {
-                let mut stamped = [0; chain::STAMP_COUNTS + 3];
+                let mut stamped = [0; chain::STAMP_COUNTS + 4];
                 stamped[..chain::STAMP_COUNTS].copy_from_slice(&self.chain.stamp_counts());
                 stamped[chain::STAMP_COUNTS] = statistics.stamped_tails;
                 stamped[chain::STAMP_COUNTS + 1] = statistics.stamped_in_use;
                 stamped[chain::STAMP_COUNTS + 2] = statistics.predicted_tails;
+                stamped[chain::STAMP_COUNTS + 3] = statistics.lookup_hits;
                 stamped
             },
             pac_fills: self.pointer.fills,

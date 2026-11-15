@@ -1,4 +1,4 @@
-//! `stela setup uninstall`: remove everything the setup record names.
+//! `stela uninstall`: remove everything the setup record names.
 use super::{
     CHOICES_PATH, Environment, RECORD, bundle, locate_esp,
     record::{Record, read_any_record},
@@ -11,6 +11,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use stela_loader::host_firmware;
 
 pub(super) fn uninstall(
     environment: &Environment<'_>,
@@ -58,6 +59,11 @@ pub(super) fn uninstall(
                 removals.push(directory);
             }
         }
+        // The firmware bundle setup, repair and update keep on the volume.
+        let firmware = record.volume.join(host_firmware::bundle::DIRECTORY);
+        if firmware.is_dir() {
+            removals.push(firmware);
+        }
     } else {
         writeln!(
             text,
@@ -80,7 +86,7 @@ pub(super) fn uninstall(
     for install in record.iter().flat_map(|r| r.installs.iter()) {
         writeln!(
             text,
-            "  keep     install \"{}\": {} keep macOS, its NVRAM and SEP state{}; delete them \
+            "  keep     install \"{}\": macOS, its NVRAM and SEP state stay on {}{}; delete them \
              with a disk utility when no longer wanted",
             install.name,
             install.disk.partitions(),

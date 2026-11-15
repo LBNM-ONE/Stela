@@ -38,6 +38,10 @@ struct Disk {
     together: bool,
     /// Finish calls that reached the disk.
     looks: usize,
+    /// Looks each started command takes, one device round trip each, the
+    /// next part posted at once; 0 for none. `left` for the running one.
+    parts: usize,
+    left: usize,
     running: Vec<(u32, Command)>,
     completed: BTreeMap<u32, Finished>,
     next: u32,
@@ -47,6 +51,10 @@ struct Disk {
     taken: Vec<&'static str>,
     /// Calls the disk saw, to tell a model's from the host side's.
     calls: usize,
+    /// The batches of starts the disk was told of ([`BlockDevice::commit`]),
+    /// and the starts not yet told of.
+    commits: usize,
+    untold: usize,
 }
 
 impl Disk {
@@ -158,12 +166,25 @@ impl BlockDevice for Device {
         let tag = disk.next;
         disk.next += 1;
         disk.running.push((tag, command));
+        disk.left = disk.parts;
         Ok(tag)
+    }
+    fn start_more(&mut self, command: Command) -> Result<u32, BlockError> {
+        let tag = self.start(command)?;
+        self.disk.borrow_mut().untold += 1;
+        Ok(tag)
+    }
+    fn commit(&mut self) {
+        let mut disk = self.disk.borrow_mut();
+        disk.commits += 1;
+        disk.untold = 0;
     }
     /// A completion waits, or one would at the next finish.
     fn posted(&self) -> bool {
         let disk = self.disk.borrow();
-        !disk.hidden && (!disk.completed.is_empty() || disk.auto && !disk.running.is_empty())
+        !disk.hidden
+            && (!disk.completed.is_empty()
+                || (disk.auto || disk.parts != 0) && !disk.running.is_empty())
     }
     fn finish(&mut self, tag: u32) -> Option<Finished> {
         let during = self.disk.borrow_mut().during_finish.take();
@@ -176,6 +197,12 @@ impl BlockDevice for Device {
         disk.looks += 1;
         if disk.auto {
             disk.complete_all();
+        }
+        if disk.parts != 0 && !disk.running.is_empty() {
+            disk.left -= 1;
+            if disk.left == 0 {
+                disk.complete_all();
+            }
         }
         disk.completed.remove(&tag)
     }
@@ -692,6 +719,31 @@ fn a_busy_core_steps_at_a_disk_signal_without_waiting_for_the_fallback() {
 }
 
 #[test]
+fn a_release_rings_once_for_the_steps_given_up_and_the_next_step_settles_them() {
+    let owed = OwedStep::new();
+    // Nothing owed: a release rings for nothing, and a step settles nothing.
+    assert!(!owed.ring_due());
+    assert_eq!(owed.stepped(5), None);
+    // Two cores give up while a third holds the drivers: the first one's
+    // time is the oldest.
+    owed.owe(100);
+    owed.owe(140);
+    // The holder's release rings once; later releases leave it to that ring.
+    assert!(owed.ring_due());
+    assert!(!owed.ring_due());
+    owed.owe(150);
+    assert!(!owed.ring_due());
+    // The rung step settles all three and reports the oldest one's wait.
+    assert_eq!(owed.stepped(400), Some(300));
+    assert!(!owed.ring_due());
+    assert_eq!(owed.stepped(410), None);
+    // A step given up after that rings again, even at counter 0.
+    owed.owe(0);
+    assert!(owed.ring_due());
+    assert_eq!(owed.stepped(7), Some(6));
+}
+
+#[test]
 fn a_completion_posted_after_a_fruitless_step_is_taken_by_the_next_step() {
     let (mut model, worker, disk) = staged(4);
     let tag = model.start(write(9, 3)).unwrap();
@@ -746,4 +798,112 @@ fn a_step_whose_time_is_spent_leaves_the_rest_to_the_next() {
     for tag in tags {
         assert!(model.finish(tag).unwrap().is_ok());
     }
+}
+
+/// A step gives the host disk its commands in order and tells it of them
+/// once, after the last; a step that starts none tells it nothing.
+#[test]
+fn a_step_tells_the_host_disk_of_its_commands_once() {
+    let (mut model, worker, disk) = staged(8);
+    model.start(write(1, 1)).unwrap();
+    model.start(write(2, 2)).unwrap();
+    model.start(Command::Flush).unwrap();
+    assert_eq!(stepped(&worker).started, 3);
+    assert_eq!(disk.borrow().taken, ["write", "write", "flush"]);
+    assert_eq!((disk.borrow().commits, disk.borrow().untold), (1, 0));
+    assert_eq!(stepped(&worker).started, 0);
+    assert_eq!(disk.borrow().commits, 1);
+}
+
+/// A waiting core leaves its wait for a doorbell that came since the last
+/// step only while the host disk has work and nobody is in the drivers.
+#[test]
+fn a_waiting_core_steps_for_a_new_doorbell_only_with_disk_work() {
+    assert!(signalled(5, 4, false, true, false));
+    assert!(!signalled(4, 4, false, true, false));
+    assert!(!signalled(5, 4, false, false, false));
+    assert!(!signalled(5, 4, false, true, true));
+    // A step owed to another core's hold, whose ring moved no count.
+    assert!(signalled(4, 4, true, true, false));
+    assert!(!signalled(4, 4, true, true, true));
+}
+
+/// A busy core hands each completion signal on once, only while no step has
+/// seen it and nobody is in the host drivers.
+#[test]
+fn a_busy_core_hands_each_completion_signal_on_once() {
+    let handed = SignalHandOff::new();
+    assert!(!handed.take(4, 4, false), "seen by a step");
+    assert!(!handed.take(5, 4, true), "the drivers' holder looks itself");
+    assert!(handed.take(5, 4, false));
+    assert!(!handed.take(5, 4, false), "handed on already");
+    assert!(handed.take(6, 4, false), "a later signal");
+}
+
+/// A disk whose completion message never arrives is found silent once, at
+/// its [`SILENT_COMPLETIONS`]th completion; one heard once never is.
+#[test]
+fn a_disk_whose_signal_never_comes_is_found_silent_once() {
+    let mut silent = SignalWatch::default();
+    let found: Vec<bool> = (0..SILENT_COMPLETIONS + 10)
+        .map(|_| silent.completed(7))
+        .collect();
+    assert_eq!(found.iter().filter(|&&found| found).count(), 1);
+    assert!(found[SILENT_COMPLETIONS as usize - 1]);
+    let mut heard = SignalWatch::default();
+    assert!(!heard.completed(7));
+    assert!(!heard.completed(8));
+    assert!((0..2 * SILENT_COMPLETIONS).all(|_| !heard.completed(8)));
+}
+
+/// A disk that moves a command by one device round trip a look shows its
+/// next part posted after each step, though the step took no result: a
+/// waiting processor's steps follow it, each leaving the disk between.
+#[test]
+fn a_disk_that_moves_one_round_trip_a_look_shows_its_next_part_posted() {
+    let (mut model, worker, disk) = staged(1);
+    disk.borrow_mut().parts = 3;
+    let tag = model.start(write(1, 1)).unwrap();
+    assert!(!worker.posted(), "nothing runs on the host disk yet");
+    assert_eq!(stepped(&worker).started, 1);
+    let mut steps = 0;
+    while worker.posted() {
+        let step = stepped(&worker);
+        steps += 1;
+        assert_eq!(step.finished, usize::from(steps == 3));
+        assert!(steps <= 3, "a step moved no part");
+    }
+    assert_eq!((steps, disk.borrow().looks), (3, 3));
+    assert_eq!(model.finish(tag), Some(Ok(None)));
+    // Another processor holding the host disk leaves nothing to look at.
+    disk.borrow_mut().parts = 2;
+    model.start(write(2, 2)).unwrap();
+    stepped(&worker);
+    let held = worker.staging.host.lock();
+    assert!(!worker.posted());
+    drop(held);
+    assert!(worker.posted());
+}
+
+/// A step only starts commands while none runs on a queueing host disk;
+/// once one runs, or for a disk that runs each command where it is asked,
+/// a step does more, and another processor's step leaves it nothing.
+#[test]
+fn a_step_only_starts_while_no_command_runs_on_a_queueing_disk() {
+    let (mut model, worker, disk) = staged(8);
+    assert!(!worker.starts_only(), "nothing queued");
+    let tag = model.start(write(1, 1)).unwrap();
+    assert!(worker.starts_only());
+    let held = worker.staging.host.lock();
+    assert!(!worker.starts_only());
+    drop(held);
+    stepped(&worker);
+    model.start(write(2, 2)).unwrap();
+    assert!(!worker.starts_only(), "a command runs to look at");
+    disk.borrow_mut().complete_all();
+    stepped(&worker);
+    assert_eq!(model.finish(tag), Some(Ok(None)));
+    let (mut model, worker, _) = staged(0);
+    model.start(write(1, 1)).unwrap();
+    assert!(!worker.starts_only(), "the disk runs it where it is asked");
 }

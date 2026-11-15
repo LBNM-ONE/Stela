@@ -22,7 +22,7 @@
 //! again.
 mod codec;
 
-use super::{Digest, Entry, FormatError, Record};
+use super::{Digest, Entry, FormatError, Record, StoredRecord};
 use crate::machine::engine::SharedTranslation;
 use crate::machine::{Offer, Translations};
 use alloc::{
@@ -355,22 +355,22 @@ impl<'a> Stored<'a> {
             })
     }
 
-    /// Each segment's record decoded, merged in segment order.
-    fn decode(
+    /// Each segment's record indexed, earlier segments' entries first, as
+    /// [`Record::merge`] merges them.
+    fn stored_record(
         &self,
         translator: &Digest,
         key: &Digest,
         scratch: &mut DecodeScratch,
-    ) -> Result<Record, DecodeError> {
-        let mut merged: Option<Record> = None;
-        for stored in self.iter() {
-            let record = stored.decode(translator, key, scratch)?;
-            match &mut merged {
-                Some(merged) => merged.merge(record),
-                None => merged = Some(record),
-            }
+    ) -> Result<StoredRecord, DecodeError> {
+        if self.iter().next().is_none() {
+            return Err(DecodeError::Invalid);
         }
-        merged.ok_or(DecodeError::Invalid)
+        let mut record = StoredRecord::new(*translator, *key);
+        for stored in self.iter() {
+            stored.add_to(&mut record, scratch)?;
+        }
+        Ok(record)
     }
 }
 
@@ -391,6 +391,23 @@ impl PackedRecord<'_> {
 
     fn same_storage(self, other: Self) -> bool {
         self.format == other.format && core::ptr::eq(self.bytes, other.bytes)
+    }
+
+    /// Its entries, indexed into `record` ([`StoredRecord::add`]).
+    fn add_to(
+        self,
+        record: &mut StoredRecord,
+        scratch: &mut DecodeScratch,
+    ) -> Result<(), DecodeError> {
+        let raw = if self.is_compressed() {
+            scratch.inflate(self.bytes)?
+        } else {
+            self.bytes
+        };
+        record.add(raw, !self.checked).map_err(|error| match error {
+            FormatError::Capacity => DecodeError::Capacity,
+            _ => DecodeError::Invalid,
+        })
     }
 
     fn decode(
@@ -525,6 +542,162 @@ pub struct Layout<'a> {
     /// Each record's offset and bytes, by offset.
     records: Vec<(u64, Piece<'a>)>,
     length: u64,
+    /// The heap bytes it holds ([`Layout::owned`]), and its records
+    /// encoded for it and not yet moved to an arena ([`Layout::settle`]).
+    owned: u64,
+    fresh: usize,
+}
+
+/// What [`Layout::settle`] did: moved every record, has more to move, or
+/// found the arena without room for the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    Done,
+    More,
+    Full,
+}
+
+/// Memory outside the heap that holds the bytes of records a boot wrote to
+/// its pack file, as the pack the loader read is held: laid-out segments
+/// keep only their index in the heap. Handed out from the front; the bytes
+/// of records no segment keeps any more (merged anew, evicted or let go)
+/// come back when [`Arena::compact`] moves those still kept to the front.
+pub struct Arena<'a> {
+    /// The region, as the exclusive borrow it came from: every slice handed
+    /// out derives from this pointer.
+    base: core::ptr::NonNull<u8>,
+    capacity: usize,
+    used: usize,
+    region: core::marker::PhantomData<&'a mut [u8]>,
+}
+
+// SAFETY: the arena stands for the exclusive borrow of its region.
+unsafe impl Send for Arena<'_> {}
+// SAFETY: as above; shared access hands out nothing.
+unsafe impl Sync for Arena<'_> {}
+
+impl Default for Arena<'_> {
+    fn default() -> Self {
+        Self {
+            base: core::ptr::NonNull::dangling(),
+            capacity: 0,
+            used: 0,
+            region: core::marker::PhantomData,
+        }
+    }
+}
+
+impl core::fmt::Debug for Arena<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Arena")
+            .field("capacity", &self.capacity)
+            .field("used", &self.used)
+            .finish()
+    }
+}
+
+impl<'a> Arena<'a> {
+    pub fn new(bytes: &'a mut [u8]) -> Self {
+        Self {
+            capacity: bytes.len(),
+            // A slice's pointer is never null.
+            base: core::ptr::NonNull::new(bytes.as_mut_ptr())
+                .unwrap_or(core::ptr::NonNull::dangling()),
+            used: 0,
+            region: core::marker::PhantomData,
+        }
+    }
+
+    /// The bytes handed out, and those left.
+    pub fn used(&self) -> u64 {
+        self.used as u64
+    }
+
+    pub fn left(&self) -> u64 {
+        (self.capacity - self.used) as u64
+    }
+
+    /// `bytes`, copied into the arena: `None` when it has no room for them.
+    fn keep(&mut self, bytes: &[u8]) -> Option<&'a [u8]> {
+        if bytes.len() > self.capacity - self.used {
+            return None;
+        }
+        // SAFETY: `used..used + len` lies in the region and no slice handed
+        // out covers it; `bytes` is outside the region (the heap or a pack).
+        let kept = unsafe {
+            let at = self.base.as_ptr().add(self.used);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), at, bytes.len());
+            core::slice::from_raw_parts(at, bytes.len())
+        };
+        self.used += bytes.len();
+        Some(kept)
+    }
+
+    /// Move the records `layouts` keep in the arena to its front, in the
+    /// order they lie, and give back the bytes between them: what it gave
+    /// back. Records the arena does not hold are left as they are.
+    ///
+    /// # Safety
+    /// `layouts` hold every slice of the arena still in use: nothing else
+    /// keeps one, as a write or merge in progress would.
+    pub unsafe fn compact(&mut self, layouts: &mut [&mut Layout<'a>]) -> u64 {
+        let start = self.base.as_ptr() as usize;
+        let end = start + self.used;
+        // Each kept record: its offset and length, and where it is.
+        let mut places: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for (index, layout) in layouts.iter_mut().enumerate() {
+            for (record, (_, piece)) in layout.records.iter_mut().enumerate() {
+                if let Piece::Kept(bytes) = piece {
+                    let at = bytes.as_ptr() as usize;
+                    if !bytes.is_empty() && (start..end).contains(&at) {
+                        places.push((at - start, bytes.len(), index, record));
+                        // No slice of the arena stays while it moves.
+                        *piece = Piece::Kept(&[]);
+                    }
+                }
+            }
+        }
+        places.sort_unstable();
+        // Runs of overlapping records (one two layouts share) move together,
+        // each run to the end of the one before: (from, to, new start).
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut moved = Vec::with_capacity(places.len());
+        for &(offset, bytes, _, _) in &places {
+            let front = match runs.last_mut() {
+                Some(run) if offset < run.1 => {
+                    run.1 = run.1.max(offset + bytes);
+                    None
+                }
+                Some(run) => Some(run.2 + run.1 - run.0),
+                None => Some(0),
+            };
+            if let Some(front) = front {
+                runs.push((offset, offset + bytes, front));
+            }
+            let (from, _, at) = runs[runs.len() - 1];
+            moved.push(at + offset - from);
+        }
+        for &(from, to, at) in runs.iter().filter(|run| run.0 != run.2) {
+            // SAFETY: both ranges lie in the used region, `at <= from`, and
+            // no slice of the arena is alive (the caller's contract).
+            unsafe {
+                core::ptr::copy(
+                    self.base.as_ptr().add(from),
+                    self.base.as_ptr().add(at),
+                    to - from,
+                );
+            }
+        }
+        for (&(_, bytes, index, record), &at) in places.iter().zip(&moved) {
+            // SAFETY: the record's bytes now lie at `at` in the used region.
+            let kept = unsafe { core::slice::from_raw_parts(self.base.as_ptr().add(at), bytes) };
+            layouts[index].records[record].1 = Piece::Kept(kept);
+        }
+        let front = runs.last().map_or(0, |&(from, to, at)| at + to - from);
+        let given = self.used - front;
+        self.used = front;
+        given as u64
+    }
 }
 
 /// Zeros for the room between records.
@@ -578,15 +751,71 @@ impl<'a> Layout<'a> {
             .into_iter()
             .map(|(_, offset, piece)| (offset, piece))
             .collect();
+        Self::of(prefix, records, offset)
+    }
+
+    /// The layout of `prefix` and `records`, `length` bytes long.
+    fn of(prefix: Vec<u8>, records: Vec<(u64, Piece<'a>)>, length: u64) -> Self {
+        let pieces: usize = records
+            .iter()
+            .map(|(_, piece)| match piece {
+                Piece::Kept(_) => 0,
+                Piece::New(bytes) => bytes.capacity(),
+            })
+            .sum();
+        let fresh = records
+            .iter()
+            .filter(|(_, piece)| matches!(piece, Piece::New(_)))
+            .count();
+        let owned = prefix.capacity() + records.capacity() * size_of::<(u64, Piece<'a>)>() + pieces;
         Self {
             prefix,
             records,
-            length: offset,
+            length,
+            owned: owned as u64,
+            fresh,
         }
+    }
+
+    /// Move records encoded for it to `arena`, about `budget` bytes of
+    /// them, while the arena has room. Its bytes stay the same.
+    pub fn settle(&mut self, arena: &mut Arena<'a>, budget: usize) -> Settled {
+        let mut moved = 0;
+        for (_, piece) in &mut self.records {
+            if self.fresh == 0 || moved >= budget {
+                break;
+            }
+            let Piece::New(bytes) = piece else {
+                continue;
+            };
+            let Some(kept) = arena.keep(bytes) else {
+                return Settled::Full;
+            };
+            moved += bytes.len();
+            self.owned -= bytes.capacity() as u64;
+            self.fresh -= 1;
+            *piece = Piece::Kept(kept);
+        }
+        if self.fresh == 0 {
+            Settled::Done
+        } else {
+            Settled::More
+        }
+    }
+
+    /// Whether every record is held outside the heap.
+    pub fn settled(&self) -> bool {
+        self.fresh == 0
     }
 
     pub fn records(&self) -> usize {
         self.records.len()
+    }
+
+    /// The heap bytes it holds, as laid out: its index and the records
+    /// encoded for it. Those kept from a pack read are the pack's.
+    pub fn owned(&self) -> u64 {
+        self.owned
     }
 
     /// The pack's length in bytes.
@@ -804,19 +1033,23 @@ pub struct Merge<'a> {
     translator: Digest,
     segments: Vec<Segment<'a>>,
     used: Vec<UsedKeys>,
-    /// Keys the running boot used so far: their records stay, whatever
-    /// their age, and its own list counts the boot at the next merge.
+    /// Keys the running boot used so far: their records are of age 0, kept
+    /// first whatever their age, and its own list counts the boot at the
+    /// next merge.
     protect: Option<UsedKeys>,
     bound: u64,
     /// Each segment's next index entry.
     cursors: Vec<usize>,
     format: PackFormat,
     scratch: DecodeScratch,
-    /// The records taken, in key order, and their ages ([`DROPPED`] for
+    /// The records taken, in key order, and their ranks ([`DROPPED`] for
     /// those left out to stay within the bound).
     records: Vec<(Digest, Piece<'a>, u8)>,
     /// The bytes and records of each age.
-    by_age: [(u64, usize); MAX_UNUSED_BOOTS as usize + 1],
+    /// The bytes and records of each rank: a record's age, one more for
+    /// those the running boot did not use when it names those it did
+    /// ([`Merge::protect`]), so they are kept first.
+    by_age: [(u64, usize); RANKS],
     phase: Phase<'a>,
     evicted: u64,
     expired: u64,
@@ -825,6 +1058,8 @@ pub struct Merge<'a> {
 
 /// The age of a record a merge leaves out to stay within its bound.
 const DROPPED: u8 = u8::MAX;
+/// The ranks a merge keeps records by ([`Merge::rank`]).
+const RANKS: usize = MAX_UNUSED_BOOTS as usize + 2;
 
 /// Where a [`Merge`] is.
 enum Phase<'a> {
@@ -892,7 +1127,7 @@ impl<'a> Merge<'a> {
             format,
             scratch: DecodeScratch::default(),
             records: Vec::new(),
-            by_age: [(0, 0); MAX_UNUSED_BOOTS as usize + 1],
+            by_age: [(0, 0); RANKS],
             phase: Phase::Taking,
             evicted: 0,
             expired: 0,
@@ -920,6 +1155,16 @@ impl<'a> Merge<'a> {
         self.records.push((key, piece, 0));
     }
 
+    /// The rank a record of `age` is kept by: its age, one more when the
+    /// running boot names the keys it used and not this one.
+    fn rank(&self, key: &Digest, age: u8) -> u8 {
+        age + u8::from(
+            self.protect
+                .as_ref()
+                .is_some_and(|keys| !keys.contains(key)),
+        )
+    }
+
     /// The age of a record whose segments gave it `age`.
     fn age(&self, key: &Digest, age: u8) -> u8 {
         let boots = self.used.len();
@@ -928,7 +1173,7 @@ impl<'a> Merge<'a> {
             None => age.saturating_add(boots as u8),
         };
         match &self.protect {
-            Some(protect) if protect.contains(key) => age.min(MAX_UNUSED_BOOTS),
+            Some(protect) if protect.contains(key) => 0,
             _ => age,
         }
     }
@@ -978,14 +1223,28 @@ impl<'a> Merge<'a> {
                 }
             }
             match merged {
-                Some(record) => Piece::New(record.encode()),
+                // A holder whose record is already the merged one (as a
+                // boot's record of a page it found holds what it read)
+                // gives its bytes: the merge copies only records it changes.
+                Some(record) => {
+                    let encoded = record.encode();
+                    let same = holders
+                        .iter()
+                        .copied()
+                        .find(|&(index, at)| *self.segments[index].record(at).bytes == encoded[..]);
+                    match same {
+                        Some((index, at)) => self.segments[index].take(at),
+                        None => Piece::New(encoded),
+                    }
+                }
                 None => return true,
             }
         };
-        let slot = &mut self.by_age[usize::from(age)];
+        let rank = self.rank(&key, age);
+        let slot = &mut self.by_age[usize::from(rank)];
         slot.0 += piece.bytes().len() as u64;
         slot.1 += 1;
-        self.records.push((key, piece, age));
+        self.records.push((key, piece, rank));
         true
     }
 
@@ -1078,11 +1337,8 @@ impl<'a> Merge<'a> {
                         let checksum = core::mem::replace(hasher, Sha256::new()).finalize();
                         let mut prefix = core::mem::take(prefix);
                         prefix.extend(checksum);
-                        self.phase = Phase::Done(Layout {
-                            prefix,
-                            records: core::mem::take(placed),
-                            length: *offset,
-                        });
+                        self.phase =
+                            Phase::Done(Layout::of(prefix, core::mem::take(placed), *offset));
                         self.records = Vec::new();
                         return true;
                     };
@@ -1092,9 +1348,16 @@ impl<'a> Merge<'a> {
                         continue;
                     }
                     let length = piece.bytes().len() as u64;
+                    // The rank less the step for records the running boot
+                    // did not use ([`Merge::rank`]).
+                    let unused = self
+                        .protect
+                        .as_ref()
+                        .is_some_and(|keys| !keys.contains(key));
+                    let age = *age - u8::from(unused);
                     prefix.extend(key.0);
                     prefix.extend(offset.to_le_bytes());
-                    prefix.extend((length | u64::from(*age) << AGE_SHIFT).to_le_bytes());
+                    prefix.extend((length | u64::from(age) << AGE_SHIFT).to_le_bytes());
                     // Hash the index in pieces, so the checksum costs no
                     // step more than its share.
                     if prefix.len() - *hashed >= INDEX_HASH_BYTES {
@@ -1144,6 +1407,13 @@ pub struct Counters {
     pub added: u64,
     pub unstorable: u64,
     pub unkept: u64,
+    /// Of those left out, the distinct entries (each counted at its first
+    /// refusal, [`SeenFilter`]); and offers of an entry a new segment took
+    /// this boot, not added again.
+    pub unkept_entries: u64,
+    pub retaken: u64,
+    /// Offers not kept because the heap was short ([`Store::shed`]).
+    pub shed: u64,
     /// Shared lookups that found a block, and why the others missed: no
     /// offer of it, an offer of its PC and page in another context, its
     /// offer evicted, or another machine compiling it at that moment.
@@ -1167,6 +1437,9 @@ impl Counters {
             added,
             unstorable,
             unkept,
+            unkept_entries,
+            retaken,
+            shed,
             shared_hits,
             shared_absent,
             shared_other_context,
@@ -1182,11 +1455,74 @@ impl Counters {
         self.added += added;
         self.unstorable += unstorable;
         self.unkept += unkept;
+        self.unkept_entries += unkept_entries;
+        self.retaken += retaken;
+        self.shed += shed;
         self.shared_hits += shared_hits;
         self.shared_absent += shared_absent;
         self.shared_other_context += shared_other_context;
         self.shared_evicted += shared_evicted;
         self.shared_in_flight += shared_in_flight;
+    }
+}
+
+/// A set of entries by page key, offset and context that answers whether
+/// it holds one with false positives only: two bits of a bit array each,
+/// allocated at the first insert. Its 2^21 bits (256 KiB) give each of a
+/// 16-part store's share of 2 million entries 16 bits: under 2% wrong.
+#[derive(Debug, Default)]
+struct SeenFilter {
+    bits: Vec<u64>,
+}
+
+impl SeenFilter {
+    /// The words of a filter.
+    const WORDS: usize = 1 << 15;
+
+    fn bits(key: &Digest, offset: u16, context: &Digest) -> [usize; 2] {
+        let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("a word"));
+        let mut mixed = word(&key.0[8..16])
+            ^ u64::from(offset).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ word(&context.0[..8]).rotate_left(17);
+        mixed = (mixed ^ mixed >> 31).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed ^= mixed >> 29;
+        let total = Self::WORDS * 64;
+        [
+            (mixed as u32) as usize % total,
+            ((mixed >> 32) as u32) as usize % total,
+        ]
+    }
+
+    /// Insert the entry: whether it may have been in already.
+    fn insert(&mut self, key: &Digest, offset: u16, context: &Digest) -> bool {
+        if self.bits.is_empty() {
+            self.bits = alloc::vec![0; Self::WORDS];
+        }
+        let mut held = true;
+        for bit in Self::bits(key, offset, context) {
+            let (word, mask) = (bit / 64, 1u64 << (bit % 64));
+            held &= self.bits[word] & mask != 0;
+            self.bits[word] |= mask;
+        }
+        held
+    }
+
+    /// Hold what `other` held too.
+    fn absorb(&mut self, other: Self) {
+        if self.bits.is_empty() {
+            self.bits = other.bits;
+        } else {
+            for (word, other) in self.bits.iter_mut().zip(other.bits) {
+                *word |= other;
+            }
+        }
+    }
+
+    fn contains(&self, key: &Digest, offset: u16, context: &Digest) -> bool {
+        !self.bits.is_empty()
+            && Self::bits(key, offset, context)
+                .into_iter()
+                .all(|bit| self.bits[bit / 64] & (1 << (bit % 64)) != 0)
     }
 }
 
@@ -1337,7 +1673,7 @@ fn retire(entry: SharedEntry, deferred: &mut Option<Arc<SharedTranslation>>) {
 /// A validated record paired with the immutable pack bytes it came from.
 pub struct DecodedRecord<'a> {
     stored: Stored<'a>,
-    record: Arc<Record>,
+    record: Arc<StoredRecord>,
     retained_bytes: usize,
 }
 
@@ -1348,7 +1684,7 @@ impl<'a> DecodedRecord<'a> {
         key: &Digest,
         scratch: &mut DecodeScratch,
     ) -> Result<Self, DecodeError> {
-        let record = Arc::new(stored.decode(translator, key, scratch)?);
+        let record = Arc::new(stored.stored_record(translator, key, scratch)?);
         let retained_bytes = record.retained_bytes();
         Ok(Self {
             stored,
@@ -1357,7 +1693,7 @@ impl<'a> DecodedRecord<'a> {
         })
     }
 
-    pub fn into_record(self) -> Arc<Record> {
+    pub fn into_record(self) -> Arc<StoredRecord> {
         self.record
     }
 }
@@ -1367,7 +1703,7 @@ impl<'a> DecodedRecord<'a> {
 #[derive(Debug, Default)]
 struct DecodedCache {
     /// Each record, its charge and its last use.
-    records: BTreeMap<Digest, (Arc<Record>, usize, u64)>,
+    records: BTreeMap<Digest, (Arc<StoredRecord>, usize, u64)>,
     /// Keys by last use.
     uses: BTreeMap<u64, Digest>,
     bytes: usize,
@@ -1377,7 +1713,7 @@ struct DecodedCache {
     /// keeps: the cache holds a small part of what the machines hold
     /// between them, and a record one of them still has need not be
     /// decoded again for another.
-    held: BTreeMap<Digest, Weak<Record>>,
+    held: BTreeMap<Digest, Weak<StoredRecord>>,
     /// The size of `held` at which the records nobody holds leave it.
     held_sweep: usize,
 }
@@ -1393,7 +1729,7 @@ impl DecodedCache {
         }
     }
 
-    fn get(&mut self, key: &Digest) -> Option<Arc<Record>> {
+    fn get(&mut self, key: &Digest) -> Option<Arc<StoredRecord>> {
         let Some((record, _, used)) = self.records.get_mut(key) else {
             return self.held.get(key)?.upgrade();
         };
@@ -1406,7 +1742,7 @@ impl DecodedCache {
 
     /// Note that `record` was handed out, for [`Self::get`] to find while
     /// anyone holds it.
-    fn hold(&mut self, record: &Arc<Record>) {
+    fn hold(&mut self, record: &Arc<StoredRecord>) {
         if self.held.len() >= self.held_sweep.max(HELD_SWEEP) {
             self.held.retain(|_, held| held.strong_count() != 0);
             self.held_sweep = 2 * self.held.len();
@@ -1416,7 +1752,7 @@ impl DecodedCache {
 
     /// Keep `record`, letting the least recently used go until it fits:
     /// those go back to the caller, to drop outside the store's lock.
-    fn insert(&mut self, record: &Arc<Record>, bytes: usize) -> Vec<Arc<Record>> {
+    fn insert(&mut self, record: &Arc<StoredRecord>, bytes: usize) -> Vec<Arc<StoredRecord>> {
         let mut evicted = Vec::new();
         self.hold(record);
         if bytes > self.bound / 8 || self.records.contains_key(&record.key) {
@@ -1440,7 +1776,7 @@ impl DecodedCache {
     }
 
     /// Let records go until the cache fits `bound`.
-    fn shrink(&mut self, bound: usize) -> Vec<Arc<Record>> {
+    fn shrink(&mut self, bound: usize) -> Vec<Arc<StoredRecord>> {
         self.bound = bound;
         let mut evicted = Vec::new();
         while self.bytes > bound {
@@ -1473,6 +1809,12 @@ pub struct Store<'a> {
     added: BTreeMap<Digest, Record>,
     added_bytes: usize,
     added_bound: usize,
+    /// The entries new segments took this boot, which offers again do not
+    /// add, and those the bound left out, counted once each.
+    taken: SeenFilter,
+    refused: SeenFilter,
+    /// The heap is short: offers are counted, not kept ([`Self::shed`]).
+    shedding: bool,
     /// The blocks offered, by page key, PC and context, for the other
     /// machines sharing the store, oldest first. The bound charges kept
     /// source/template buffers, Arc payloads, index entries and FIFO capacity;
@@ -1560,13 +1902,16 @@ impl<'a> Store<'a> {
             shared_bytes: 0,
             shared_bound: 0,
             misses: MissTables::default(),
+            taken: SeenFilter::default(),
+            refused: SeenFilter::default(),
+            shedding: false,
             counters: Counters::default(),
         }
     }
 
     /// Bound what the store keeps beyond its pack. Records the decoded
     /// cache lets go come back, to drop outside a lock.
-    pub fn set_bounds(&mut self, bounds: Bounds) -> Vec<Arc<Record>> {
+    pub fn set_bounds(&mut self, bounds: Bounds) -> Vec<Arc<StoredRecord>> {
         self.added_bound = bounds.added;
         self.decoded.shrink(bounds.decoded)
     }
@@ -1589,6 +1934,8 @@ impl<'a> Store<'a> {
             }
         }
         self.added_bytes += other.added_bytes;
+        self.taken.absorb(other.taken);
+        self.refused.absorb(other.refused);
         self.counters.add(&other.counters);
     }
 
@@ -1671,6 +2018,25 @@ impl<'a> Store<'a> {
         }
     }
 
+    /// Keep no offer while `shed`, the heap being short, or keep them again:
+    /// the writer sheds the store's work before anything else's.
+    pub fn shed(&mut self, shed: bool) {
+        self.shedding = shed;
+    }
+
+    /// Whether offers are shed.
+    pub fn shedding(&self) -> bool {
+        self.shedding
+    }
+
+    /// Count an offer not kept while shedding, whose stored form was never
+    /// made.
+    pub fn count_shed(&mut self, offer: &Offer) {
+        self.misses
+            .offered(shared_key(&offer.key(), offer.pc(), &offer.context()));
+        self.counters.shed += 1;
+    }
+
     /// Keep `entry`, the stored form of `offer` ([`Offer::entry`], made
     /// before the store's lock is taken), for the next pack while the added
     /// bound has room.
@@ -1678,6 +2044,10 @@ impl<'a> Store<'a> {
         let key = offer.key();
         self.misses
             .offered(shared_key(&key, offer.pc(), &offer.context()));
+        if self.shedding {
+            self.counters.shed += 1;
+            return;
+        }
         let Some(entry) = entry else {
             self.counters.unstorable += 1;
             return;
@@ -1689,9 +2059,16 @@ impl<'a> Store<'a> {
         {
             return;
         }
+        if self.taken.contains(&key, entry.offset, &entry.context) {
+            self.counters.retaken += 1;
+            return;
+        }
         let bytes = entry.retained_bytes();
         if self.added_bytes + bytes > self.added_bound {
             self.counters.unkept += 1;
+            if !self.refused.insert(&key, entry.offset, &entry.context) {
+                self.counters.unkept_entries += 1;
+            }
             return;
         }
         self.added_bytes += bytes;
@@ -1708,7 +2085,7 @@ impl<'a> Store<'a> {
     }
 
     /// A record already decoded and checked against this pack.
-    pub fn cached_record(&mut self, key: &Digest) -> Option<Arc<Record>> {
+    pub fn cached_record(&mut self, key: &Digest) -> Option<Arc<StoredRecord>> {
         let record = self.decoded.get(key)?;
         self.counters.cached += 1;
         self.counters.repeated += 1;
@@ -1758,7 +2135,7 @@ impl<'a> Store<'a> {
         stored: Stored<'a>,
         decoded: &Result<DecodedRecord<'a>, DecodeError>,
         scratch: &mut DecodeScratch,
-    ) -> Vec<Arc<Record>> {
+    ) -> Vec<Arc<StoredRecord>> {
         self.decode_scratch.retain(scratch);
         if !self
             .stored(key)
@@ -1808,6 +2185,11 @@ impl<'a> Store<'a> {
     /// ([`Delta`]): the added bound is free again.
     pub fn take_added(&mut self) -> BTreeMap<Digest, Record> {
         self.added_bytes = 0;
+        for (key, record) in &self.added {
+            for entry in record.entries() {
+                self.taken.insert(key, entry.offset, &entry.context);
+            }
+        }
         core::mem::take(&mut self.added)
     }
 
@@ -1834,7 +2216,7 @@ impl<'a> Store<'a> {
 }
 
 impl Translations for Store<'_> {
-    fn record(&mut self, key: &Digest) -> Option<Arc<Record>> {
+    fn record(&mut self, key: &Digest) -> Option<Arc<StoredRecord>> {
         if let Some(record) = self.cached_record(key) {
             return Some(record);
         }
@@ -1870,10 +2252,6 @@ impl Translations for Store<'_> {
     fn offer(&mut self, offer: Offer) {
         let entry = offer.entry();
         self.keep(&offer, entry);
-        self.lend(offer);
-    }
-
-    fn lend(&mut self, offer: Offer) {
         if let Some(mut staged) = StagedOffer::new(offer, self.shared_bound) {
             drop(self.accept_shared(&mut staged));
         }
@@ -1924,7 +2302,7 @@ mod tests {
             ..Bounds::default()
         }));
         assert!(!store.stored(&keys[0]).unwrap().checked());
-        let held: Vec<Arc<Record>> = keys[..8]
+        let held: Vec<Arc<StoredRecord>> = keys[..8]
             .iter()
             .map(|key| store.record(key).unwrap())
             .collect();
@@ -1958,12 +2336,12 @@ mod tests {
             key.0[..8].copy_from_slice(&(index as u64).to_le_bytes());
             key
         };
-        let kept = Arc::new(Record::new(translator, key(0)));
+        let kept = Arc::new(StoredRecord::new(translator, key(0)));
         assert!(cache.insert(&kept, 1).is_empty());
         for index in 1..=2 * HELD_SWEEP {
             assert!(
                 cache
-                    .insert(&Arc::new(Record::new(translator, key(index))), 1)
+                    .insert(&Arc::new(StoredRecord::new(translator, key(index))), 1)
                     .is_empty()
             );
         }
@@ -2053,7 +2431,7 @@ mod tests {
         assert!(store.cached_record(&first).is_none());
 
         let held = store.record(&first).unwrap();
-        assert_eq!(*held, compressed_record);
+        assert_eq!(held.record().unwrap(), compressed_record);
         assert!(Arc::ptr_eq(&held, &store.record(&first).unwrap()));
         assert_eq!(store.record(&second).unwrap().key, second);
         let output = written(&mut store, u64::MAX);
@@ -2396,7 +2774,10 @@ mod tests {
             offsets.sort();
             offsets
         };
-        assert_eq!(offsets(&next.record(&key).unwrap()), [8, 0x10]);
+        assert_eq!(
+            offsets(&next.record(&key).unwrap().record().unwrap()),
+            [8, 0x10]
+        );
         assert_eq!(next.counters.loaded, 1);
         let segments = segments.into_iter().map(Segment::from).collect();
         let mut merge = Merge::new(translator, segments, Vec::new(), u64::MAX);
@@ -2532,7 +2913,7 @@ mod tests {
         let kept = kept.layout.to_vec();
         let pack = Pack::parse(&kept, &translator).unwrap();
         assert_eq!(pack.records(), 1);
-        assert_eq!(pack.age(&used), Some(MAX_UNUSED_BOOTS));
+        assert_eq!(pack.age(&used), Some(0));
     }
 
     /// The time a store's lookup of a page key takes over one segment and
@@ -2719,11 +3100,48 @@ mod tests {
         assert_eq!(large.counters.unstorable, 1);
         let bytes = written(&mut small, u64::MAX);
         let mut next = Store::new(translator, Some(&bytes)).0;
-        assert_eq!(next.record(&key).unwrap().entries().len(), 4);
+        assert_eq!(next.record(&key).unwrap().len(), 4);
         // A take frees the bound for the entries that come next.
         assert_eq!(small.added_bytes(), 0);
         small.keep(&offers[63], offers[63].entry());
         assert_eq!(small.counters.added, 5);
+    }
+
+    #[test]
+    fn an_entry_a_segment_took_is_not_added_again_and_refusals_count_each_entry_once() {
+        let translator = translator_id();
+        let key = Digest::of(b"page");
+        let offers: Vec<Offer> = (0..8)
+            .map(|index| offer(0x1_0000_4000 + 8 * index, key))
+            .collect();
+        let one = offers[0].entry().unwrap().retained_bytes();
+        let mut store = Store::new(translator, None).0;
+        drop(store.set_bounds(Bounds {
+            added: 2 * one,
+            ..Bounds::default()
+        }));
+        // Offered twice each while the bound holds two: six refused twice.
+        for _ in 0..2 {
+            for offer in &offers {
+                store.keep(offer, offer.entry());
+            }
+        }
+        assert_eq!(store.counters.added, 2);
+        assert_eq!(store.counters.unkept, 12);
+        assert_eq!(store.counters.unkept_entries, 6);
+        // A segment takes the two; compiled again, they are not added again,
+        // and the bound takes two of the others.
+        assert_eq!(store.take_added().len(), 1);
+        for offer in &offers {
+            store.keep(offer, offer.entry());
+        }
+        assert_eq!(store.counters.retaken, 2);
+        assert_eq!(store.counters.added, 4);
+        assert_eq!(store.counters.unkept_entries, 6);
+        let kept = store.take_added();
+        let entries: Vec<u16> = kept[&key].entries().iter().map(|e| e.offset).collect();
+        assert_eq!(entries.len(), 2);
+        assert!(!entries.contains(&offers[0].entry().unwrap().offset));
     }
 
     #[test]

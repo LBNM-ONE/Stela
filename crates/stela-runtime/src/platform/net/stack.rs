@@ -31,11 +31,13 @@ pub struct Config {
     pub dns: Vec<Ipv4>,
 }
 
-/// Autonegotiation after an adapter reset: about 3 s for 2.5GBASE-T,
-/// doubled.
-const CARRIER_WAIT_US: u64 = 6_000_000;
-/// smoltcp's DHCP client retries within this.
-const DHCP_WAIT_US: u64 = 30_000_000;
+/// smoltcp's DHCP client asks every 10 seconds within this. A switch port
+/// that runs spanning tree forwards nothing for its first 30 seconds after
+/// the link comes up (IEEE 802.1D: 15 s listening, 15 s learning), and the
+/// adapter's start has just dropped and raised the link, so a wait of 30
+/// seconds lost every request there. Other systems' clients ask for a
+/// minute or longer.
+const DHCP_WAIT_US: u64 = 60_000_000;
 /// smoltcp's resolver retries each server within this.
 const DNS_WAIT_US: u64 = 15_000_000;
 /// How long a name's address is used before it is looked up again.
@@ -53,7 +55,9 @@ pub const DOWNLOAD_BUFFER: usize = 4 << 20;
 const SEND_BUFFER: usize = 64 * 1024;
 
 /// The link as smoltcp's device. A link refusal is kept, and the operation
-/// polling the interface reports it.
+/// polling the interface reports it. Under [`Link::receive`]'s contract a
+/// receive error means the device is gone, so the operation ends there
+/// rather than polling a dead link to its deadline.
 struct Phy<L> {
     link: L,
     tx_frame: Vec<u8>,
@@ -99,8 +103,13 @@ impl<L: Link> phy::TxToken for Tx<'_, L> {
                 return result;
             }
         }
-        if let Err(error) = self.link.transmit(frame) {
-            self.fault.get_or_insert(error);
+        // A full ring drops the frame, as a full queue would; the protocol
+        // retransmits it. Anything else is the link's fault.
+        match self.link.transmit(frame) {
+            Ok(()) | Err(LinkError::Busy) => {}
+            Err(error) => {
+                self.fault.get_or_insert(error);
+            }
         }
         result
     }
@@ -463,15 +472,31 @@ impl<L: Link, C: Clock> Stack<L, C> {
         Ok(())
     }
 
+    /// Waits for carrier as long as the link may take to bring it up
+    /// ([`Link::carrier_wait_us`]), returning as soon as it is up.
+    /// `waiting` hears each whole second waited so far.
+    fn await_carrier(&mut self, waiting: &mut dyn FnMut(u64)) -> Result<(), NetError> {
+        let start = self.now()?;
+        let limit = self.phy.link.carrier_wait_us();
+        let mut reported = 0;
+        while !self.phy.link.carrier() {
+            let elapsed = self.now()?.saturating_sub(start);
+            if elapsed >= limit {
+                return Err(NetError::NoCarrier);
+            }
+            let seconds = elapsed / 1_000_000;
+            if seconds > reported {
+                reported = seconds;
+                waiting(seconds);
+            }
+        }
+        Ok(())
+    }
+
     /// Waits for carrier and, without a configuration by hand, a DHCP
     /// lease.
     pub fn dhcp(&mut self) -> Result<&Config, NetError> {
-        let start = self.now()?;
-        while !self.phy.link.carrier() {
-            if self.now()? >= start + CARRIER_WAIT_US {
-                return Err(NetError::NoCarrier);
-            }
-        }
+        self.await_carrier(&mut |_| {})?;
         let deadline = self.now()? + DHCP_WAIT_US;
         while self.config.is_none() {
             if self.dhcp.is_none() {
@@ -479,7 +504,7 @@ impl<L: Link, C: Clock> Stack<L, C> {
             }
             if self.now()? >= deadline {
                 return Err(NetError::Dhcp(
-                    "no IPv4 lease: no DHCP server answered within 30 seconds",
+                    "no IPv4 lease: no DHCP server answered within 60 seconds",
                 ));
             }
             self.poll()?;

@@ -461,7 +461,7 @@ fn l1d_2_disables_eee_slows_its_clocks_and_uses_the_slow_mdio_clock_while_down()
 }
 
 #[test]
-fn the_station_address_comes_from_the_eeprom_load_or_the_adapter_is_refused() {
+fn the_station_address_comes_from_the_eeprom_load_or_is_random() {
     let mut fixture = Fixture::new();
     {
         let mut model = fixture.model.borrow_mut();
@@ -507,10 +507,18 @@ fn the_station_address_comes_from_the_eeprom_load_or_the_adapter_is_refused() {
         model.registers.insert(MAC_STA_ADDR, 0);
         model.registers.insert(MAC_STA_ADDR + 4, 0);
     }
-    assert!(matches!(
-        fixture.attach(0x1063),
-        Err(BlockError::Unsupported(_))
-    ));
+    // atl1c_probe: no valid permanent address, so eth_hw_addr_random; the
+    // adapter starts and is programmed with it.
+    let adapter = fixture.attach(0x1063).unwrap();
+    let mac = adapter.mac();
+    assert!(mac.is_valid() && mac.0[0] & 2 != 0, "{mac}");
+    let [a, b, c, d, e, f] = mac.0;
+    let model = fixture.model.borrow();
+    assert_eq!(model.get(MAC_STA_ADDR), u32::from_be_bytes([c, d, e, f]));
+    assert_eq!(
+        model.get(MAC_STA_ADDR + 4),
+        u32::from(u16::from_be_bytes([a, b]))
+    );
 }
 
 #[test]
@@ -638,7 +646,7 @@ fn transmit_fills_one_descriptor_per_frame_and_pads_short_frames() {
 }
 
 #[test]
-fn a_full_ring_waits_for_the_consumer_and_then_reports_a_stall() {
+fn a_full_ring_is_busy_until_the_consumer_frees_a_descriptor() {
     let mut fixture = Fixture::new();
     let mut adapter = fixture.attach(0x1063).unwrap();
     fixture.link(Some(GIGABIT_FULL));
@@ -646,10 +654,8 @@ fn a_full_ring_waits_for_the_consumer_and_then_reports_a_stall() {
     for _ in 0..TX_RING - 1 {
         adapter.transmit(&[1; 60]).unwrap();
     }
-    assert!(matches!(
-        adapter.transmit(&[1; 60]),
-        Err(LinkError::Adapter(_))
-    ));
+    assert_eq!(adapter.transmit(&[1; 60]), Err(LinkError::Busy));
+    assert_eq!(adapter.transmit(&[1; 60]), Err(LinkError::Busy));
     fixture
         .model
         .borrow_mut()
@@ -739,6 +745,63 @@ fn a_return_descriptor_naming_no_free_descriptor_reinitializes_the_queues() {
     let frame = vec![9; 64];
     assert!(fixture.model.borrow_mut().deliver(&frame, 0, None, 1));
     assert_eq!(adapter.receive(), Ok(Some(frame)));
+}
+
+/// A dropped adapter stops: interrupts masked and queues off before the
+/// MAC, then the soft reset, within 50 ms of waits even when the MAC
+/// stays busy. A function that left the bus gets no write.
+#[test]
+fn dropping_an_adapter_stops_it_within_an_exit_and_a_lost_one_gets_no_write() {
+    for busy in [0, IDLE_STATUS_RXMAC_BUSY] {
+        let mut fixture = Fixture::new();
+        let (clock, elapsed) = crate::timing::counted_model(Clock {
+            ticks_per_microsecond: 1,
+        });
+        let adapter = Atl1c::bring_up(
+            Peer(fixture.model.clone()),
+            clock,
+            Fixture::chip(0x1063),
+            &mut fixture.dma,
+            2,
+            String::from("peer"),
+        )
+        .unwrap();
+        fixture.model.borrow_mut().busy = busy;
+        fixture.model.borrow_mut().writes.clear();
+        let before = elapsed.get();
+        drop(adapter);
+        assert!(
+            elapsed.get() - before < 50_000,
+            "{}",
+            elapsed.get() - before
+        );
+        let model = fixture.model.borrow();
+        let at = |found: &dyn Fn(usize, u32) -> bool| {
+            model
+                .writes
+                .iter()
+                .position(|&(offset, value)| found(offset, value))
+                .unwrap()
+        };
+        let masked = at(&|offset, value| offset == IMR && value == 0);
+        let receive = at(&|offset, value| offset == RXQ_CTRL && value & RXQ_CTRL_EN == 0);
+        let transmit = at(&|offset, value| offset == TXQ_CTRL && value & TXQ_CTRL_EN == 0);
+        let mac = at(&|offset, value| {
+            offset == MAC_CTRL && value & (MAC_CTRL_RX_EN | MAC_CTRL_TX_EN) == 0
+        });
+        let reset = at(&|offset, value| offset == MASTER_CTRL && value & MASTER_CTRL_SOFT_RST != 0);
+        assert!(masked < receive && receive < transmit && transmit < mac && mac < reset);
+    }
+    let mut fixture = Fixture::new();
+    let adapter = fixture.attach(0x1063).unwrap();
+    fixture
+        .model
+        .borrow_mut()
+        .registers
+        .insert(MASTER_CTRL, u32::MAX);
+    fixture.model.borrow_mut().writes.clear();
+    drop(adapter);
+    assert!(fixture.model.borrow().writes.is_empty());
 }
 
 #[test]

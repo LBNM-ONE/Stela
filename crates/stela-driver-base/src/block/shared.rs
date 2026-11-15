@@ -119,6 +119,16 @@ pub(super) fn merge(
     }
 }
 
+/// Where the last of a merged command's requests ends in its data: each
+/// request is its ticket, offset and bytes.
+fn offset_end(requests: &[(u32, usize, usize)]) -> usize {
+    requests
+        .iter()
+        .map(|&(_, offset, bytes)| offset + bytes)
+        .max()
+        .unwrap_or(0)
+}
+
 impl Held<'_> {
     pub(super) fn requests(&mut self) -> &mut Requests {
         // SAFETY: the lock is held; the requests are apart from the device.
@@ -134,8 +144,10 @@ impl Held<'_> {
 
     /// Queue `command` and start what the device has room for; its ticket.
     /// Completions are collected only when the device has no room, which
-    /// they may free: a start needs no look at them.
-    pub(super) fn submit(&mut self, command: Command) -> u32 {
+    /// they may free: a start needs no look at them. The device is told of
+    /// what started unless `more` commands follow at once, when the caller
+    /// tells it ([`Self::commit`]).
+    pub(super) fn submit(&mut self, command: Command, more: bool) -> u32 {
         let requests = self.requests();
         let ticket = requests.next;
         requests.next = requests.next.wrapping_add(1);
@@ -144,9 +156,18 @@ impl Held<'_> {
             .push_back((ticket, command, crate::Clock::ticks()));
         self.step(false);
         if !self.requests().waiting.is_empty() {
-            self.advance();
+            self.step(true);
+        }
+        if !more {
+            self.commit();
         }
         ticket
+    }
+
+    /// Tell the device of every command started since it was last told
+    /// ([`BlockDevice::commit`]).
+    pub(super) fn commit(&mut self) {
+        BlockDevice::commit(&mut **self);
     }
 
     /// Count a command `accounted` as, with `merges` requests joined into
@@ -210,6 +231,7 @@ impl Held<'_> {
     /// here, its caller waiting.
     pub(super) fn advance(&mut self) {
         self.step(true);
+        self.commit();
     }
 
     /// Start the waiting commands, collecting completions first when `reap`.
@@ -284,13 +306,31 @@ impl Held<'_> {
                 finished.insert(ticket, result);
                 continue;
             }
-            let tickets = core::iter::once((ticket, 0, bytes)).chain(merged.more);
-            for (ticket, offset, bytes) in tickets {
-                let part = match &result {
-                    Ok(Some(data)) => Ok(Some(data[offset..offset + bytes].to_vec())),
-                    other => other.clone(),
-                };
-                finished.insert(ticket, part);
+            let tickets: Vec<_> = core::iter::once((ticket, 0, bytes))
+                .chain(merged.more)
+                .collect();
+            match result {
+                // Each request's part, split off the end so the first keeps
+                // the command's buffer: only the later parts are copied.
+                Ok(Some(mut data)) if data.len() >= offset_end(&tickets) => {
+                    data.truncate(offset_end(&tickets));
+                    for &(ticket, offset, _) in tickets[1..].iter().rev() {
+                        let part = data.split_off(offset);
+                        finished.insert(ticket, Ok(Some(part)));
+                    }
+                    finished.insert(tickets[0].0, Ok(Some(data)));
+                }
+                Ok(Some(_)) => {
+                    for &(ticket, ..) in &tickets {
+                        let short = BlockError::Protocol("a read returned too little data");
+                        finished.insert(ticket, Err(short));
+                    }
+                }
+                other => {
+                    for &(ticket, ..) in &tickets {
+                        finished.insert(ticket, other.clone());
+                    }
+                }
             }
         }
     }
@@ -338,7 +378,8 @@ impl Held<'_> {
             }
             let accounted = command.accounted(block);
             work.starts = work.starts.saturating_add(1);
-            match self.start(command) {
+            // The device is told of the batch once its caller commits.
+            match self.start_more(command) {
                 Ok(tag) => {
                     let requests = self.requests();
                     if requests.running.is_empty() {
@@ -412,16 +453,27 @@ impl Shared {
     /// None means disabled, not yet observed, or currently held by an owner.
     /// This snapshot grants no DMA, mapping or quiescence permission.
     pub fn callback_stats(&self) -> Option<CallbackStats> {
-        if !self.0.profile_callbacks.load(Ordering::Relaxed)
-            || self
-                .0
-                .held
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-        {
+        if !self.0.profile_callbacks.load(Ordering::Relaxed) {
             return None;
         }
-        Held(&self.0).requests().stats.callbacks
+        self.try_lock()?.requests().stats.callbacks
+    }
+
+    /// The disk, unless another owner is using it now: an owner that may
+    /// not wait, as a service turn, which holds its processor inside one
+    /// exit, comes back later. The holder may itself wait for a lock its
+    /// device needs, such as the host drivers'.
+    pub(super) fn try_lock(&self) -> Option<Held<'_>> {
+        self.0
+            .held
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+            .then(|| Held(&self.0))
+    }
+
+    /// Whether another owner is using the disk now.
+    fn held(&self) -> bool {
+        self.0.held.load(Ordering::Relaxed)
     }
 
     /// The disk, once no other owner is using it.
@@ -448,7 +500,7 @@ impl Shared {
                     device.execute(command)
                 });
             }
-            disk.submit(command)
+            disk.submit(command, false)
         };
         loop {
             if let Some(result) = self.lock().take(ticket) {
@@ -488,6 +540,7 @@ impl Shared {
             first: 0,
             identity,
             started: Vec::new(),
+            uncommitted: false,
         }
     }
 
@@ -504,6 +557,7 @@ impl Shared {
             first,
             identity,
             started: Vec::new(),
+            uncommitted: false,
         })
     }
 
@@ -531,12 +585,21 @@ impl Shared {
 pub(super) const WINDOW_DEPTH: usize = 64;
 
 /// A run of blocks of a [`Shared`] disk.
+///
+/// A look never waits for the disk while another owner uses it, as that
+/// owner may itself wait long for a lock its device needs (the host
+/// drivers'): [`BlockDevice::finish`] and [`BlockDevice::finished`] answer
+/// nothing yet, [`BlockDevice::room`] no room, [`BlockDevice::posted`] that
+/// a finish may find a result, and a commit is made by the next call that
+/// takes the disk. A start, once room said the disk was free, takes it.
 pub struct Window {
     pub(super) disk: Shared,
     pub(super) first: u64,
     pub(super) identity: Identity,
     /// The tickets of this window's started commands not yet finished.
     pub(super) started: Vec<u32>,
+    /// A commit put off while another owner held the disk.
+    pub(super) uncommitted: bool,
 }
 
 impl Window {
@@ -548,6 +611,25 @@ impl Window {
     pub(super) fn run(&self, command: Command) -> Result<(), BlockError> {
         let command = command.within(&self.identity, self.first)?;
         self.disk.run(command).map(drop)
+    }
+}
+
+impl Window {
+    /// Queue `command` on the disk; its ticket. The device is told of it at
+    /// once unless `more` follow ([`BlockDevice::commit`]).
+    fn submit(&mut self, command: Command, more: bool) -> Result<u32, BlockError> {
+        let command = command.within(&self.identity, self.first)?;
+        // Only the window's own depth refuses. Another owner that took the
+        // disk since `room` answered is waited for: a start refused for it
+        // would fail a store whose caller had found room.
+        if self.started.len() >= WINDOW_DEPTH {
+            return Err(BlockError::Protocol("the disk window queue is full"));
+        }
+        let ticket = self.disk.lock().submit(command, more);
+        // Without more to follow it told the device of every start.
+        self.uncommitted &= more;
+        self.started.push(ticket);
+        Ok(ticket)
     }
 }
 
@@ -620,21 +702,31 @@ impl BlockDevice for Window {
     }
 
     fn room(&self) -> bool {
-        self.started.len() < WINDOW_DEPTH
+        self.started.len() < WINDOW_DEPTH && !self.disk.held()
     }
 
     fn start(&mut self, command: Command) -> Result<u32, BlockError> {
-        let command = command.within(&self.identity, self.first)?;
-        if !self.room() {
-            return Err(BlockError::Protocol("the disk window queue is full"));
-        }
-        let ticket = self.disk.lock().submit(command);
-        self.started.push(ticket);
-        Ok(ticket)
+        self.submit(command, false)
     }
 
+    fn start_more(&mut self, command: Command) -> Result<u32, BlockError> {
+        self.submit(command, true)
+    }
+
+    fn commit(&mut self) {
+        match self.disk.try_lock() {
+            Some(mut disk) => disk.commit(),
+            None => self.uncommitted = true,
+        }
+    }
+
+    /// Takes the disk's completions and commits what waits.
     fn finish(&mut self, tag: u32) -> Option<Finished> {
-        let finished = self.disk.lock().take(tag)?;
+        let finished = {
+            let mut disk = self.disk.try_lock()?;
+            self.uncommitted = false;
+            disk.take(tag)
+        }?;
         self.started.retain(|&ticket| ticket != tag);
         Some(finished)
     }
@@ -645,7 +737,7 @@ impl BlockDevice for Window {
     }
 
     fn finished(&mut self, tag: u32) -> Option<Finished> {
-        let finished = self.disk.lock().requests().finished.remove(&tag)?;
+        let finished = self.disk.try_lock()?.requests().finished.remove(&tag)?;
         self.started.retain(|&ticket| ticket != tag);
         Some(finished)
     }
@@ -653,7 +745,9 @@ impl BlockDevice for Window {
     /// One of this window's commands has a result, or the disk has posted
     /// a completion: another window's results never count.
     fn posted(&self) -> bool {
-        let mut disk = self.disk.lock();
+        let Some(mut disk) = self.disk.try_lock() else {
+            return true;
+        };
         let finished = &disk.requests().finished;
         self.started
             .iter()

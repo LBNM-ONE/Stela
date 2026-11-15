@@ -37,6 +37,7 @@ impl Fixture {
             tags: (0..DEPTH).map(|_| Tag::Free).collect(),
             recovery: None,
             signalled: false,
+            owed: false,
             max_transfer: BOUNCE_BYTES,
             max_command_bytes: MAX_COMMAND_BYTES,
             shutdown_timeout_us: 1000,
@@ -55,6 +56,7 @@ impl Fixture {
             ready_timeout_us: 500_000,
             configuration: CONFIGURATION_VALUE & !ENABLE,
             independent_identify: false,
+            fatal_standing: false,
             version: 0,
             commands: 0,
             scans: 0,
@@ -302,6 +304,22 @@ fn a_fatal_controller_is_reset_first_and_poisons_when_it_stays_fatal() {
     assert_eq!(c.registers.read32(DOORBELLS + 8).unwrap(), 0);
 }
 
+/// INTMS masks pin and MSI interrupts. A controller configured for MSI-X
+/// is never written there, at attach or at a reset.
+#[test]
+fn the_interrupt_mask_register_is_left_alone_under_msix() {
+    for (signalled, mask) in [(false, u32::MAX), (true, 0)] {
+        let fixture = Fixture::new();
+        let mut c = fixture.disk.controller.borrow_mut();
+        c.signalled = signalled;
+        c.configure_admin().unwrap();
+        assert_eq!(c.registers.read32(INTERRUPT_MASK_SET).unwrap(), mask);
+        assert_eq!(c.registers.read32(ADMIN_ATTRIBUTES).unwrap(), 15 << 16 | 15);
+        assert_ne!(c.registers.read64(ADMIN_SUBMISSION).unwrap(), 0);
+        assert_ne!(c.registers.read64(ADMIN_COMPLETION).unwrap(), 0);
+    }
+}
+
 fn namespace(blocks: u64, flbas: u8, formats: &[(usize, u32)], attributes: u8) -> Vec<u8> {
     let mut page = vec![0u8; PAGE];
     page[NAMESPACE_SIZE].copy_from_slice(&blocks.to_le_bytes());
@@ -376,6 +394,92 @@ fn running_id(controller: &Controller, tag: u32) -> u16 {
         Tag::Running { id, .. } => id,
         _ => panic!("tag {tag} runs nothing"),
     }
+}
+
+/// Post, before it is sent, the successful completion of the next admin
+/// command, reporting it fetched.
+fn answer_next_admin(controller: &mut Controller) {
+    let id = controller.command_id.wrapping_add(1);
+    let entry = usize::from(controller.admin.head) * 16;
+    let head = u32::from(controller.admin.next(controller.admin.tail));
+    let phase = u32::from(controller.admin.phase) << 16;
+    controller.admin.completions.write(entry + 8, head);
+    controller
+        .admin
+        .completions
+        .write(entry + 12, phase | u32::from(id));
+}
+
+/// Linux `nvme_wait_ready` ends at CSTS.RDY and reads no more of CSTS
+/// before its first command, whose completion it takes: a CSTS.CFS still
+/// set once the controller is ready stands, at attach and after a reset,
+/// and fails no command the controller answers. A CFS that rises after a
+/// clean start fails the next command before it is sent.
+#[test]
+fn a_fatal_status_standing_at_ready_fails_no_command_the_controller_answers() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.registers.write32(STATUS, READY | FATAL).unwrap();
+    c.wait_enabled(1000).unwrap();
+    assert!(c.fatal_standing);
+    answer_next_admin(&mut c);
+    let identify = c.identify_command(IDENTIFY_CONTROLLER, 0).unwrap();
+    assert_eq!(c.admin(identify), Ok(0));
+    assert_eq!(c.fault, None);
+
+    // A clean start: the CFS that rises later is the controller's failure.
+    c.registers.write32(STATUS, READY).unwrap();
+    c.wait_enabled(1000).unwrap();
+    assert!(!c.fatal_standing);
+    c.registers.write32(STATUS, READY | FATAL).unwrap();
+    let tail = c.admin.tail;
+    assert!(matches!(
+        c.admin_wait(identify, true),
+        Err(Lost::Reset(BlockError::Device { status: 3 }))
+    ));
+    assert_eq!(c.admin.tail, tail, "nothing sent to the failed controller");
+
+    // A reset's enable keeps a CFS standing at ready the same way and
+    // goes on to Identify Controller.
+    c.fatal_standing = false;
+    let deadline = c.deadline(1000).unwrap();
+    c.recovery = Some(Recovery::Enabling(deadline));
+    c.recover().unwrap();
+    assert!(c.fatal_standing);
+    assert!(matches!(
+        c.recovery,
+        Some(Recovery::Admin {
+            step: Step::Identify,
+            ..
+        })
+    ));
+}
+
+/// CAP.MQES bounds the I/O queues alone, as Linux shortens its I/O queue
+/// depth to it: a controller with four-entry queues is started with a
+/// four-entry I/O queue and three tags. Only the reserved MQES 0, one
+/// entry that can hold no command, is refused.
+#[test]
+fn a_short_mqes_shortens_the_io_queue_and_only_one_entry_is_refused() {
+    let _clock = crate::test_clock::virtualize();
+    let fixture = Fixture::new();
+    let mut c = fixture.disk.controller.borrow_mut();
+    c.clock = Clock {
+        ticks_per_microsecond: 1,
+    };
+    // MQES 3, CAP.TO one half second, the NVM command set. The fixture's
+    // CSTS never shows RDY, so the start ends waiting for it.
+    c.registers
+        .write64(CAPABILITIES, 3 | 1 << 24 | 1 << 37)
+        .unwrap();
+    assert_eq!(c.initialize(), Err(BlockError::Timeout.at(ENABLE_WAIT)));
+    assert_eq!(c.io.entries, 4);
+    assert_eq!(c.tags.len(), 3);
+    c.registers
+        .write64(CAPABILITIES, 1 << 24 | 1 << 37)
+        .unwrap();
+    assert!(matches!(c.initialize(), Err(BlockError::Unsupported(_))));
 }
 
 #[test]
@@ -901,10 +1005,11 @@ fn a_command_past_its_deadline_is_aborted_then_resets_the_controller_and_runs_ag
         assert!(matches!(controller.recovery, Some(Recovery::Enabling(_))));
         controller.registers.write32(STATUS, READY).unwrap();
     }
-    // Ready: identified, then the I/O queues created again, completion
-    // queue first.
+    // Ready: identified, then the queue count set and the I/O queues
+    // created again, completion queue first.
     for opcode in [
         ADMIN_IDENTIFY,
+        ADMIN_SET_FEATURES,
         ADMIN_CREATE_COMPLETION,
         ADMIN_CREATE_SUBMISSION,
     ] {
@@ -1187,4 +1292,163 @@ fn only_the_first_namespace_carries_the_bare_controller_serial() {
     assert_eq!(super::namespace_serial("S1", 2, Some(1)), "S1/n2");
     // A controller whose only active namespace is not the first ID.
     assert_eq!(super::namespace_serial("S1", 3, Some(3)), "S1");
+}
+
+/// A command's start and finish count in their parts: the start and its
+/// doorbell, and the look at the completion queue with its status read and
+/// completion doorbell. Other tests run commands too, so counts only grow.
+#[test]
+fn a_command_counts_its_start_and_finish_parts() {
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    parts::take();
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        let id = running_id(&controller, read);
+        post(&mut controller, id, 0);
+    }
+    assert!(matches!(disk.finish(read), Some(Ok(Some(_)))));
+    let counted = parts::take();
+    let calls = |part: parts::Part| counted[part as usize][0];
+    for part in [
+        parts::Part::Start,
+        parts::Part::Doorbell,
+        parts::Part::Advance,
+        parts::Part::Ring,
+    ] {
+        assert!(calls(part) >= 1, "{part:?}");
+    }
+}
+
+/// A valid completion is taken with no status read, as Linux takes it, even
+/// while the controller reports a fatal status; an invalid one reads the
+/// status and fails the controller with it.
+#[test]
+fn completions_are_trusted_without_a_status_read_unless_they_look_invalid() {
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        controller.registers.write32(STATUS, FATAL).unwrap();
+        let id = running_id(&controller, read);
+        post(&mut controller, id, 0);
+    }
+    assert!(matches!(disk.finish(read), Some(Ok(Some(_)))));
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        let id = running_id(&controller, read);
+        post(&mut controller, id.wrapping_add(7), 0);
+    }
+    let error = BlockError::Device { status: FATAL };
+    assert_eq!(disk.finish(read), Some(Err(error.clone())));
+    assert_eq!(disk.controller.borrow().fault, Some(error));
+}
+
+/// An invalid completion from a controller whose status is good poisons it
+/// as a corrupt queue.
+#[test]
+fn an_invalid_completion_from_a_healthy_controller_is_a_corrupt_queue() {
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    {
+        let mut controller = disk.controller.borrow_mut();
+        controller.registers.write32(STATUS, READY).unwrap();
+        let id = running_id(&controller, read);
+        post(&mut controller, id.wrapping_add(7), 0);
+    }
+    let corrupt = BlockError::Device { status: 0xffff };
+    assert_eq!(disk.finish(read), Some(Err(corrupt)));
+}
+
+/// A dead controller posts nothing: its commands' timeout reads its status,
+/// within the command deadline, and resets one that failed fatally and
+/// fails the commands of one that reads all ones.
+#[test]
+fn a_dead_controller_is_found_at_the_command_timeout() {
+    let _clock = crate::test_clock::virtualize();
+    let wait = |disk: &mut Namespace| {
+        let clock = disk.controller.borrow().clock;
+        let started = clock.try_start().unwrap();
+        while clock.try_elapsed_us(started).unwrap() < 1000 {
+            core::hint::spin_loop();
+        }
+    };
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    disk.controller
+        .borrow()
+        .registers
+        .write32(STATUS, FATAL)
+        .unwrap();
+    assert_eq!(disk.finish(read), None);
+    wait(disk);
+    assert_eq!(disk.finish(read), None);
+    {
+        let controller = disk.controller.borrow();
+        assert!(
+            controller.aborts.is_empty(),
+            "no abort to a failed controller"
+        );
+        assert!(controller.recovery.is_some(), "reset at the first deadline");
+    }
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let read = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    disk.controller
+        .borrow()
+        .registers
+        .write32(STATUS, REMOVED)
+        .unwrap();
+    assert_eq!(disk.finish(read), None);
+    wait(disk);
+    assert_eq!(disk.finish(read), Some(Err(removed())));
+}
+
+/// Commands started with more to follow share one submission doorbell,
+/// rung at the commit with the tail past the last; a look at the queue
+/// rings one a caller left owed, and a plain start rings at once.
+#[test]
+fn a_batch_of_starts_rings_the_submission_doorbell_once() {
+    let mut fixture = Fixture::new();
+    let disk = &mut fixture.disk;
+    let doorbell = |disk: &Namespace| {
+        let controller = disk.controller.borrow();
+        let at = DOORBELLS + 2 * usize::from(controller.io.id) * controller.doorbell_stride;
+        controller.registers.read32(at).unwrap()
+    };
+    let first = disk
+        .start_more(Command::Read { lba: 0, bytes: 512 })
+        .unwrap();
+    let second = disk
+        .start_more(Command::Read { lba: 8, bytes: 512 })
+        .unwrap();
+    assert_eq!(doorbell(disk), 0, "owed, not rung");
+    disk.commit();
+    assert_eq!(doorbell(disk), 2, "one ring past both");
+    disk.commit();
+    assert_eq!(doorbell(disk), 2);
+    for tag in [first, second] {
+        {
+            let mut controller = disk.controller.borrow_mut();
+            let id = running_id(&controller, tag);
+            post(&mut controller, id, 0);
+        }
+        assert!(matches!(disk.finish(tag), Some(Ok(Some(_)))));
+    }
+    // Left owed: the next look at the queue rings it.
+    let third = disk
+        .start_more(Command::Read { lba: 0, bytes: 512 })
+        .unwrap();
+    assert_eq!(doorbell(disk), 2);
+    assert_eq!(disk.finish(third), None);
+    assert_eq!(doorbell(disk), 3);
+    // A plain start rings at once.
+    let fourth = disk.start(Command::Read { lba: 0, bytes: 512 }).unwrap();
+    assert_eq!(doorbell(disk), 4);
+    let _ = fourth;
 }

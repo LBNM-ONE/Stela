@@ -19,6 +19,11 @@ pub(super) struct Model {
     pub(super) smb_hidden: bool,
     pub(super) smb_stuck: bool,
     pub(super) ulp_stuck: bool,
+    /// A PHY in ULP or behind SMBus: no MDIO cycle completes until the
+    /// LANPHYPC toggle brings it back.
+    pub(super) phy_asleep: bool,
+    /// An Intel ME that never finishes taking the PHY out of ULP.
+    pub(super) me_stuck: bool,
     pub(super) flush_after_tx: bool,
     pub(super) flush_after_rx: bool,
     pub(super) phy: BTreeMap<(u8, u16, u16), u16>,
@@ -35,8 +40,15 @@ pub(super) struct Model {
     pub(super) flash_control: u16,
     pub(super) time: u64,
     pub(super) quiet_until: u64,
+    /// The Intel ME holds the PHY semaphore until this model time.
+    pub(super) firmware_flag_until: u64,
+    /// Each MDIO cycle takes this long before MDIC reports it ready.
+    pub(super) mdic_cycle_us: u64,
+    pub(super) mdic_ready_at: u64,
     pub(super) master_busy: usize,
     pub(super) mdic_failures: usize,
+    /// The MDIC attempt the `mdic_failures` window starts at.
+    pub(super) mdic_fail_after: usize,
     pub(super) mdic_attempts: usize,
     pub(super) mdic_kind: u8,
     pub(super) init_missing: bool,
@@ -79,6 +91,8 @@ impl Model {
             smb_hidden: false,
             smb_stuck: false,
             ulp_stuck: false,
+            phy_asleep: false,
+            me_stuck: false,
             flush_after_tx: false,
             flush_after_rx: false,
             phy: BTreeMap::from([((2, 0, 2), 0x154), ((2, 0, 3), 0x93)]),
@@ -95,8 +109,12 @@ impl Model {
             flash_control: 0,
             time: 0,
             quiet_until: 0,
+            firmware_flag_until: 0,
+            mdic_cycle_us: 0,
+            mdic_ready_at: 0,
             master_busy: 0,
             mdic_failures: 0,
+            mdic_fail_after: 0,
             mdic_attempts: 0,
             mdic_kind: 0,
             init_missing: false,
@@ -167,6 +185,12 @@ unsafe impl Registers for Io {
         let mut m = self.0.borrow_mut();
         m.enter()?;
         let mut value = m.mac.get(&at).copied().unwrap_or(0);
+        if at == super::super::EXTCNF_CTRL && m.time < m.firmware_flag_until {
+            value |= super::super::SWFLAG;
+        }
+        if at == super::super::MDIC && m.time < m.mdic_ready_at {
+            value &= !super::super::MDIC_READY;
+        }
         if at == STATUS && m.master_busy != 0 {
             m.master_busy -= 1;
             value |= MASTER_ENABLED;
@@ -209,8 +233,19 @@ unsafe impl Registers for Io {
         } else if at == CTRL && previous & PHY_RESET != 0 && value & PHY_RESET == 0 {
             m.mac.insert(at, value);
             m.did_reset();
+        } else if !m.spt && at == CTRL && previous & (1 << 16) != 0 && value & (1 << 16) == 0 {
+            // Any PCH's LANPHYPC toggle wakes its PHY.
+            m.phy_asleep = false;
+            m.mac.insert(at, value);
+        } else if at == H2ME && value & H2ME_ENFORCE_SETTINGS != 0 && !m.me_stuck {
+            // The ME takes the PHY out of ULP and reports it done.
+            m.phy_asleep = false;
+            let fwsm = m.mac.get(&super::super::FWSM).copied().unwrap_or(0);
+            m.mac.insert(super::super::FWSM, fwsm & !ULP_CONFIG_DONE);
+            m.mac.insert(at, value);
         } else if m.spt && at == CTRL && previous & (1 << 16) != 0 && value & (1 << 16) == 0 {
             m.power_pending = true;
+            m.phy_asleep = false;
             if m.smb_hidden_after_power {
                 m.smb_hidden = true;
                 let value = m.phy.get(&(1, 769, 23)).copied().unwrap_or(0) | 1;
@@ -231,6 +266,8 @@ unsafe impl Registers for Io {
                 m.kmrn.insert(index, value as u16);
                 m.mac.insert(at, value);
             }
+        } else if at == super::super::MDIC && m.phy_asleep {
+            m.mac.insert(at, value & !super::super::MDIC_READY);
         } else if at == super::super::MDIC {
             let index = ((value >> 16) & 31) as u16;
             let address = ((value >> 21) & 31) as u8;
@@ -249,7 +286,9 @@ unsafe impl Registers for Io {
                     smb && m.smb_hidden && m.mac.get(&0x18).copied().unwrap_or(0) & (1 << 11) == 0;
                 m.phy_load(address, index)
             };
-            let failed = m.mdic_attempts < m.mdic_failures;
+            m.mdic_ready_at = m.time + m.mdic_cycle_us;
+            let failed =
+                (m.mdic_fail_after..m.mdic_fail_after + m.mdic_failures).contains(&m.mdic_attempts);
             m.mdic_attempts += 1;
             let response = (value & !0xffff)
                 | u32::from(data)
@@ -473,6 +512,7 @@ fn raw(io: Io, timer: Timer) -> Controller<Io, Timer> {
         poisoned: false,
         profile: Profile::I82579,
         config_read: None,
+        ulp_exit_failed: false,
     }
 }
 #[test]
@@ -516,20 +556,11 @@ fn cold_composition_uses_real_nvm_and_two_distinct_reset_lifecycles() {
 }
 #[test]
 fn unmanaged_exact_cohort_and_readiness_are_required() {
-    for failure in 0..6 {
+    for failure in 2..6 {
         let (state, released, io, timer) = fixture();
         {
             let mut m = state.borrow_mut();
             match failure {
-                0 => {
-                    m.mac.insert(
-                        super::super::FWSM,
-                        super::super::FW_VALID | super::super::RESET_PERMITTED,
-                    );
-                }
-                1 => {
-                    m.mac.insert(super::super::FWSM, 0);
-                }
                 2 => m.init_missing = true,
                 3 => m.reset_missing = true,
                 4 => m.reset_stuck = true,
@@ -545,15 +576,7 @@ fn unmanaged_exact_cohort_and_readiness_are_required() {
         };
         assert!(matches!(
             error,
-            Error::Nvm(nvm::Error::FirmwareOwned)
-                | Error::Phy(super::super::Error {
-                    primary: Fault::ResetBlocked,
-                    ..
-                })
-                | Error::InitTimeout
-                | Error::ResetNotObserved
-                | Error::ResetStuck
-                | Error::MasterTimeout
+            Error::InitTimeout | Error::ResetNotObserved | Error::ResetStuck | Error::MasterTimeout
         ));
         assert_eq!(
             released.load(Ordering::SeqCst),
@@ -787,4 +810,108 @@ fn missing_minimum_before_each_cold_profile_keeps_original_io_and_provider() {
         assert_eq!(released.load(Ordering::SeqCst), 0);
         assert_eq!(state.borrow().timer_drops.load(Ordering::SeqCst), 0);
     }
+}
+
+fn phy_resets(state: &Rc<RefCell<Model>>) -> usize {
+    state
+        .borrow()
+        .operations
+        .iter()
+        .filter(|o| o[0] == 1 && o[1] == CTRL && o[2] & PHY_RESET != 0)
+        .count()
+}
+
+fn lanphypc_toggles(state: &Rc<RefCell<Model>>) -> usize {
+    state
+        .borrow()
+        .operations
+        .iter()
+        .filter(|o| o[0] == 1 && o[1] == CTRL && o[2] & LANPHYPC_OVERRIDE != 0)
+        .count()
+}
+
+/// `e1000_init_phy_workarounds_pchlan`: an 82579 whose PHY the last owner
+/// left behind SMBus is woken by the LANPHYPC toggle, not refused.
+#[test]
+fn an_82579_phy_left_in_smbus_mode_is_woken_by_the_lanphypc_toggle() {
+    let (state, released, io, timer) = fixture();
+    state.borrow_mut().phy_asleep = true;
+    let controller = start(io, timer).unwrap();
+    assert_eq!(lanphypc_toggles(&state), 1);
+    assert!(!controller.is_poisoned());
+    drop(controller);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+}
+
+/// An adapter the Intel ME manages starts: the PHY is shared through the
+/// software flag, the PHY configuration stays gated as Linux leaves a
+/// managed 82579, and no LANPHYPC toggle runs on an answering PHY.
+#[test]
+fn an_82579_the_me_manages_starts_with_its_phy_configuration_gated() {
+    let (state, _, io, timer) = fixture();
+    state.borrow_mut().mac.insert(
+        super::super::FWSM,
+        super::super::FW_VALID | super::super::RESET_PERMITTED,
+    );
+    let controller = start(io, timer).unwrap();
+    assert_eq!(lanphypc_toggles(&state), 0);
+    assert!(phy_resets(&state) >= 2);
+    assert_ne!(
+        state.borrow().mac[&super::super::EXTCNF_CTRL] & GATE_PHY,
+        0,
+        "Linux keeps a managed 82579's automatic PHY configuration gated"
+    );
+    drop(controller);
+}
+
+/// A PHY reset the ME blocks is left out, as `e1000e_phy_hw_reset_generic`
+/// leaves it out, and the adapter still starts; a PHY that does not answer
+/// while the ME blocks its wake-up is refused with that reason.
+#[test]
+fn a_phy_reset_the_me_blocks_is_left_out_and_a_blocked_wake_is_named() {
+    let (state, _, io, timer) = fixture();
+    state.borrow_mut().mac.insert(super::super::FWSM, 0);
+    let controller = start(io, timer).unwrap();
+    assert_eq!(phy_resets(&state), 0);
+    drop(controller);
+
+    let (state, released, io, timer) = fixture();
+    {
+        let mut m = state.borrow_mut();
+        m.mac.insert(super::super::FWSM, 0);
+        m.phy_asleep = true;
+    }
+    assert!(matches!(start(io, timer), Err(Error::RecoveryBlocked)));
+    assert_eq!(lanphypc_toggles(&state), 0);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+}
+
+/// `e1000_phy_is_accessible_pchlan` takes any valid PHY ID as an answer:
+/// a PHY that answers with another ID is named as the wrong PHY by the
+/// identity check after recovery, with no LANPHYPC toggle before it.
+#[test]
+fn a_wrong_phy_that_answers_is_named_without_a_lanphypc_toggle() {
+    let (state, released, io, timer) = fixture_lpt();
+    state.borrow_mut().phy.insert((2, 0, 3), 0x00b7);
+    assert!(matches!(
+        start_lpt(0x153a, io, timer),
+        Err(Error::Phy(error)) if error.primary == Fault::WrongPhy(0x0154_00b7)
+    ));
+    assert_eq!(lanphypc_toggles(&state), 0);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+}
+
+/// An LPT PHY left behind SMBus is found with the MAC forced to SMBus mode
+/// or woken by the toggle, and the MAC ends out of SMBus mode.
+#[test]
+fn an_lpt_phy_left_in_smbus_mode_is_woken_and_the_mac_leaves_smbus_mode() {
+    let (state, _, io, timer) = fixture_lpt();
+    state.borrow_mut().phy_asleep = true;
+    let controller = start_lpt(0x153a, io, timer).unwrap();
+    assert_eq!(lanphypc_toggles(&state), 1);
+    assert_eq!(
+        state.borrow().mac.get(&CTRL_EXT).copied().unwrap_or(0) & FORCE_SMBUS,
+        0
+    );
+    drop(controller);
 }

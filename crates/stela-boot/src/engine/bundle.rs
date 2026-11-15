@@ -81,6 +81,22 @@ pub(super) fn contents(file: &File) -> &'static [u8] {
     }
 }
 
+/// `file`'s contents to change: once, by the one owner of the file.
+///
+/// # Safety
+/// Nothing else reads or writes `file`'s contents for as long as the slice
+/// lives.
+pub(super) unsafe fn contents_mut(file: &File) -> &'static mut [u8] {
+    // SAFETY: the loader left every bundle file allocated; the physmap maps
+    // it, and the caller owns it alone.
+    unsafe {
+        core::slice::from_raw_parts_mut(
+            layout::physical(file.contents.physical) as *mut u8,
+            file.contents.bytes as usize,
+        )
+    }
+}
+
 fn open(root: &mut Directory, path: &str) -> Result<RegularFile> {
     let path = CString16::try_from(path).map_err(|_| refuse!("bundle path is not UCS-2"))?;
     root.open(&path, FileMode::Read, FileAttribute::empty())
@@ -152,12 +168,8 @@ fn read_sized(mut file: RegularFile, path: &str, bytes: u64) -> Result<ReadPages
         .ok_or(refuse!("bundle file is too large"))?;
     let count = length.div_ceil(PAGE).max(1);
     let pages = ReadPages {
-        start: boot::allocate_pages(
-            boot::AllocateType::AnyPages,
-            boot::MemoryType::LOADER_DATA,
-            count,
-        )
-        .map_err(|_| refuse!("firmware has no memory for Stela"))?,
+        start: crate::firmware::any_pages(count)
+            .map_err(|_| refuse!("firmware has no memory for Stela"))?,
         count,
         length,
     };
@@ -286,13 +298,16 @@ const MAX_HASH_FILE_BYTES: u64 = payload::MAX_HASH_BLOCKS * 32;
 /// ambiguous paths across firmware volumes rather than choosing a different
 /// inventory.
 pub fn restore_inventory(path: &str) -> Result<Inventory> {
-    with_inventory(path, |_, _, _| Ok(()))
+    with_inventory(path, None, |_, _, _| Ok(()))
 }
 
 /// [`restore_inventory`], also running `check` on the inventory's volume
-/// while it is open, with the inventory's directory.
+/// while it is open, with the inventory's directory. With `source`, the
+/// install medium's GPT partition, only the volume on that partition is
+/// searched (`stela_boot_core::bundle::inventory_volume`).
 pub fn with_inventory(
     path: &str,
+    source: Option<[u8; 16]>,
     mut check: impl FnMut(&mut Directory, &str, &PayloadManifest) -> Result<()>,
 ) -> Result<Inventory> {
     const LIMIT: u64 = 16 * 1024 * 1024;
@@ -300,6 +315,12 @@ pub fn with_inventory(
     for handle in
         boot::find_handles::<SimpleFileSystem>().map_err(|_| refuse!("no file systems"))?
     {
+        if !stela_boot_core::bundle::inventory_volume(
+            source,
+            source.and_then(|_| super::translations::partition(handle)),
+        ) {
+            continue;
+        }
         let Ok(mut volume) = boot::open_protocol_exclusive::<SimpleFileSystem>(handle) else {
             continue;
         };

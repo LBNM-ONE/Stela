@@ -163,6 +163,36 @@ fn system_exits_report(exits: &step_timing::SystemExits, tsc_hz: u64) {
     }
     numerical_exits_report(numerical, &exits.floating, tsc_hz);
     numerical_causes_report(&exits.floating_words);
+    compression_report(&exits.compression, tsc_hz);
+}
+
+/// `PES WKDM compress=count ns_each whole/read/codec/write`: the WKDMC and
+/// WKDMD instructions completed since the last beat, the mean nanoseconds
+/// of their handling and of its parts (`step_timing::Compression`).
+fn compression_report(compression: &[step_timing::Compression; 2], tsc_hz: u64) {
+    if compression.iter().all(|operation| operation.count == 0) {
+        return;
+    }
+    let mut line = String::from("PES WKDM count ns_each whole/read/codec/write");
+    for (name, operation) in ["compress", "decompress"].iter().zip(compression) {
+        let each = |ticks: u64| {
+            u128::from(ticks) * 1_000_000_000
+                / u128::from(tsc_hz.max(1))
+                / u128::from(operation.count.max(1))
+        };
+        line.push_str(&format!(
+            " {name}={} {}/{}/{}/{}",
+            operation.count,
+            each(operation.whole),
+            each(operation.read),
+            each(operation.codec),
+            each(operation.write),
+        ));
+    }
+    output::arguments(format_args!(
+        "{line}
+"
+    ));
 }
 
 /// The exits of `exits` past the first `shown`, summed, if any.
@@ -263,7 +293,90 @@ fn numerical_exits_report(
 /// named by the model mapped there (`name@page`) with its total handling
 /// time and the part of it spent waiting for the board's lock; `other`
 /// holds pages past the table's, and `forwarded` the accesses sent to the
-/// home machine with their PEs' wait for its answer.
+/// home machine with their PEs' wait for its answer. `PES DEVICE MODELS`
+/// sums the pages by model, and `PES DEVICE REGISTERS` gives the sixteen
+/// costliest registers by direction (`name@address:r` or `:w`, or
+/// `name.REGISTER:r` summed over the model's pages where it names them).
+/// `PES BARRIER`: the DSBs that completed maintenance their PE posted, the
+/// share that waited for no PE, the time each took, and by what the last PE
+/// they waited for was doing (native code or an exit, by slot and word), the
+/// eight that took longest.
+fn barrier_waits_report(waits: &step_timing::BarrierWaits, tsc_hz: u64) {
+    const SHOWN: usize = 8;
+    if waits.waits == 0 {
+        return;
+    }
+    let each = |count: u64, ticks: u64| {
+        u128::from(ticks) * 1_000_000_000 / u128::from(count.max(1)) / u128::from(tsc_hz.max(1))
+    };
+    let mut line = format!(
+        "PES BARRIER waits={} quick={} ns_each={} blockers count/ns_each",
+        waits.waits,
+        waits.quick,
+        each(waits.waits, waits.ticks)
+    );
+    let mut blockers: Vec<_> = waits
+        .blockers
+        .iter()
+        .filter(|blocker| blocker.count != 0)
+        .collect();
+    blockers.sort_unstable_by_key(|blocker| core::cmp::Reverse(blocker.ticks));
+    for blocker in blockers.into_iter().take(SHOWN) {
+        let name = if blocker.key == step_timing::BLOCKER_ENTERING {
+            String::from("entering")
+        } else if blocker.key == step_timing::BLOCKER_RETURNED {
+            String::from("returned")
+        } else if blocker.key & step_timing::BLOCKER_EXIT == 0 {
+            String::from("native")
+        } else {
+            let slot = ((blocker.key & !step_timing::BLOCKER_EXIT) >> 32) as usize;
+            let word = blocker.key as u32;
+            let slot_name = EXIT_NAMES.get(slot).copied().unwrap_or("exit");
+            if word == 0 || word == step_timing::DEVICE_SITE_KEY {
+                String::from(slot_name)
+            } else {
+                format!("{slot_name}.{}", step_timing::system_key_name(word))
+            }
+        };
+        line.push_str(&format!(
+            " {name}={}/{}",
+            blocker.count,
+            each(blocker.count, blocker.ticks)
+        ));
+    }
+    if waits.other.count != 0 {
+        line.push_str(&format!(
+            " other={}/{}",
+            waits.other.count,
+            each(waits.other.count, waits.other.ticks)
+        ));
+    }
+    output::arguments(format_args!("{line}\n"));
+}
+
+/// `PES REGIME`: the host's regime changes and prediction isolations, how
+/// many and the time each took.
+fn regime_syncs_report(regimes: &step_timing::RegimeSyncs, tsc_hz: u64) {
+    if regimes.syncs == 0 {
+        return;
+    }
+    let each = |count: u64, ticks: u64| {
+        u128::from(ticks) * 1_000_000_000 / u128::from(count.max(1)) / u128::from(tsc_hz.max(1))
+    };
+    let mut sources = String::new();
+    for (name, count) in step_timing::SyncSource::NAMES.iter().zip(regimes.sources) {
+        sources.push_str(&format!(" {name}={count}"));
+    }
+    output::arguments(format_args!(
+        "PES REGIME syncs={} ns_each={} isolations={} ns_each={} unchanged={} by{sources}\n",
+        regimes.syncs,
+        each(regimes.syncs, regimes.sync_ticks),
+        regimes.isolations,
+        each(regimes.isolations, regimes.isolation_ticks),
+        regimes.unchanged,
+    ));
+}
+
 fn device_exits_report<H: Host>(
     machine: &Machine<H, parallel::Board>,
     exits: &step_timing::DeviceExits,
@@ -328,17 +441,96 @@ fn device_exits_report<H: Host>(
         line.push_str(&format!(" {name}={count}/{}", nanos(ticks)));
     }
     output::arguments(format_args!("{line}\n"));
+    // The same accesses by register and direction, the sixteen costliest:
+    // which registers translated code could complete itself. A register
+    // its model names counts as `model.NAME`, summed over the model's pages
+    // (a gate's CALL over every connection).
+    const REGISTERS: usize = 16;
+    let mut registers: Vec<(String, step_timing::DeviceRegisterExit)> = Vec::new();
+    for exit in exits.counted_registers() {
+        let physical = exit.register & !step_timing::DEVICE_REGISTER_WRITE;
+        let direction = if exit.register & step_timing::DEVICE_REGISTER_WRITE != 0 {
+            'w'
+        } else {
+            'r'
+        };
+        let (name, register) = machine.devices.with(|devices| {
+            (
+                stela_engine::machine::Devices::device_name(devices, physical),
+                stela_engine::machine::Devices::register_name(devices, physical),
+            )
+        });
+        let name = name.unwrap_or("unmapped");
+        let label = match register {
+            Some(register) => format!("{name}.{register}:{direction}"),
+            None => format!("{name}@{physical:#x}:{direction}"),
+        };
+        match registers.iter_mut().find(|(known, _)| *known == label) {
+            Some((_, sum)) => {
+                sum.count += exit.count;
+                sum.ticks += exit.ticks;
+                sum.waited += exit.waited;
+                sum.access += exit.access;
+                sum.settle += exit.settle;
+                sum.transfer += exit.transfer;
+                sum.copies += exit.copies;
+                sum.released += exit.released;
+                sum.longest = sum.longest.max(exit.longest);
+            }
+            None => registers.push((label, *exit)),
+        }
+    }
+    registers.sort_unstable_by_key(|(_, exit)| core::cmp::Reverse(exit.ticks));
+    // A write's time also splits into its access (the lock and the model's
+    // write) and the settle after it, and the settle into the transfer under
+    // the lock and the deferred copies after its release; the longest exit
+    // ends each entry.
+    let mut line = String::from(
+        "PES DEVICE REGISTERS count/ns/lock_ns[/access_ns/settle_ns/transfer_ns/copies_ns/released_ns]/longest_ns",
+    );
+    for (label, exit) in registers.iter().take(REGISTERS) {
+        line.push_str(&format!(
+            " {label}={}/{}/{}",
+            exit.count,
+            nanos(exit.ticks),
+            lock_nanos(exit.waited)
+        ));
+        if label.ends_with(":w") {
+            line.push_str(&format!(
+                "/{}/{}/{}/{}/{}",
+                nanos(exit.access),
+                nanos(exit.settle),
+                nanos(exit.transfer),
+                nanos(exit.copies),
+                lock_nanos(exit.released)
+            ));
+        }
+        line.push_str(&format!("/{}", nanos(exit.longest)));
+    }
+    let other = exits.other_registers;
+    if other.count != 0 {
+        line.push_str(&format!(
+            " other={}/{}/{}",
+            other.count,
+            nanos(other.ticks),
+            lock_nanos(other.waited)
+        ));
+    }
+    output::arguments(format_args!("{line}\n"));
     // A device write's exit, split ([`step_timing::DeviceWrites`]).
     let writes = exits.writes;
     if writes.count != 0 {
         let each = |ticks: u64| nanos(ticks) / u128::from(writes.count);
         let parts = writes.access + writes.settle + writes.call;
         output::arguments(format_args!(
-            "PES DEVICE WRITES count={} ns_each exit={} access={} settle={} call={} rest={}\n",
+            "PES DEVICE WRITES count={} ns_each exit={} access={} settle={} transfer={} copies={} released={} call={} rest={}\n",
             writes.count,
             each(writes.exit),
             each(writes.access),
             each(writes.settle),
+            each(writes.transfer),
+            each(writes.copies),
+            lock_nanos(writes.released) / u128::from(writes.count),
             each(writes.call),
             each(writes.exit.saturating_sub(parts)),
         ));
@@ -494,6 +686,67 @@ fn transfer_times_report<H: Host>(machine: &Machine<H, parallel::Board>, tsc_hz:
         ));
     }
     output::arguments(format_args!("{line}\n"));
+}
+
+/// `DEVICE WRITE PARTS calls/entry_us/model_us/service_us/longest_us`:
+/// since the last beat, the board's scalar device writes by register page
+/// (`stela_soc::machine::WRITE_PARTS`), the most costly first: the model's
+/// own work under the devices' lock, apart from the lock, the transfer and
+/// the release a write's exit also holds.
+fn write_times_report<H: Host>(machine: &Machine<H, parallel::Board>, tsc_hz: u64) {
+    let times = machine.devices.with(|devices| devices.take_write_times());
+    let mut pages: Vec<_> = times
+        .pages
+        .iter()
+        .map(|page| (Some(page.page), *page))
+        .chain(core::iter::once((None, times.other)))
+        .filter(|(_, page)| page.calls != 0)
+        .collect();
+    if pages.is_empty() {
+        return;
+    }
+    pages.sort_unstable_by_key(|(_, page)| core::cmp::Reverse(page.parts.iter().sum::<u64>()));
+    let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
+    let mut line = String::from("DEVICE WRITE PARTS calls/entry_us/model_us/service_us/longest_us");
+    for (address, page) in &pages {
+        let name = match address {
+            Some(address) => {
+                let device = machine
+                    .devices
+                    .with(|devices| stela_engine::machine::Devices::device_name(devices, *address))
+                    .unwrap_or("unmapped");
+                format!("{device}@{address:#x}")
+            }
+            None => String::from("other"),
+        };
+        line.push_str(&format!(
+            " {name}={}/{}/{}/{}/{}",
+            page.calls,
+            micros(page.parts[0]),
+            micros(page.parts[1]),
+            micros(page.parts[2]),
+            micros(page.longest)
+        ));
+    }
+    output::arguments(format_args!("{line}\n"));
+}
+
+/// `DEVICE AIC rises/pins_raised/claimed/empty`: since the last beat, how
+/// often the AIC's IRQ output rose, the CPU pins those rises raised, and
+/// the event reads that claimed an IRQ or found none
+/// (`stela_soc::aic::AicCounts`): pins per rise is the fan-out, and the
+/// empty reads mostly the CPUs that lost the claim.
+fn aic_counts_report<H: Host>(machine: &Machine<H, parallel::Board>) {
+    let Some(counts) = machine.devices.with(|devices| devices.take_aic_counts()) else {
+        return;
+    };
+    if counts == stela_soc::aic::AicCounts::default() {
+        return;
+    }
+    output::arguments(format_args!(
+        "DEVICE AIC rises={} pins_raised={} claimed={} empty={}\n",
+        counts.rises, counts.pins_raised, counts.claimed, counts.empty
+    ));
 }
 
 /// Completed intervals of this owned home machine only. Other PEs' state
@@ -1295,8 +1548,10 @@ impl Heartbeat {
             let mut shares =
                 String::from("PES TIME idle%/spin%/sync%/waits/compiled/shared/halt%/short");
             // Per PE: the interval's share compiling, reading and hashing
-            // fetch pages, finding shared blocks and installing blocks.
-            let mut fetches = String::from("PES FETCH compile%/page%/shared%/install%");
+            // fetch pages, finding shared blocks, installing blocks, walking
+            // fetch translations and refilling dropped or remade pages.
+            let mut fetches =
+                String::from("PES FETCH compile%/page%/shared%/install%/walk%/refill%");
             // Per PE: the blocks it holds, its block table's slots, the
             // pages its index finds blocks in, and the code arena parts it
             // released for heap pressure since the last beat; on a shared
@@ -1359,6 +1614,7 @@ impl Heartbeat {
             let mut itlb_sources = String::from(concat!(
                 "PES ITLBSRC fills_lower/fills_upper/cold_seen/drop_asid/drop_every",
                 "/all_local/all_received/all_forgot/all_kept/made/mail_merged/refilled",
+                "/drop_upper/drop_no_asid/drop_global",
             ));
             // Per PE: its installs at EL0 and then above EL0 by where the
             // block came from: compiled in a page the store keys (offered
@@ -1370,9 +1626,13 @@ impl Heartbeat {
                 "PES STORE user_compiled/user_unstorable/user_pack/user_shared/user_rebased",
                 "/kernel_compiled/kernel_unstorable/kernel_pack/kernel_shared/kernel_rebased",
             ));
-            let mut stamped = String::from(
-                "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed/promoted",
-            );
+            // Per PE: stamped tail hits and misses by cause, stamps written,
+            // changed cells, table probe transfers (jump cache misses), stamped
+            // tails made, then every probe transfer (jump cache and table).
+            let mut stamped = String::from(concat!(
+                "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed",
+                "/filled/promoted/probe_hits",
+            ));
             let mut stamped_in_use = 0;
             let mut predicted = 0;
             let mut pac_fills = 0;
@@ -1417,9 +1677,12 @@ impl Heartbeat {
             // EL0 code (idle paths, wake-ups with nothing for user code,
             // kernel threads), as shares of the interval; then its WFIs and
             // those that completed at once, its WFEs that reached the engine
-            // and those that completed at once, and its interrupts.
+            // and those that completed at once, and its interrupts; then the
+            // WFEs native code completed after spinning for the event, the
+            // spins that missed, the WFEs an exclusive monitor kept from
+            // spinning and the time spins took.
             let mut levels = String::from(
-                "PES LEVELS user%/kernel%/guarded%/irq%/before_wfi% wfi/wfi_now/wfe/wfe_now/interrupts",
+                "PES LEVELS user%/kernel%/guarded%/irq%/before_wfi% wfi/wfi_now/wfe/wfe_now/interrupts/wfe_spun/spin_miss/wfe_held/spin_ns",
             );
             let mut totals = parallel::Counts::default();
             for (pe, (now, before)) in per_pe.iter().zip(&mut self.pe_counts).enumerate() {
@@ -1440,11 +1703,13 @@ impl Heartbeat {
                     now.short_waits.saturating_sub(before.short_waits),
                 ));
                 fetches.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}",
                     percent(now.compile_ticks.saturating_sub(before.compile_ticks)),
                     percent(now.page_ticks.saturating_sub(before.page_ticks)),
                     percent(now.shared_ticks.saturating_sub(before.shared_ticks)),
                     percent(now.install_ticks.saturating_sub(before.install_ticks)),
+                    percent(now.walk_ticks.saturating_sub(before.walk_ticks)),
+                    percent(now.refill_ticks.saturating_sub(before.refill_ticks)),
                 ));
                 code.push_str(&format!(
                     " {pe}:{}/{}/{}/{}",
@@ -1526,6 +1791,10 @@ impl Heartbeat {
                     &now.stamped[..promoted],
                     &before.stamped[..promoted],
                 );
+                stamped.push_str(&format!(
+                    "/{}",
+                    now.stamped[promoted + 2].saturating_sub(before.stamped[promoted + 2])
+                ));
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
                 pac_fills += now.pac_fills.saturating_sub(before.pac_fills);
@@ -1562,7 +1831,7 @@ impl Heartbeat {
                 }
                 let level = now.levels.since(&before.levels);
                 levels.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                     tsc_percent(level.ticks[step_timing::Level::User as usize]),
                     tsc_percent(level.ticks[step_timing::Level::Kernel as usize]),
                     tsc_percent(level.ticks[step_timing::Level::Guarded as usize]),
@@ -1573,6 +1842,11 @@ impl Heartbeat {
                     level.wfe,
                     level.wfe_at_once,
                     level.interrupts,
+                    level.wfe_spun,
+                    level.wfe_spin_missed,
+                    level.wfe_held,
+                    u128::from(level.wfe_spin_counts) * 1_000_000_000
+                        / u128::from(host::COUNTER_HZ),
                 ));
                 for (total, (now, before)) in
                     exits.iter_mut().zip(now.exits.iter().zip(before.exits))
@@ -1636,9 +1910,30 @@ impl Heartbeat {
                         / u128::from(host::COUNTER_HZ),
                 ));
             }
+            // By call since the last beat: the releases that did the host's
+            // work (a staged disk's step) on the calling core and its
+            // microseconds there, those that handed it to a sleeping PE,
+            // those that handed it a host disk's completion signal, and those
+            // that took that signal's step themselves with no PE asleep.
+            let mut releases =
+                String::from("DEVICE RELEASES stepped/us/handed/signals/signal_steps");
+            for (index, call) in Call::ALL.iter().enumerate() {
+                let (now, then) = (&times[index], &self.lock_times[index]);
+                releases.push_str(&format!(
+                    " {}={}/{}/{}/{}/{}",
+                    call.name(),
+                    now.stepped.wrapping_sub(then.stepped),
+                    u128::from(now.step.wrapping_sub(then.step)) * 1_000_000
+                        / u128::from(host::COUNTER_HZ),
+                    now.handed.wrapping_sub(then.handed),
+                    now.signals.wrapping_sub(then.signals),
+                    now.signal_steps.wrapping_sub(then.signal_steps),
+                ));
+            }
             self.lock_times = times;
             output::arguments(format_args!("{locks}\n"));
             output::arguments(format_args!("{wakes}\n"));
+            output::arguments(format_args!("{releases}\n"));
             self.lock_waits = waits;
             output::arguments(format_args!("{shares}\n"));
             output::arguments(format_args!("{fetches}\n"));
@@ -1720,8 +2015,12 @@ impl Heartbeat {
         if machine.step_timing().is_some() {
             let exits = parallel::system_exits(machine);
             system_exits_report(&exits, tsc_hz);
+            barrier_waits_report(&exits.barriers, tsc_hz);
+            regime_syncs_report(&exits.regimes, tsc_hz);
             device_exits_report(machine, &exits.devices, tsc_hz);
             transfer_times_report(machine, tsc_hz);
+            aic_counts_report(machine);
+            write_times_report(machine, tsc_hz);
             hot_blocks_report(
                 machine,
                 &mut self.dynamic,

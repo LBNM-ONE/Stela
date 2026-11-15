@@ -13,15 +13,25 @@ struct ReadDestination<'a> {
 }
 
 impl Controller {
-    /// Before the CPU takes back memory a completion released: an owned
-    /// controller's completion counts only while its registers answer
-    /// without a fatal status, which a removed hierarchy or a failed engine
-    /// would not.
+    /// Before the CPU takes back memory an admin command's data completion
+    /// released: an owned controller's completion counts only while its
+    /// registers answer without a fatal status, which a removed hierarchy or
+    /// a failed engine would not.
     pub(super) fn trust_completion(&self) -> Result<(), BlockError> {
         match self.owned {
             Some(_) => self.check_fatal(),
             None => Ok(()),
         }
+    }
+
+    /// The error for an I/O completion that names no command it may, or
+    /// whose entry changed under its read: the controller's own, when its
+    /// status says it is removed or fatally failed, otherwise a corrupt
+    /// queue.
+    fn invalid_completion(&self) -> BlockError {
+        parts::timed(parts::Part::Status, || self.check_fatal())
+            .err()
+            .unwrap_or(BlockError::Device { status: 0xffff })
     }
 
     /// Page `index` of those tag `tag` holds.
@@ -57,6 +67,21 @@ impl Controller {
         }
     }
 
+    /// The first `bytes` of tag `tag`'s data pages, copied once into a new
+    /// buffer, which is not filled first.
+    fn gathered(&self, tag: usize, bytes: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(bytes);
+        for &page in &self.held[tag] {
+            let left = bytes - data.len();
+            if left == 0 {
+                break;
+            }
+            let page = self.pool.pages[usize::from(page)].bytes();
+            data.extend_from_slice(&page[..left.min(page.len())]);
+        }
+        data
+    }
+
     /// The pool's pages back from tag `tag`, whose command ended for good.
     pub(super) fn release(&mut self, tag: usize) {
         let mut pages = core::mem::take(&mut self.held[tag]);
@@ -85,8 +110,20 @@ impl Controller {
     pub(super) fn publish(
         &mut self,
         io: bool,
+        command: [u32; 16],
+        data: Data,
+    ) -> Result<u16, BlockError> {
+        self.publish_with(io, command, data, true)
+    }
+
+    /// [`Self::publish`], an I/O command's doorbell left owed unless `ring`
+    /// ([`Self::ring_submissions`]).
+    fn publish_with(
+        &mut self,
+        io: bool,
         mut command: [u32; 16],
         data: Data,
+        ring: bool,
     ) -> Result<u16, BlockError> {
         let stride = self.doorbell_stride;
         loop {
@@ -112,12 +149,44 @@ impl Controller {
         queue.submissions.write_submission(base, command);
         queue.submissions.give()?;
         queue.tail = queue.next(queue.tail);
-        fence(Ordering::SeqCst);
-        registers.write32(
-            DOORBELLS + 2 * usize::from(queue.id) * stride,
-            u32::from(queue.tail),
-        )?;
+        if !io {
+            fence(Ordering::SeqCst);
+            registers.write32(
+                DOORBELLS + 2 * usize::from(queue.id) * stride,
+                u32::from(queue.tail),
+            )?;
+            return Ok(id);
+        }
+        self.owed = true;
+        if ring {
+            self.ring_submissions()?;
+        }
         Ok(id)
+    }
+
+    /// Ring the I/O submission doorbell at the queue's tail if a command
+    /// published since it last rang, telling the controller of every one.
+    pub(super) fn ring_submissions(&mut self) -> Result<(), BlockError> {
+        if !self.owed {
+            return Ok(());
+        }
+        self.owed = false;
+        // Every entry written before the tail the controller reads.
+        fence(Ordering::SeqCst);
+        let doorbell = DOORBELLS + 2 * usize::from(self.io.id) * self.doorbell_stride;
+        let tail = u32::from(self.io.tail);
+        parts::timed(parts::Part::Doorbell, || {
+            self.registers.write32(doorbell, tail)
+        })
+    }
+
+    /// Ring an owed I/O submission doorbell; a failure fails the commands
+    /// whose doorbell it was, and the controller.
+    pub(super) fn commit(&mut self) {
+        if let Err(error) = self.ring_submissions() {
+            self.poison(error);
+            self.fail_all();
+        }
     }
 
     /// The completion at queue `io`'s head, once the controller has posted
@@ -308,6 +377,17 @@ impl Controller {
         block: usize,
         command: Command,
     ) -> Result<u32, BlockError> {
+        self.start_with(namespace, block, command, true)
+    }
+
+    /// [`Self::start`], its doorbell left owed unless `ring`.
+    pub(super) fn start_with(
+        &mut self,
+        namespace: u32,
+        block: usize,
+        command: Command,
+        ring: bool,
+    ) -> Result<u32, BlockError> {
         self.ready()?;
         let tag = self
             .tags
@@ -320,7 +400,7 @@ impl Controller {
             .pool
             .take(command_pages(&command))
             .ok_or(BlockError::Protocol("every NVMe bounce page is in use"))?;
-        self.submit(tag, namespace, block, command, 0);
+        self.submit_with(tag, namespace, block, command, 0, ring);
         Ok(tag as u32)
     }
 
@@ -338,7 +418,7 @@ impl Controller {
         self.settle()?;
         match self.registers.read32(STATUS)? {
             REMOVED => return Err(self.poison(removed())),
-            status if status & FATAL != 0 => {
+            status if self.fails(status) => {
                 self.reset();
                 self.settle()?;
             }
@@ -363,12 +443,25 @@ impl Controller {
         command: Command,
         retries: u8,
     ) {
+        self.submit_with(tag, namespace, block, command, retries, true);
+    }
+
+    /// [`Self::submit`], its doorbell left owed unless `ring`.
+    fn submit_with(
+        &mut self,
+        tag: usize,
+        namespace: u32,
+        block: usize,
+        command: Command,
+        retries: u8,
+        ring: bool,
+    ) {
         let slot = self.io.tail;
         // A command whose deadline cannot be kept is not sent; the deadline
         // runs from its doorbell.
         let published = self.deadline(self.command_timeout_us).and_then(|_| {
             let words = self.io_command(tag, namespace, block, &command)?;
-            let id = self.publish(true, words, Data::Tag(tag))?;
+            let id = self.publish_with(true, words, Data::Tag(tag), ring)?;
             Ok((id, self.deadline(self.command_timeout_us)?))
         });
         self.tags[tag] = match published {
@@ -394,7 +487,16 @@ impl Controller {
         self.advance_into(None);
     }
 
-    fn advance_into(&mut self, mut destination: Option<ReadDestination<'_>>) {
+    fn advance_into(&mut self, destination: Option<ReadDestination<'_>>) {
+        parts::timed(parts::Part::Advance, || self.advance_timed(destination));
+    }
+
+    fn advance_timed(&mut self, mut destination: Option<ReadDestination<'_>>) {
+        // A command whose doorbell a caller left owed must not wait for its
+        // deadline: a look at the queue rings it.
+        if self.recovery.is_none() {
+            self.commit();
+        }
         if self.fault.is_some() {
             self.fail_all();
             return;
@@ -425,25 +527,30 @@ impl Controller {
                 break;
             }
             let (head, phase, consumed) = (self.io.head, self.io.phase, self.io.consumed);
+            // A valid completion is trusted as Linux's nvme_handle_cqe trusts
+            // it, with no register read: the controller's status is read
+            // where Linux reads it, at a command's timeout, a reset, an admin
+            // command's data, and a completion that looks invalid.
             match self.posted(true) {
                 Ok(None) => break,
                 Ok(Some((id, _, status, sq_head))) => {
-                    if !reaped && let Err(error) = self.trust_completion() {
-                        (self.io.head, self.io.phase, self.io.consumed) = (head, phase, consumed);
-                        self.poison(error);
-                        self.fail_all();
-                        return;
-                    }
                     if !self.complete(id, status, sq_head, &mut destination) {
                         // A completion for no running command, or for one the
                         // controller had not fetched: the queue is corrupt.
                         // It stays unretired.
                         (self.io.head, self.io.phase, self.io.consumed) = (head, phase, consumed);
-                        self.poison(BlockError::Device { status: 0xffff });
+                        let error = self.invalid_completion();
+                        self.poison(error);
                         self.fail_all();
                         return;
                     }
                     reaped = true;
+                }
+                Err(BlockError::Device { status: 0xffff }) => {
+                    let error = self.invalid_completion();
+                    self.poison(error);
+                    self.fail_all();
+                    return;
                 }
                 Err(error) => {
                     self.poison(error);
@@ -452,7 +559,8 @@ impl Controller {
                 }
             }
         }
-        if reaped && let Err(error) = self.ring_completion(true) {
+        if reaped && let Err(error) = parts::timed(parts::Part::Ring, || self.ring_completion(true))
+        {
             self.poison(error);
             self.fail_all();
             return;
@@ -590,9 +698,7 @@ impl Controller {
                     self.gather(tag, read.bytes);
                     Tag::Done(Ok(None))
                 } else {
-                    let mut data = alloc::vec![0; bytes];
-                    self.gather(tag, &mut data);
-                    Tag::Done(Ok(Some(data)))
+                    Tag::Done(Ok(Some(self.gathered(tag, bytes))))
                 }
             }
             (Ok(()), 0, _) => Tag::Done(Ok(None)),

@@ -176,6 +176,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// An architectural cache epoch must never wrap back to an old permission.
     pub(super) fn advance_translation_generation(&mut self) {
         self.mirrors.close_code_page();
+        self.forget_device_reads();
         self.mirrors.transitions.contexts_moved();
         self.translation_generation = self
             .translation_generation
@@ -186,6 +187,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// What TTBR0 or its ASID selects may have changed.
     fn advance_table_generation(&mut self) {
         self.mirrors.close_code_page();
+        self.forget_device_reads();
         self.mirrors.transitions.contexts_moved();
         self.table_generation = self
             .table_generation
@@ -428,6 +430,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 };
                 statistics.itlb_drops[1] += 1;
                 statistics.itlb_sources[source as usize] += 1;
+                if source == ItlbSource::DropEvery {
+                    let every = match (half, scoped) {
+                        (1, _) => ItlbSource::DropUpper,
+                        (_, None) => ItlbSource::DropNoAsid,
+                        _ => ItlbSource::DropGlobal,
+                    };
+                    statistics.itlb_sources[every as usize] += 1;
+                }
                 super::compilation::note_itlb_ghost(ghosts, entry, ItlbMiss::Forgotten);
                 if spaces.live(entry.key).is_some() {
                     Self::keep_dropped(
@@ -462,7 +472,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.mirrors.close(SPRR_PERM_MIRROR);
         self.advance_translation_generation();
         self.statistics.translation_changes += 1;
-        self.sync_host_regime();
+        self.sync_host_regime(step_timing::SyncSource::Translation);
     }
 
     /// Anything about translation may have changed: every lookup context
@@ -493,6 +503,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         asid: Option<u16>,
     ) {
         self.mirrors.close_code_page();
+        self.forget_device_reads();
         match everywhere {
             mmu::tlbi::Everywhere::Addresses(addresses)
             | mmu::tlbi::Everywhere::AsidAddresses(addresses, _) => {
@@ -542,7 +553,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn table_base_changed(&mut self) {
         self.advance_table_generation();
         self.statistics.table_base_changes += 1;
-        self.sync_host_regime();
+        self.sync_host_regime(step_timing::SyncSource::TableBase);
     }
 
     /// Forget the blocks compiled from the page holding `physical`, which an

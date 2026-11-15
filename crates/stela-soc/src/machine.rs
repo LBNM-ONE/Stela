@@ -13,7 +13,9 @@ pub mod t6000_pmgr;
 mod timekeeping;
 mod transfer_times;
 mod usb;
-pub use transfer_times::{PartTime, TRANSFER_PARTS};
+pub use transfer_times::{
+    PageWrites, PartTime, TRANSFER_PARTS, WRITE_PAGES, WRITE_PARTS, WriteTimes,
+};
 
 use crate::Result;
 pub use crate::pmu::{RtcAnchor, RtcEpoch};
@@ -709,6 +711,22 @@ impl AppleDevices {
         self.transfer_times.take()
     }
 
+    /// The scalar device writes timed since the last call, by register
+    /// page and by [`WRITE_PARTS`], while transfers are timed
+    /// ([`Self::time_transfers`]).
+    pub fn take_write_times(&mut self) -> WriteTimes {
+        self.transfer_times.take_writes()
+    }
+
+    /// The AICv2 or AICv3's delivery counts since the last call
+    /// ([`crate::aic::AicCounts`]); `None` for an AICv1 or none.
+    pub fn take_aic_counts(&mut self) -> Option<crate::aic::AicCounts> {
+        let Some(Controller::V2(id)) = self.aic else {
+            return None;
+        };
+        self.bus.device_mut::<Aic2>(id).map(Aic2::take_counts)
+    }
+
     /// The NOR sectors the guest changed since the last call, as (offset,
     /// bytes), for the host to persist.
     pub fn nor_dirty(&mut self) -> Vec<(usize, Vec<u8>)> {
@@ -1279,6 +1297,19 @@ impl Devices for AppleDevices {
 
     fn device_name(&self, physical: u64) -> Option<&'static str> {
         self.bus.name_at(physical)
+    }
+
+    fn register_name(&self, physical: u64) -> Option<&'static str> {
+        self.bus.register_name_at(physical)
+    }
+
+    fn plain_epoch(
+        &self,
+        physical: u64,
+        bytes: u8,
+    ) -> Option<(alloc::sync::Arc<core::sync::atomic::AtomicU64>, u64)> {
+        self.bus
+            .plain_epoch(physical, Width::from_bytes(u64::from(bytes))?)
     }
 
     fn memory_lock(&self) -> stela_engine::machine::mmu::MemoryLocks {

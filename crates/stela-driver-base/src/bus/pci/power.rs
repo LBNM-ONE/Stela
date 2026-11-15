@@ -17,7 +17,7 @@ const D3_DELAY: u64 = 10_000;
 const READY_TIMEOUT: u64 = 60_000_000;
 
 mod error;
-pub use error::Error;
+pub use error::{Error, START_BUDGET};
 
 #[derive(Clone, Copy)]
 enum Phase {
@@ -57,6 +57,9 @@ pub enum WakeState {
 /// timer must remain usable under the original platform's power/context grant.
 pub unsafe trait Timer {
     fn check(&self) -> Result<(), Error>;
+    /// Caller-tracked, so a wait that ends a device's start budget names the
+    /// driver's own step (`budget::Bounded`).
+    #[track_caller]
     fn wait_us(&self, microseconds: u64) -> Result<(), Error>;
     /// Start a nonblocking minimum interval, when the same source can retain
     /// and revalidate it. A returned interval has the same physical guarantee
@@ -77,6 +80,7 @@ unsafe impl<T: Timer + ?Sized> Timer for alloc::rc::Rc<T> {
     fn check(&self) -> Result<(), Error> {
         (**self).check()
     }
+    #[track_caller]
     fn wait_us(&self, microseconds: u64) -> Result<(), Error> {
         (**self).wait_us(microseconds)
     }

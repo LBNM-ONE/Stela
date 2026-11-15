@@ -34,6 +34,33 @@ pub fn selected(tool: &str) -> bool {
     names.iter().any(|name| env::var_os(name).is_some())
 }
 
+/// What freestanding C for the mount compiles with whatever the host's Clang
+/// defaults to: distributions turn on hardening the mount's runtime has no
+/// support for (Arch's and Nix's stack protector calls `__stack_chk_fail`;
+/// others add CET branch markers or `_FORTIFY_SOURCE`), and their
+/// configuration files can add any flag, stack clash probes among them.
+/// Clang offers no stack clash probes for the mount's COFF target, and
+/// rejects the flag that turns them off there.
+pub const UNHARDENED: [&str; 4] = [
+    "--no-default-config",
+    "-fno-stack-protector",
+    "-fcf-protection=none",
+    "-U_FORTIFY_SOURCE",
+];
+
+/// The Clang to compile with when the caller chose no compiler: `CLANG`,
+/// which `cargo xtask` sets to the one it chose, else `clang` on PATH. The
+/// build reruns when either changes, so objects never mix compilers.
+pub fn clang() -> std::ffi::OsString {
+    println!("cargo:rerun-if-env-changed=CLANG");
+    env::var_os("CLANG")
+        .filter(|clang| !clang.is_empty())
+        .unwrap_or_else(|| {
+            println!("cargo:rerun-if-env-changed=PATH");
+            "clang".into()
+        })
+}
+
 /// Apple's ar produces a BSD archive even for COFF inputs; the active Rust
 /// toolchain's LLVM archiver does not.
 pub fn rust_archiver() -> PathBuf {

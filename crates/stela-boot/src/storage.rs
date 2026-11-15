@@ -73,38 +73,28 @@ pub fn captures(wifi: stela_drivers::net::wifi::intel::platform::Observations) -
     }
 }
 
-/// The host subsystem a probe failure belongs to, where its kind names one.
-fn subsystem(error: &stela_drivers::probe::Error) -> &'static str {
-    use stela_drivers::probe::Error;
-    match error {
-        Error::Enumeration(_) => "PCI",
-        Error::Vmd(_) => "storage",
-        Error::Realtek(_) => "card reader",
-        Error::Tg3(_) | Error::Aqtion(_) | Error::Pch(_) => "network",
-        Error::IntelWifi(_) | Error::MediatekWifi(_) | Error::RealtekWifi(_) => "Wi-Fi",
-        Error::IntelBluetooth(_) | Error::Bcm4377(_) => "Bluetooth",
-        Error::Sfh(_) | Error::SfhCold(_) | Error::Ish(_) | Error::IshCold(_) => "sensors",
-        Error::Ehci(_) => "USB",
-        Error::HdaPci(_) | Error::Hda(_) | Error::HdaNative(_) => "audio",
-        Error::Usb4(_) => "USB4",
-        _ => "device",
-    }
-}
-
 /// Whether a function whose probe failed this way could hold a disk: a
 /// storage, USB or unnamed device's failure.
-pub(crate) fn may_hold_disks(error: &stela_drivers::probe::Error) -> bool {
+pub(crate) fn may_hold_disks(
+    devices: &stela_drivers::probe::Devices,
+    address: pci::Address,
+    error: &stela_drivers::probe::Error,
+) -> bool {
     matches!(
-        subsystem(error),
-        "storage" | "card reader" | "USB" | "device"
+        devices.subsystem(address, error),
+        "storage" | "USB" | "device"
     )
 }
 
 /// Report a PCI function probe could not bring up, by its subsystem.
-pub(crate) fn report_failure(address: pci::Address, error: &stela_drivers::probe::Error) {
+pub(crate) fn report_failure(
+    devices: &stela_drivers::probe::Devices,
+    address: pci::Address,
+    error: &stela_drivers::probe::Error,
+) {
     output::arguments(format_args!(
         "HOST DEVICE FAILED pci={address} ({}) error={error}\n",
-        subsystem(error)
+        devices.subsystem(address, error)
     ));
 }
 
@@ -281,6 +271,64 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
             functions.len() - CENSUS_LINES
         ));
     }
+    let nvidia: Vec<u16> = functions
+        .iter()
+        .map(crate::pci_io::FunctionObservation::identity)
+        .filter(|identity| identity.vendor == NVIDIA && identity.class[0] == 0x03)
+        .map(|identity| identity.device)
+        .collect();
+    let notice = gpu_notice(&nvidia);
+    if nvidia.is_empty() {
+        output::arguments(format_args!(
+            "UNSUPPORTED host GPU: no NVIDIA display controller among {} PCI functions\n",
+            functions.len()
+        ));
+    } else if notice != 0 {
+        output::arguments(format_args!(
+            "UNSUPPORTED host GPU: no NVIDIA display controller here is of a chip Stela drives: {nvidia:04x?}\n"
+        ));
+    }
+    GPU_NOTICE.store(notice, core::sync::atomic::Ordering::Relaxed);
+}
+
+const NVIDIA: u16 = 0x10de;
+/// Which notice the census chose: 0 none, 1 no NVIDIA card, 2 none Stela drives.
+static GPU_NOTICE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Said once before an install or a start on a PC with no NVIDIA graphics
+/// card: the install itself draws through no GPU and would finish, and the
+/// installed macOS then could not start.
+pub const NO_NVIDIA_GPU_NOTICE: &str = "No NVIDIA graphics card found: macOS can be installed, \
+    but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 or 50 series card.";
+
+/// Said in the same place on a PC whose NVIDIA cards are all of chips Stela
+/// has no driver for, older or newer than the series it names.
+pub const NO_DRIVEN_NVIDIA_GPU_NOTICE: &str = "The NVIDIA graphics card here is not one Stela \
+    drives: macOS can be installed, but it starts only with a GeForce GTX 16 or RTX 20, 30, 40 \
+    or 50 series card.";
+
+/// The notice ([`GPU_NOTICE`]) for a PC whose NVIDIA display controllers have
+/// these PCI device IDs: none when one of them is of a chip Stela's catalog
+/// names.
+fn gpu_notice(nvidia: &[u16]) -> u8 {
+    use stela_loader::host_firmware::recipes::nvidia_chip;
+    if nvidia.is_empty() {
+        1
+    } else if nvidia.iter().all(|device| nvidia_chip(*device).is_none()) {
+        2
+    } else {
+        0
+    }
+}
+
+/// What to say before an install or a start when the census ([`discover`])
+/// found no NVIDIA display controller Stela drives.
+pub fn gpu_notice_found() -> Option<&'static str> {
+    match GPU_NOTICE.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        1 => Some(NO_NVIDIA_GPU_NOTICE),
+        _ => Some(NO_DRIVEN_NVIDIA_GPU_NOTICE),
+    }
 }
 
 /// What the storage drivers need after ExitBootServices: the ECAM windows,
@@ -447,7 +495,7 @@ impl Prepared {
             output::arguments(format_args!("STORAGE UNMAPPED ecam={window:x?}\n"));
         }
         for (address, error) in &devices.failures {
-            report_failure(*address, error);
+            report_failure(&devices, *address, error);
         }
         for (location, error) in &devices.platform_failures {
             output::arguments(format_args!("PLATFORM FAILED {location}: {error}\n"));
@@ -464,6 +512,11 @@ impl Prepared {
         ));
         for (location, error) in &devices.usb_vendor_failures {
             output::arguments(format_args!("USB VENDOR FAILED {location}: {error}\n"));
+        }
+        for (location, error) in &devices.usb_vendor_warnings {
+            output::arguments(format_args!(
+                "USB VENDOR WARNING {location}: {error}; started without its firmware patch\n"
+            ));
         }
         for device in &devices.disks {
             let id = device.identity();

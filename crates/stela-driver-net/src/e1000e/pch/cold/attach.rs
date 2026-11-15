@@ -96,8 +96,8 @@ pub enum AttachError {
 impl core::fmt::Display for AttachError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Device(error) => write!(f, "e1000e PCH: {error}"),
-            Self::Controller(error) => write!(f, "e1000e PCH: {error}"),
+            Self::Device(error) => error.fmt(f),
+            Self::Controller(error) => error.fmt(f),
         }
     }
 }
@@ -291,6 +291,18 @@ impl Pch {
     /// Stop both queues and hand the PHY back, as `e1000e_down` does.
     pub fn stop(&mut self) -> Result<(), Error> {
         self.link.shutdown()
+    }
+
+    /// Whether the NVM's checksum valid bit was clear, which Linux repairs
+    /// in flash and Stela leaves unwritten.
+    pub fn nvm_repair_left_out(&self) -> bool {
+        self.link.nvm_repair_left_out()
+    }
+
+    /// Whether the PHY did not leave ULP when asked and the start went on,
+    /// as Linux goes on after "Failed to disable ULP".
+    pub fn ulp_exit_failed(&self) -> bool {
+        self.link.ulp_exit_failed()
     }
 }
 

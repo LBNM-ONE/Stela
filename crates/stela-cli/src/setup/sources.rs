@@ -3,7 +3,7 @@
 //! command says up front what it reads and downloads.
 //!
 //! A command needs the image's boot files ([`Need::BootFiles`], the
-//! recovery members `restore::payload::trim` copies) to prepare boot
+//! members preparing a bundle reads, `boot::restore_inputs_in`) to prepare boot
 //! bundles or name a remote install medium, and the whole image
 //! ([`Need::WholeImage`]) only to write a full install medium
 //! ([`need`]). [`locate`] tries, in order:
@@ -16,7 +16,7 @@
 //! 3. for boot files, the members a setup that streams the image keeps on
 //!    its USB (`inputs`), or the USB's own full install medium of the
 //!    build, which holds the image byte for byte (`medium::image`);
-//! 4. Apple's servers: the boot files alone by byte ranges (about 2.2 GB of
+//! 4. Apple's servers: the boot files alone by byte ranges (about 0.45 GB of
 //!    macOS 27.2's 27 GB), or the whole image streamed onto the USB's
 //!    pieces (`medium::download`), its size read first.
 use super::{Environment, InstallImage, host::bytes_text, medium, record::Record};
@@ -33,8 +33,19 @@ pub(super) enum Need {
     /// The boot files: enough to prepare boot bundles and name the image
     /// on Apple's servers.
     BootFiles,
-    /// The whole image, which a full install medium holds.
+    /// The whole image, which a full install medium holds, and its boot
+    /// files, to prepare boot bundles.
     WholeImage,
+    /// The whole image for a full install medium, and no boot bundle: its
+    /// boot files are not read.
+    Pieces,
+}
+
+impl Need {
+    /// Whether it writes the whole image as a full install medium.
+    pub(super) fn whole(self) -> bool {
+        matches!(self, Self::WholeImage | Self::Pieces)
+    }
 }
 
 /// Whether `record` installs from a medium that streams the image from
@@ -55,7 +66,10 @@ pub(super) fn medium_ready(record: &Record, build: &str) -> bool {
 /// install medium of `build` right needs from the image.
 pub(super) fn need(record: &Record, build: &str, bundles: bool) -> Option<Need> {
     match medium_ready(record, build) {
-        false if !wants_remote(record) => Some(Need::WholeImage),
+        false if !wants_remote(record) => Some(match bundles {
+            true => Need::WholeImage,
+            false => Need::Pieces,
+        }),
         false => Some(Need::BootFiles),
         true => bundles.then_some(Need::BootFiles),
     }
@@ -92,6 +106,14 @@ impl Source {
             Self::Kept(_) | Self::Medium(_) => 0,
             Self::Remote { whole, .. } => *whole,
         })
+    }
+}
+
+/// The bytes `source` downloads from Apple: none from a file.
+pub(super) fn download_bytes(source: &Source) -> u64 {
+    match source {
+        Source::Remote { boot, pieces, .. } => boot + pieces,
+        _ => 0,
     }
 }
 
@@ -155,7 +177,7 @@ impl Lookup<'_> {
     fn what(&self) -> &'static str {
         match self.need {
             Need::BootFiles => "its boot files",
-            Need::WholeImage => "the whole image",
+            Need::WholeImage | Need::Pieces => "the whole image",
         }
     }
 }
@@ -200,16 +222,20 @@ pub(super) fn locate(environment: &Environment<'_>, lookup: &Lookup<'_>) -> Resu
     };
     match (environment.image_size)(lookup.build, lookup.model) {
         Ok((boot, whole)) => Ok(Source::Remote {
-            boot,
+            boot: match lookup.need {
+                Need::Pieces => 0,
+                Need::BootFiles | Need::WholeImage => boot,
+            },
             // A damaged copy of the build keeps its intact pieces.
             pieces: match lookup.need {
                 Need::BootFiles => 0,
-                Need::WholeImage => match lookup.medium {
+                Need::WholeImage | Need::Pieces => match lookup.medium {
                     Some(m) if m.build == lookup.build => medium::missing_bytes(
                         &m.volume,
                         lookup.build,
                         whole,
                         environment.piece_bytes,
+                        &m.damaged,
                     ),
                     _ => whole,
                 },
@@ -224,7 +250,7 @@ pub(super) fn locate(environment: &Environment<'_>, lookup: &Lookup<'_>) -> Resu
             what = lookup.what(),
             only = match lookup.need {
                 Need::BootFiles => ", which downloads only its boot files, not the whole image",
-                Need::WholeImage => "",
+                Need::WholeImage | Need::Pieces => "",
             },
         ),
     }
@@ -250,7 +276,7 @@ pub(super) fn describe(source: &Source, lookup: &Lookup<'_>) -> String {
             remote_text(source, build),
             match lookup.need {
                 Need::BootFiles => "USB or this ",
-                Need::WholeImage => "",
+                Need::WholeImage | Need::Pieces => "",
             }
         ),
     }
@@ -267,8 +293,16 @@ fn remote_text(source: &Source, build: &str) -> String {
         return String::new();
     };
     let total = bytes_text(boot + pieces);
-    match pieces {
-        0 => format!(
+    match (boot, pieces) {
+        // No boot bundle is prepared: the image's pieces alone.
+        (0, _) if pieces == whole => {
+            format!("{total} from Apple: the whole macOS {build} image straight onto the USB")
+        }
+        (0, _) => format!(
+            "{total} from Apple: the pieces of the macOS {build} image this USB's copy lacks, \
+             straight onto the USB; the pieces it holds are checked and kept"
+        ),
+        (_, 0) => format!(
             "{total} of the macOS {build} image's {} from Apple: its boot files, read by range",
             bytes_text(whole)
         ),
@@ -331,12 +365,20 @@ pub(super) fn obtain(
                 "Reading the boot files of macOS {} from this USB",
                 lookup.build
             );
-            restore::payload::trim(
-                medium::image::open(medium)?,
-                lookup.model,
-                &path,
-                "Reading boot files from the USB",
-            )
+            // The members a download reads, and no more.
+            (|| -> Result<u64> {
+                let mut image = medium::image::open(medium)?;
+                let mut archive =
+                    zip::ZipArchive::new(&mut image as &mut dyn restore::ImageSource)?;
+                let names = (environment.bundle_inputs)(&mut archive, lookup.model)?;
+                restore::copy_inputs(
+                    &mut archive,
+                    &names,
+                    &path,
+                    "Reading boot files from the USB",
+                    None,
+                )
+            })()
             .with_context(|| format!("reading {}", medium.directory().display()))?;
             Ok(Obtained {
                 path,
@@ -355,7 +397,7 @@ pub(super) fn obtain(
                 // Kept, so a later command finds it.
                 Need::BootFiles => (directory, None),
                 // Only its boot files land here, until the USB holds them.
-                Need::WholeImage => {
+                Need::WholeImage | Need::Pieces => {
                     let temporary = temporary_in(&directory)?;
                     (temporary.path().to_path_buf(), Some(temporary))
                 }
@@ -402,6 +444,8 @@ fn cached(directory: &Path, lookup: &Lookup<'_>) -> Option<PathBuf> {
     let (build, model) = (lookup.build, lookup.model);
     let mut candidates = Vec::new();
     if lookup.need == Need::BootFiles {
+        candidates.push(directory.join(super::prepare::inputs_name(build, model)));
+        // A recovery archive an earlier stela downloaded holds them too.
         candidates.push(directory.join(super::prepare::recovery_name(build, model)));
         // Where a first setup keeps its downloads until it finishes.
         candidates.push(directory.join("setup").join("boot.ipsw"));

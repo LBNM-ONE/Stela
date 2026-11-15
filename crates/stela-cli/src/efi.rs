@@ -105,16 +105,70 @@ pub struct Uninstall {
 /// the old file in place; with `fresh`, only when nothing is there yet.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], fresh: bool) -> Result<()> {
     let parent = path.parent().context("a file without a parent directory")?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(bytes)?;
-    file.as_file().sync_all()?;
-    match fresh {
-        true => file.persist_noclobber(path).map_err(|error| error.error)?,
-        false => file.persist(path).map_err(|error| error.error)?,
-    };
+    (|| -> Result<()> {
+        let mut file = tempfile::NamedTempFile::new_in(parent)?;
+        file.write_all(bytes)?;
+        file.as_file().sync_all()?;
+        match fresh {
+            true => persist_new(file, path)?,
+            false => drop(file.persist(path).map_err(|error| error.error)?),
+        };
+        Ok(())
+    })()
+    .with_context(|| format!("cannot write {}", path.display()))?;
     // FAT may refuse to sync a directory; the file itself is already synced.
     let _ = fs::File::open(parent).and_then(|directory| directory.sync_all());
     Ok(())
+}
+
+/// Give the synced temporary `file` the name `path`, never replacing a
+/// `path` that exists ([`rename_new`]); a refused `file` is removed.
+pub(crate) fn persist_new(file: tempfile::NamedTempFile, path: &Path) -> Result<()> {
+    let temporary = file.into_temp_path();
+    rename_new(&temporary, path)?;
+    // It is `path` now: nothing is left to remove.
+    let _ = temporary.keep();
+    Ok(())
+}
+
+/// Give the finished file `from` the name `to`, never replacing a `to` that
+/// exists: by a rename that refuses to replace where the file system has
+/// one, else, as on FAT and exFAT under macOS (which refuse that rename with
+/// ENOTSUP and have no hard links either), by a plain rename once `to` is
+/// checked to be absent. A refused `from` stays where it is.
+pub(crate) fn rename_new(from: &Path, to: &Path) -> Result<()> {
+    rename_new_with(from, to, |from, to| {
+        tempfile::TempPath::try_from_path(from)?
+            .persist_noclobber(to)
+            .map_err(|error| {
+                // Kept for the caller, not removed with the handle.
+                let _ = error.path.keep();
+                error.error
+            })
+    })
+}
+
+fn rename_new_with(
+    from: &Path,
+    to: &Path,
+    no_replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    match no_replace(from, to) {
+        Ok(()) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("{} already exists", to.display())
+        }
+        Err(_) => {}
+    }
+    match fs::symlink_metadata(to) {
+        Ok(_) => bail!("{} already exists", to.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", to.display()));
+        }
+    }
+    fs::rename(from, to)
+        .with_context(|| format!("cannot rename {} to {}", from.display(), to.display()))
 }
 
 /// Whether the partition's boot loader is a `stela.efi`; `None` when it has
@@ -175,7 +229,7 @@ pub fn install(command: &Install) -> Result<serde_json::Value> {
 }
 
 /// Copy the ARM source when given and the options, then the loader, over
-/// whatever loader is there: callers check it first. `stela setup` uses this
+/// whatever loader is there: callers check it first. `stela create` uses this
 /// without a source: install mode runs none.
 pub(crate) fn add_mount(
     esp: &Path,
@@ -246,4 +300,85 @@ pub fn uninstall(esp: &Path, owned: bool) -> Result<serde_json::Value> {
         "files": files,
         "kept_loader": (stela == Some(false)).then(|| esp.join(LOADER)),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What macOS answers for a rename that keeps an existing file on FAT
+    /// and exFAT: ENOTSUP.
+    fn unsupported(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+
+    fn temporary(directory: &Path, bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new_in(directory).unwrap();
+        file.write_all(bytes).unwrap();
+        file
+    }
+
+    #[test]
+    fn a_volume_without_a_keeping_rename_publishes_a_new_file_by_renaming() {
+        let temp = tempfile::tempdir().unwrap();
+        let (part, path) = (temp.path().join("a.part"), temp.path().join("boot.log"));
+        fs::write(&part, b"new").unwrap();
+        rename_new_with(&part, &path, unsupported).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        // Only the published file is left: the part became it.
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_existing_file_is_never_replaced_either_way() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("boot.log");
+        fs::write(&path, b"earlier boots").unwrap();
+        // A refused part stays for its caller, either way.
+        let part = temp.path().join("a.part");
+        fs::write(&part, b"new").unwrap();
+        for result in [
+            rename_new_with(&part, &path, unsupported),
+            rename_new(&part, &path),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("already exists"), "{error}");
+            assert_eq!(fs::read(&part).unwrap(), b"new");
+        }
+        fs::remove_file(&part).unwrap();
+        let error = persist_new(temporary(temp.path(), b"new"), &path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), b"earlier boots");
+        // The refused temporary files are removed.
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    /// The real rename, on whatever file system holds the temporary
+    /// directory (`TMPDIR` on a FAT or exFAT volume takes the fallback).
+    #[test]
+    fn a_new_file_is_published_on_the_temporary_directory_s_file_system() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("boot.log");
+        persist_new(temporary(temp.path(), b"new"), &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        let image = temp.path().join("fdr.img4");
+        write_atomic(&image, b"image", true).unwrap();
+        assert_eq!(fs::read(&image).unwrap(), b"image");
+        assert!(write_atomic(&image, b"other", true).is_err());
+        assert_eq!(fs::read(&image).unwrap(), b"image");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn a_failed_write_names_the_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing").join("boot.log");
+        let error = format!("{:#}", write_atomic(&path, b"new", true).unwrap_err());
+        assert!(
+            error.contains(&format!("cannot write {}", path.display())),
+            "{error}"
+        );
+    }
 }

@@ -1,4 +1,4 @@
-//! `stela boot-log`: the boot logs `stela.efi` keeps. Every boot writes the
+//! `stela log`: the boot logs `stela.efi` keeps. Every boot writes the
 //! USB's own log, [`crate::efi::BOOT_LOG`] on the USB's EFI partition, from
 //! its first line; an install keeps another on its machine-state partition
 //! (`stela_runtime::pc::boot_log`), at the partition's start, or in the tail
@@ -11,10 +11,9 @@
 //! hold no log, the system disks too. FILE is a whole-disk image or device,
 //! a raw partition, or a copy of the `boot.log` file itself. The hidden
 //! `--partition`, `--offset` and `--in-target` name one machine-state place
-//! instead. `stela setup boot-log` reads the same places of a setup.
+//! instead. `stela log STICK` reads the same places of a stick.
 use crate::setup::host::{self, Disk, Host};
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use clap::Args;
 use std::{
     fmt::Write as _,
     fs::File,
@@ -30,30 +29,31 @@ use stela_runtime::pc::{
     machine_state,
 };
 
-#[derive(Args)]
-pub(crate) struct BootLog {
-    /// A whole-disk image or device, a raw partition, or a copied boot.log
-    /// file: every boot log on it is printed. Without it, every disk of this
-    /// computer is read directly (with sudo for disks only root may read),
-    /// so the USB Stela booted from only needs to be plugged in.
-    file: Option<PathBuf>,
-    /// Write the logs to this file instead of the terminal, as the boot
-    /// wrote them, to attach to a report.
-    #[arg(short, long, value_name = "FILE")]
-    output: Option<PathBuf>,
-    /// Only the machine-state partition with this unique GUID in FILE's
+/// One machine-state place in a file, which the hidden `log` options name
+/// instead of finding every log.
+#[derive(Default, Clone)]
+pub(crate) struct Place {
+    /// Only the machine-state partition with this unique GUID in the file's
     /// GPT.
-    #[arg(long, conflicts_with = "offset", requires = "file", hide = true)]
-    partition: Option<String>,
-    /// Only the machine-state partition at this byte offset in FILE (0 for
-    /// a raw partition).
-    #[arg(long, value_parser = crate::args::parse_address, requires = "file", hide = true)]
-    offset: Option<u64>,
-    /// With --partition or --offset: the partition is a Mac's SSD partition
-    /// whose last bytes hold the machine state; with --offset, FILE ends
-    /// where the partition does.
-    #[arg(long, hide = true)]
-    in_target: bool,
+    pub(crate) partition: Option<String>,
+    /// Only the machine-state partition at this byte offset in the file (0
+    /// for a raw partition).
+    pub(crate) offset: Option<u64>,
+    /// The partition is a Mac's SSD partition whose last bytes hold the
+    /// machine state; with an offset, the file ends where the partition
+    /// does.
+    pub(crate) in_target: bool,
+}
+
+/// `stela log`: the logs of a whole-disk image or device, a raw partition
+/// or a copied boot.log (`file`), or of every disk of this computer.
+pub(crate) struct BootLog {
+    pub(crate) file: Option<PathBuf>,
+    /// Where the logs go instead of standard output.
+    pub(crate) output: Option<PathBuf>,
+    pub(crate) partition: Option<String>,
+    pub(crate) offset: Option<u64>,
+    pub(crate) in_target: bool,
 }
 
 impl BootLog {
@@ -126,6 +126,7 @@ pub(crate) fn write_logs(
     headings: bool,
     output: Option<&Path>,
 ) -> Result<()> {
+    let replaced = output.is_some_and(Path::exists);
     let mut sink: Box<dyn Write> = match output {
         Some(path) => Box::new(
             File::create(path).with_context(|| format!("cannot create {}", path.display()))?,
@@ -153,17 +154,30 @@ pub(crate) fn write_logs(
         result => result.context("cannot write the boot log")?,
     }
     if let Some(path) = output {
-        eprintln!("{}", saved(logs.len(), path));
+        #[cfg(unix)]
+        crate::setup::hand_to_invoker(path);
+        eprintln!("{}", saved(logs.len(), path, replaced));
     }
     Ok(())
 }
 
 /// Where `count` logs were written, as the full path to attach.
-fn saved(count: usize, path: &Path) -> String {
+fn saved(count: usize, path: &Path, replaced: bool) -> String {
+    let path = shown(path);
+    let over = match replaced {
+        true => ", replacing the file that was there",
+        false => "",
+    };
     match count {
-        1 => format!("Saved the boot log to {}", shown(path).display()),
-        _ => format!("Saved {count} boot logs to {}", shown(path).display()),
+        1 => format!("Saved the boot log to {}{over}", path.display()),
+        _ => format!("Saved {count} boot logs to {}{over}", path.display()),
     }
+}
+
+/// Where `stela log` saves the logs on a terminal: `log.txt` in this
+/// folder, the one file every hint asks to attach.
+pub(crate) fn default_output() -> PathBuf {
+    PathBuf::from("log.txt")
 }
 
 /// `path` in full, as a file to attach is found again.
@@ -481,6 +495,87 @@ pub(crate) fn summary(log: &Log) -> String {
     text
 }
 
+/// End every device skip the USB's boot log at `path` holds (`pc::device_starts`):
+/// the functions an earlier boot did not finish starting, which later boots
+/// skip until `by` (`stela repair` or `stela update`) clears them.
+/// The functions it named, for the report; none when the log names none or
+/// cannot be read, which leaves nothing to clear. A dry run changes nothing.
+pub(crate) fn clear_device_skips(path: &Path, by: &str, dry_run: bool) -> Result<Vec<String>> {
+    use stela_runtime::pc::device_starts;
+    let Ok(mut bytes) = std::fs::read(path) else {
+        return Ok(Vec::new());
+    };
+    let Ok(log) = boot_log::read(&bytes) else {
+        return Ok(Vec::new());
+    };
+    let named: Vec<String> = device_starts::read(&log.stream)
+        .iter()
+        .map(|function| {
+            format!(
+                "PCI {} {:04x}:{:04x}",
+                function.address, function.vendor, function.device
+            )
+        })
+        .collect();
+    if named.is_empty() || dry_run {
+        return Ok(named);
+    }
+    let mut region = Region {
+        identity: Identity {
+            transport: Transport::VirtioBlk,
+            location: path.display().to_string(),
+            model: String::from("boot log"),
+            serial: String::new(),
+            blocks: bytes.len() as u64 / 512,
+            block_size: 512,
+            read_only: false,
+            features: Default::default(),
+        },
+        bytes: &mut bytes,
+    };
+    let mut writer = boot_log::Writer::resume(&mut region)
+        .map_err(|error| anyhow!("{}: {error}", path.display()))?;
+    writer.append(format!("{} by {by}\n", device_starts::CLEARED).as_bytes());
+    writer
+        .flush(&mut region)
+        .map_err(|error| anyhow!("{}: {error}", path.display()))?;
+    // In place: the file keeps the clusters `stela.efi` writes on to.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {} to write", path.display()))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(named)
+}
+
+/// A boot log file's bytes as 512-byte blocks.
+struct Region<'a> {
+    identity: Identity,
+    bytes: &'a mut [u8],
+}
+
+impl BlockDevice for Region<'_> {
+    fn identity(&self) -> &Identity {
+        &self.identity
+    }
+
+    fn read(&mut self, lba: u64, buffer: &mut [u8]) -> Result<(), BlockError> {
+        self.identity.check(lba, buffer.len())?;
+        let at = (lba * 512) as usize;
+        buffer.copy_from_slice(&self.bytes[at..at + buffer.len()]);
+        Ok(())
+    }
+
+    fn write(&mut self, lba: u64, data: &[u8]) -> Result<(), BlockError> {
+        self.identity.check(lba, data.len())?;
+        let at = (lba * 512) as usize;
+        self.bytes[at..at + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+}
+
 /// A disk image read through 512- or 4096-byte blocks.
 struct Image {
     file: File,
@@ -651,6 +746,50 @@ pub(crate) mod tests {
             offset,
             in_target: false,
         }
+    }
+
+    /// `stela repair` and `stela update` end every skip the USB's log
+    /// holds, in place, and a dry run changes nothing.
+    #[test]
+    fn clearing_device_skips_ends_them_in_place() {
+        use stela_runtime::pc::device_starts;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.bin");
+        // A boot that stopped inside a network adapter's start.
+        std::fs::write(
+            &path,
+            region(&["HOST DEVICE START pci=0000:05:00.0 id=144d:a808\n\
+                 HOST DEVICE START pci=0000:07:00.0 id=10ec:8125\n"]),
+        )
+        .unwrap();
+        let skips = |path: &Path| {
+            let log = boot_log::read(&std::fs::read(path).unwrap()).unwrap();
+            device_starts::read(&log.stream)
+        };
+        assert_eq!(skips(&path).iter().count(), 1);
+        let named = clear_device_skips(&path, "stela repair", true).unwrap();
+        assert_eq!(named, ["PCI 0000:07:00.0 10ec:8125"]);
+        assert_eq!(skips(&path).iter().count(), 1);
+        let named = clear_device_skips(&path, "stela repair", false).unwrap();
+        assert_eq!(named, ["PCI 0000:07:00.0 10ec:8125"]);
+        assert!(skips(&path).is_empty());
+        let log = boot_log::read(&std::fs::read(&path).unwrap()).unwrap();
+        let text = String::from_utf8(log.stream).unwrap();
+        assert!(
+            text.ends_with("HOST DEVICE SKIPS CLEARED by stela repair\n"),
+            "{text}"
+        );
+        // Nothing left to clear, and no log at all, write nothing.
+        assert!(
+            clear_device_skips(&path, "stela update", false)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            clear_device_skips(&dir.path().join("none"), "x", false)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -960,9 +1099,15 @@ pub(crate) mod tests {
         expected.extend_from_slice(b"=== disk ===\n");
         expected.extend_from_slice(&logs[1].1.stream);
         assert_eq!(std::fs::read(&output).unwrap(), expected);
-        let said = saved(2, &output);
+        let said = saved(2, &output, false);
         assert!(said.starts_with("Saved 2 boot logs to "), "{said}");
         assert!(said.ends_with("log.txt"), "{said}");
+        // A log.txt that was there is said to be replaced.
+        let said = saved(1, &output, true);
+        assert!(
+            said.ends_with("log.txt, replacing the file that was there"),
+            "{said}"
+        );
         let error = write_logs(&logs, false, Some(&dir.path().join("no/such/dir")));
         assert!(format!("{:#}", error.unwrap_err()).contains("cannot create"));
     }

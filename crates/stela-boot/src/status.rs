@@ -26,9 +26,9 @@ use crate::{
 use alloc::{format, string::String, vec::Vec};
 use core::{
     arch::x86_64::_rdtsc,
-    cell::RefCell,
     fmt::{self, Write as _},
 };
+use stela_boot_core::screen::Exclusive;
 
 /// Frames of the running marker: three cells moving across six and back.
 const FRAMES: usize = 14;
@@ -91,19 +91,18 @@ struct State {
     history: String,
 }
 
-/// One processor runs the mount; every access is a `try_borrow`, so a line
-/// drawn while the state is in use is skipped rather than re-entered.
-struct Global(RefCell<State>);
-// SAFETY: see `Global`.
-unsafe impl Sync for Global {}
-
-static STATE: Global = Global(RefCell::new(State {
+/// The boot PE's reports and the host drivers' waits on any processor
+/// ([`tick`]) reach the state, one at a time: a marker frame due while it
+/// is in use is skipped, and a report waits at most [`REPORT_WAIT_SPINS`]
+/// tries for its turn, so a step's end or a failure line is not lost to
+/// another processor's tick.
+static STATE: Exclusive<State> = Exclusive::new(State {
     tsc_hz: 0,
     running: None,
     stream: Vec::new(),
     streamed: true,
     history: String::new(),
-}));
+});
 
 fn now() -> u64 {
     // SAFETY: RDTSC has no memory effects.
@@ -260,7 +259,7 @@ impl State {
         let mut text = running.title;
         // A failed step keeps what it was on, such as the PCI function a
         // probe stopped in: before the engine resumes the boot log, the
-        // screen is the only record of it.
+        // screen shows it whatever becomes of the stop's record.
         if matches!(mark, Mark::Failed) && !running.detail.is_empty() {
             text.push_str(" at ");
             text.push_str(&running.detail);
@@ -298,10 +297,20 @@ impl State {
     }
 }
 
-fn with(f: impl FnOnce(&mut State)) {
-    if let Ok(mut state) = STATE.0.try_borrow_mut() {
-        f(&mut state);
-    }
+/// Tries a report makes for the state before it is skipped: far longer
+/// than another processor's frame takes, and still short when the holder
+/// is this processor further up its stack.
+const REPORT_WAIT_SPINS: u64 = 1 << 22;
+
+fn with<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
+    let mut spins = 0u64;
+    STATE.with_until(
+        || {
+            spins += 1;
+            spins >= REPORT_WAIT_SPINS
+        },
+        f,
+    )
 }
 
 /// The time-stamp counter's rate, for the times steps show.
@@ -372,7 +381,7 @@ pub fn progress_fraction(detail: &str, completed: u64, total: u64) {
 /// the state or the console is in use.
 pub fn tick() {
     output::pump_serial();
-    with(|state| {
+    STATE.try_with(|state| {
         let frame = state.tsc_hz / 8;
         let Some(running) = state.running.as_mut().filter(|_| frame > 0) else {
             return;
@@ -447,6 +456,12 @@ pub fn info(text: &str) {
     with(|state| state.line(Mark::Info, text));
 }
 
+/// A warning line of its own, with no step to end, as for what an earlier
+/// start left.
+pub fn warning(text: &str) {
+    with(|state| state.line(Mark::Warn, text));
+}
+
 /// Draw with Stela's console on `screen` from now on, starting with the
 /// finished lines so far and the running step.
 pub fn take_screen(screen: Option<console::Framebuffer>) {
@@ -467,12 +482,12 @@ pub fn take_screen(screen: Option<console::Framebuffer>) {
 
 /// The finished lines so far.
 pub fn history(into: &mut [u8; HISTORY_BYTES]) -> usize {
-    let mut bytes = 0;
-    if let Ok(state) = STATE.0.try_borrow() {
-        bytes = state.history.len();
+    with(|state| {
+        let bytes = state.history.len();
         into[..bytes].copy_from_slice(state.history.as_bytes());
-    }
-    bytes
+        bytes
+    })
+    .unwrap_or(0)
 }
 
 /// Draw the loader's finished lines again, as the system engine's screen

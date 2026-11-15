@@ -137,11 +137,31 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let waited = device.map_or(0, |_| self.devices.take_lock_wait());
         if let Some(timing) = &mut self.step_timing {
             let spent = now.wrapping_sub(since);
+            let written = self.timed_write.take();
             if let Some(physical) = device {
                 let page = step_timing::device_page(physical);
-                self.system_exits.devices.add(page, 1, spent, waited);
+                let devices = &mut self.system_exits.devices;
+                devices.add(page, 1, spent, waited);
+                let write = if written.is_some() {
+                    step_timing::DEVICE_REGISTER_WRITE
+                } else {
+                    0
+                };
+                let [access, settle, _, transfer, copies, released] = written.unwrap_or_default();
+                devices.add_register(step_timing::DeviceRegisterExit {
+                    register: physical | write,
+                    count: 1,
+                    ticks: spent,
+                    waited,
+                    access,
+                    settle,
+                    transfer,
+                    copies,
+                    released,
+                    longest: spent,
+                });
             }
-            if let Some(parts) = self.timed_write.take() {
+            if let Some(parts) = written {
                 self.system_exits.devices.writes.add(spent, parts);
             }
             let level = step_timing::Level::of(self.cpu.pstate.el, self.cpu.pstate.guarded);

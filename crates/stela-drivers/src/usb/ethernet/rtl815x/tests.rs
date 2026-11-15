@@ -271,16 +271,39 @@ fn revision01_reads_idr_preserves_station_and_masks_only_led_mode() {
         assert!(chip.carrier().unwrap());
         chip.stop().unwrap();
     }
-    for case in 0..4 {
+    for case in 0..3 {
         let model = Rc::new(RefCell::new(Model::new(0x4c00)));
         match case {
             0 => model.borrow_mut().stuck_reset = true,
             1 => model.borrow_mut().stuck_phy = true,
-            2 => model.borrow_mut().stuck_list = true,
-            _ => model.borrow_mut().set(PLA, PLA_IDR, 4, 0x05040303),
+            _ => model.borrow_mut().stuck_list = true,
         }
         assert!(Chip::attach(Io(model), Revision(0x4c00), false).is_err());
     }
+}
+
+#[test]
+fn an_invalid_station_address_is_replaced_by_a_programmed_random_one() {
+    // determine_ethernet_addr: an invalid address gets eth_hw_addr_random;
+    // set_ethernet_addr writes it to IDR on every revision but 01.
+    let model = Rc::new(RefCell::new(Model::new(0x4c00)));
+    model.borrow_mut().set(PLA, PLA_IDR, 4, 0x05040303);
+    let (_, mac) = Chip::attach(Io(model), Revision(0x4c00), false).unwrap();
+    assert!(mac.is_valid() && mac.0[0] & 2 != 0, "{mac}");
+    let model = Rc::new(RefCell::new(Model::new(0x4c10)));
+    model.borrow_mut().set(PLA, PLA_BACKUP, 4, 0);
+    model.borrow_mut().set(PLA, PLA_BACKUP + 4, 4, 0);
+    let (_, mac) = Chip::attach(Io(model.clone()), Revision(0x4c10), false).unwrap();
+    assert!(mac.is_valid() && mac.0[0] & 2 != 0, "{mac}");
+    let [a, b, c, d, e, f] = mac.0;
+    assert_eq!(
+        model.borrow().get(PLA, PLA_IDR, 4),
+        u32::from_le_bytes([a, b, c, d])
+    );
+    assert_eq!(
+        model.borrow().get(PLA, PLA_IDR + 4, 2),
+        u32::from(u16::from_le_bytes([e, f]))
+    );
 }
 
 #[test]
@@ -369,7 +392,9 @@ fn timeout_unknown_revision_and_alignment_are_explicit() {
             Err(BlockError::Timeout)
         ));
     }
-    for revision in [0x4c20, 0x5c10, 0x6010, 0x7030, 0x7410, 0xffff] {
+    // Unimplemented revisions refuse after the identity read. Patched
+    // revisions start without their file (every_patched_revision_...).
+    for revision in [0x4c20, 0xffff] {
         let model = Rc::new(RefCell::new(Model::new(revision)));
         assert!(Chip::attach(Io(model.clone()), Revision(revision), false).is_err());
         assert_eq!(model.borrow().trace.len(), 1);
@@ -396,8 +421,10 @@ fn backup_station_address_is_validated_then_restored_with_write_gate() {
         let model = Rc::new(RefCell::new(Model::new(0x4c10)));
         model.borrow_mut().set(PLA, PLA_BACKUP, 4, first);
         model.borrow_mut().set(PLA, PLA_BACKUP + 4, 4, 0);
-        assert!(Chip::attach(Io(model.clone()), Revision(0x4c10), false).is_err());
-        assert_eq!(model.borrow().trace.len(), 3);
+        // Invalid (zero, multicast, all ones): a random address instead.
+        let (_chip, mac) = Chip::attach(Io(model.clone()), Revision(0x4c10), false).unwrap();
+        assert!(mac.is_valid() && mac.0[0] & 2 != 0, "{mac}");
+        assert_ne!(model.borrow().get(PLA, PLA_IDR, 4), first);
     }
 }
 
@@ -451,6 +478,61 @@ fn unchanged_linux_ocp_request_trace_matches_native_helpers() {
     assert_eq!(actual, std::fs::read_to_string(path).unwrap());
 }
 
+/// A frame whose transmit TD the controller has not finished is queued and
+/// the call returns at once, as usbnet submits its URB; the next frame is
+/// busy until the TD completes, and a TD past its 1 s deadline is cancelled
+/// and reported before the buffer is reused.
+#[test]
+fn a_transmit_in_flight_makes_the_next_busy_until_it_ends_or_times_out() {
+    use crate::net::{Link, LinkError};
+    let mut dma = TestRegion::new(128 * 1024 * 8);
+    let (mut controller, model) = unconfigured_cancellation_controller_with_configurations(
+        &mut dma,
+        &[vec![9, 2, 9, 0, 0, 7, 0, 0x80, 50]],
+    );
+    controller.set_slot_speed(1, HIGH_SPEED);
+    model.borrow_mut().ethernet = Some(ethernet::rtl815x::tests::Model::new(0x4c00));
+    let configuration = vec![
+        9, 2, 32, 0, 1, 7, 0, 0x80, 50, 9, 4, 0, 0, 2, 0xff, 0, 0, 0, 7, 5, 0x81, 2, 0, 2, 0, 7, 5,
+        0x02, 2, 0, 2, 0,
+    ];
+    let mut device = model::addressed_device(&controller, vec![configuration]);
+    device.speed = HIGH_SPEED;
+    device.descriptor[8..12].copy_from_slice(&[0xda, 0x0b, 0x52, 0x81]);
+    controller.preflight_vendor_ethernet(&mut device).unwrap();
+    model::select(&mut device).unwrap();
+    let shared = Rc::new(RefCell::new(controller));
+    let mut found = Found::default();
+    bind(&shared, device, &mut dma, &mut found);
+    let mut link = found.vendor_links.pop().unwrap();
+    assert!(link.carrier());
+    let clock = shared.borrow().clock;
+    let elapsed = |since: u64| clock.now_us() - since;
+
+    model.borrow_mut().silence_transfer = Some(4);
+    let before = clock.now_us();
+    link.transmit(&[1; 60]).unwrap();
+    assert!(link.sending.is_some());
+    let sent = link.send.bytes().to_vec();
+    assert_eq!(link.transmit(&[2; 60]), Err(LinkError::Busy));
+    assert_eq!(link.send.bytes(), sent);
+    assert!(elapsed(before) < 100_000);
+    crate::test_clock::advance(clock, 1_000_000);
+    assert!(matches!(
+        link.transmit(&[3; 60]),
+        Err(LinkError::Adapter(message)) if message.ends_with("device timeout")
+    ));
+    assert!(link.sending.is_none());
+
+    model.borrow_mut().silence_transfer = None;
+    let outgoing = model.borrow().outgoing.len();
+    link.transmit(&[4; 60]).unwrap();
+    assert!(link.sending.is_none());
+    assert_eq!(model.borrow().outgoing.len(), outgoing + 1);
+    link.transmit(&[5; 60]).unwrap();
+    assert_eq!(model.borrow().outgoing.len(), outgoing + 2);
+}
+
 #[test]
 fn rtl8152b_binds_real_xhci_dma_moves_aggregates_wraps_and_quiesces() {
     use crate::net::Link;
@@ -502,9 +584,25 @@ fn rtl8152b_binds_real_xhci_dma_moves_aggregates_wraps_and_quiesces() {
         aggregate[24..84].fill(0x5a);
         aggregate[88..92].copy_from_slice(&64u32.to_le_bytes());
         aggregate[112..172].fill(0x6a);
-        model.borrow_mut().push_event(aggregate);
+        model.borrow_mut().push_event(aggregate.clone());
         assert_eq!(link.receive().unwrap(), Some(vec![0x5a; 60]));
         assert_eq!(link.receive().unwrap(), Some(vec![0x6a; 60]));
+        assert_eq!(link.receive().unwrap(), None);
+        // r8152's rx_bottom and read_bulk_callback: an aggregate that fails
+        // its checks and a STALLed transfer are counted and dropped, and
+        // the link keeps receiving.
+        let mut runt = aggregate.clone();
+        runt[..4].copy_from_slice(&5u32.to_le_bytes());
+        model.borrow_mut().push_event(runt);
+        assert_eq!(link.receive().unwrap(), None);
+        model.borrow_mut().halt_transfer = Some(3);
+        assert_eq!(link.receive().unwrap(), None);
+        model.borrow_mut().halt_transfer = None;
+        model.borrow_mut().push_event(aggregate);
+        let received = (0..2).find_map(|_| link.receive().unwrap());
+        assert_eq!(received, Some(vec![0x5a; 60]));
+        assert_eq!(link.receive().unwrap(), Some(vec![0x6a; 60]));
+        assert_eq!(link.rx_dropped(), 2);
         assert_eq!(link.receive().unwrap(), None);
         match scenario {
             0 => {
@@ -617,7 +715,7 @@ fn rtl815x_firmware_uses_ep0_dma_wrapping_and_poison_guards() {
 }
 
 #[test]
-fn rtl8153_missing_exact_firmware_never_creates_a_native_link() {
+fn rtl8153_missing_firmware_starts_the_chip_unpatched() {
     for revision in [
         0x5c10, 0x5c20, 0x5c30, 0x6010, 0x6400, 0x7030, 0x7410, 0x7420,
     ] {
@@ -627,6 +725,8 @@ fn rtl8153_missing_exact_firmware_never_creates_a_native_link() {
             &[vec![9, 2, 9, 0, 0, 7, 0, 0x80, 50]],
         );
         controller.set_slot_speed(1, HIGH_SPEED);
+        model.borrow_mut().ethernet_upload =
+            Some(ethernet::rtl815x::FirmwareModel::new(revision, &[]));
         let config = vec![
             9, 2, 32, 0, 1, 7, 0, 0x80, 50, 9, 4, 0, 0, 2, 0xff, 0, 0, 0, 7, 5, 0x81, 2, 0, 2, 0,
             7, 5, 2, 2, 0, 2, 0,
@@ -647,10 +747,24 @@ fn rtl8153_missing_exact_firmware_never_creates_a_native_link() {
         let shared = Rc::new(RefCell::new(controller));
         let mut found = Found::default();
         bind(&shared, dev, &mut dma, &mut found);
-        assert!(found.vendor_links.is_empty() && found.failures.is_empty());
-        assert_eq!(found.vendor_failures.len(), 1);
-        let ethernet::Error::Firmware { request, .. } = &found.vendor_failures[0].1 else {
-            panic!("{:?}", found.vendor_failures)
+        // rtl8152_request_firmware: without the file the chip starts
+        // unpatched, and the link names what it runs without.
+        assert!(
+            found.vendor_failures.is_empty() && found.failures.is_empty(),
+            "{revision:04x}: {:?} {:?}",
+            found.vendor_failures,
+            found.failures
+        );
+        assert_eq!(found.vendor_links.len(), 1, "{revision:04x}");
+        let link = &found.vendor_links[0];
+        assert!(link.firmware.is_none());
+        assert!(
+            link.location.ends_with("without its firmware patch"),
+            "{}",
+            link.location
+        );
+        let Some(ethernet::Error::Firmware { request, .. }) = &link.firmware_skipped else {
+            panic!("{:?}", link.firmware_skipped)
         };
         assert_eq!(
             request.name,
@@ -675,6 +789,14 @@ fn rtl8153_missing_exact_firmware_never_creates_a_native_link() {
         );
         assert!(model.borrow().seen.contains(&CONFIGURE_ENDPOINT));
         assert!(model.borrow().active[3].is_none() && model.borrow().outgoing.is_empty());
+        // The probe account names the missing patch once, for the log.
+        let location = link.location.clone();
+        let mut devices = crate::probe::Devices::default();
+        let empty = crate::firmware::Catalog::from_handoff(Vec::new()).unwrap();
+        devices.absorb_usb(None, found, &empty);
+        assert_eq!(devices.usb_vendor_warnings.len(), 1);
+        assert_eq!(devices.usb_vendor_warnings[0].0, location);
+        assert!(devices.usb_vendor_failures.is_empty() && devices.nics.len() == 1);
     }
 }
 
@@ -910,6 +1032,24 @@ fn rtl8153_native_usb2_usb3_binding_uploads_exact_provider_and_keeps_owned_recei
         }
         link.stop().unwrap();
         assert!(link.transmit(&[0; 60]).is_err());
+    }
+}
+
+#[test]
+fn every_patched_revision_starts_without_its_firmware_file() {
+    use ethernet::rtl815x::{FirmwareIo, FirmwareModel};
+    // rtl8152_apply_firmware skips a patch request_firmware did not find:
+    // each revision with a firmware file starts and initializes without it.
+    for revision in [
+        0x5c10, 0x5c20, 0x5c30, 0x6010, 0x6400, 0x7030, 0x7410, 0x7420,
+    ] {
+        assert!(Revision(revision).firmware().is_some());
+        let model = Rc::new(RefCell::new(FirmwareModel::new(revision, &[])));
+        let (chip, mac) =
+            Chip::attach_with_firmware(FirmwareIo(model), Revision(revision), 4, None)
+                .unwrap_or_else(|error| panic!("{revision:04x}: {error:?}"));
+        assert!(chip.initialized, "{revision:04x}");
+        assert!(!mac.is_multicast() && mac.0 != [0; 6]);
     }
 }
 

@@ -24,10 +24,13 @@ pub(in super::super) struct Download {
 }
 
 impl Download {
+    /// Open the catalog's image on Apple's servers, pinning its size and
+    /// entity tag, and copy its boot files to `boot` when bundles are
+    /// prepared; the catalog's build is checked either way.
     pub(in super::super) fn prepare(
         image: restore::Image,
         model: &str,
-        boot: &Path,
+        boot: Option<&Path>,
     ) -> Result<Self> {
         ensure!(
             image.sha1.is_some(),
@@ -39,9 +42,15 @@ impl Download {
             etag: source.etag().into(),
             image,
         };
-        restore::payload::trim(source, model, boot, "Downloading boot files")?;
+        let build = match boot {
+            Some(boot) => {
+                restore::inputs_from(source, model, boot)?;
+                restore::payload::identity(boot, model)?.1
+            }
+            None => restore::payload::identity_of(source, model)?.1,
+        };
         ensure!(
-            restore::payload::identity(boot, model)?.1 == download.image.build,
+            build == download.image.build,
             "the catalog download contains a different macOS build"
         );
         Ok(download)
@@ -229,11 +238,13 @@ fn write_from(
         "invalid download size or piece size"
     );
     let directory = directory(volume, &image.build);
-    fs::create_dir_all(&directory)?;
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("cannot create {}", directory.display()))?;
     let manifest_path = directory.join(MANIFEST_FILE);
     let written = finished(&manifest_path, image, total, &sizes);
     if manifest_path.exists() {
-        fs::remove_file(&manifest_path)?;
+        fs::remove_file(&manifest_path)
+            .with_context(|| format!("cannot remove {}", manifest_path.display()))?;
     }
     let mut whole_sha256 = Sha256::new();
     let mut whole_sha1 = Sha1::new();
@@ -289,20 +300,23 @@ fn write_from(
         // first, so a full USB has room for the new one.
         let promoted = directory.join(piece_name(index));
         if promoted.exists() {
-            fs::remove_file(&promoted)?;
+            fs::remove_file(&promoted)
+                .with_context(|| format!("cannot remove {}", promoted.display()))?;
         }
-        let mut file = fs::File::create(partial_path(&directory, index))?;
+        let partial = partial_path(&directory, index);
+        let writing = || format!("cannot write {}", partial.display());
+        let mut file = fs::File::create(&partial).with_context(writing)?;
         let mut hashes = Hashes::default();
         stream(&mut source, size, |bytes| {
-            file.write_all(bytes)?;
+            file.write_all(bytes).with_context(writing)?;
             hashes.update(bytes);
             whole_sha256.update(bytes);
             whole_sha1.update(bytes);
             progress.advance(bytes.len() as u64);
             Ok(())
         })?;
-        file.sync_all()?;
-        crate::progress::drop_cached(&file);
+        file.sync_all().with_context(writing)?;
+        crate::progress::drop_cached(&file).with_context(writing)?;
         offset += size;
         position = offset;
         let (sha256, blocks) = hashes.finish();
@@ -391,7 +405,9 @@ fn write_from(
     let json = inventory.manifest.to_json();
     efi::write_atomic(&manifest_path, json.as_bytes(), false)?;
     match fs::remove_file(&resume_path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| format!("cannot remove {}", resume_path.display()));
+        }
         _ => {}
     }
     Ok(Written {
@@ -417,9 +433,11 @@ fn promote(
         let partial = partial_path(directory, index);
         verify(index, piece, &partial)?;
         if path.exists() {
-            fs::remove_file(&path)?;
+            fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
         }
-        fs::rename(partial, path)?;
+        fs::rename(&partial, &path).with_context(|| {
+            format!("cannot rename {} to {}", partial.display(), path.display())
+        })?;
     }
     Ok(())
 }
@@ -470,12 +488,20 @@ impl<'a> Joined<'a> {
         let offset = start % self.piece_bytes;
         debug_assert!(start.is_multiple_of(HASH_BLOCK_BYTES));
         debug_assert!(bytes <= WINDOW && bytes as u64 <= self.piece_bytes - offset);
+        let path = partial_path(self.directory, index);
+        let reading = |error: io::Error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot read {}: {error}", path.display()),
+            )
+        };
         if self.current.as_ref().is_none_or(|(old, _)| *old != index) {
-            self.current = Some((index, fs::File::open(partial_path(self.directory, index))?));
+            self.current = Some((index, fs::File::open(&path).map_err(reading)?));
         }
         let file = &mut self.current.as_mut().unwrap().1;
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut self.buffer[..bytes])?;
+        file.seek(SeekFrom::Start(offset)).map_err(reading)?;
+        file.read_exact(&mut self.buffer[..bytes])
+            .map_err(reading)?;
         let first = (start / HASH_BLOCK_BYTES) as usize;
         for (index, bytes) in self.buffer[..bytes].chunks(BLOCK).enumerate() {
             let block = first + index;

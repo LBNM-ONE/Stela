@@ -78,6 +78,18 @@ impl Kick for Doorbells {
     fn release_due(&self) -> bool {
         super::storage::release_due()
     }
+
+    fn release_inline(&self) -> bool {
+        super::storage::release_inline()
+    }
+
+    fn signal_due(&self) -> bool {
+        super::storage::signal_due()
+    }
+
+    fn signal_step(&self) -> bool {
+        super::storage::signal_step()
+    }
 }
 
 /// What every PE's machine shares with the home machine's settings.

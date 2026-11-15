@@ -16,6 +16,7 @@ pub mod rtl815x;
 use super::descriptor::{Endpoint, Interface};
 use super::xhci::{Device, Shared, SlotId, TransferTicket};
 use crate::{
+    Deadline,
     block::BlockError,
     bus::dma::{DmaAllocator, DmaBuffer},
     net::{Link, LinkError, Mac},
@@ -214,8 +215,20 @@ impl Backend {
     }
 }
 
-/// One receive TD and one synchronous transmit TD; DMA allocations persist
-/// for the boot even after failed cancellation, as required by xHCI ownership.
+/// How long one transmit TD may stay outstanding before it is cancelled.
+const TRANSMIT_US: u64 = 1_000_000;
+
+/// A transmit TD the controller still owns: its ticket, its length and when
+/// it times out.
+struct Sending {
+    ticket: TransferTicket,
+    bytes: usize,
+    deadline: Deadline,
+}
+
+/// One receive TD and one transmit TD, each in flight across link calls, as
+/// usbnet keeps its URBs; DMA allocations persist for the boot even after
+/// failed cancellation, as required by xHCI ownership.
 pub struct UsbEthernet {
     controller: Shared,
     id: SlotId,
@@ -225,15 +238,28 @@ pub struct UsbEthernet {
     receive: DmaBuffer,
     send: DmaBuffer,
     queued: Option<TransferTicket>,
+    /// The transmit TD in flight; the send buffer is the controller's until
+    /// it completes or its cancellation is acknowledged.
+    sending: Option<Sending>,
     pending: VecDeque<Vec<u8>>,
     carrier: bool,
     closed: bool,
     stopped: bool,
     pub firmware: Option<firmware::Receipt>,
+    /// Why the chip runs without its firmware patch: the file was missing
+    /// or failed validation, and r8152 then starts the chip unpatched.
+    pub firmware_skipped: Option<firmware::Error>,
+    /// Receive transfers that failed and aggregates that did not decode,
+    /// dropped as r8152 and the ASIX drivers count them in `rx_errors`.
+    rx_dropped: u64,
     pub location: String,
 }
 
 impl UsbEthernet {
+    /// Receive transfers and aggregates dropped as damaged. Saturates.
+    pub fn rx_dropped(&self) -> u64 {
+        self.rx_dropped
+    }
     pub fn driver(&self) -> &'static str {
         match self.chip {
             Backend::Realtek(_) => "usb-rtl815x",
@@ -265,9 +291,15 @@ impl UsbEthernet {
             controller: controller.clone(),
             id: device.id,
         };
-        let (chip, mac, firmware, family) = match binding.kind {
+        let (chip, mac, firmware, family, firmware_skipped) = match binding.kind {
             Kind::Realtek(revision) => {
-                let firmware = firmware::load(provider, &device.descriptor, revision)?;
+                // rtl8152_request_firmware: a missing or invalid patch is
+                // reported and the chip starts without it.
+                let (firmware, skipped) =
+                    match firmware::load(provider, &device.descriptor, revision) {
+                        Ok(firmware) => (firmware, None),
+                        Err(error) => (None, Some(error)),
+                    };
                 let (chip, mac) = Chip::attach_with_policy(
                     io,
                     revision,
@@ -291,7 +323,11 @@ impl UsbEthernet {
                     "RTL8152"
                 };
                 let receipt = firmware.map(|(image, _)| firmware::Receipt::from_image(image));
-                (Backend::Realtek(chip), mac, receipt, String::from(family))
+                let family = match skipped {
+                    Some(_) => format!("{family} without its firmware patch"),
+                    None => String::from(family),
+                };
+                (Backend::Realtek(chip), mac, receipt, family, skipped)
             }
             Kind::Asix(identity) => {
                 let (chip, mac) = asix::Device::attach(io, identity)?;
@@ -310,7 +346,7 @@ impl UsbEthernet {
                     chip.identity().0,
                     chip.identity().1
                 );
-                (Backend::Asix(chip), mac, None, family)
+                (Backend::Asix(chip), mac, None, family, None)
             }
         };
         let receive_bytes = chip.receive_bytes();
@@ -323,11 +359,14 @@ impl UsbEthernet {
             receive: dma.allocate(receive_bytes, receive_bytes.next_power_of_two())?,
             send: dma.allocate(2048, 2048)?,
             queued: None,
+            sending: None,
             pending: VecDeque::new(),
             carrier: false,
             closed: false,
             stopped: false,
             firmware,
+            firmware_skipped,
+            rx_dropped: 0,
             location: format!("{} {family}", device.location),
         })
     }
@@ -349,6 +388,7 @@ impl UsbEthernet {
         c.cancel(self.binding.input.dci())?;
         self.queued = None;
         c.cancel(self.binding.output.dci())?;
+        self.sending = None;
         self.pending.clear();
         Ok(())
     }
@@ -395,6 +435,46 @@ fn link_error(error: BlockError) -> LinkError {
     LinkError::Adapter(format!("USB Ethernet: {error}"))
 }
 
+impl UsbEthernet {
+    /// Whether the send buffer is free: no transmit TD in flight, or the one
+    /// in flight completed. A failed TD is reported once its endpoint is
+    /// reset, and one past its deadline once its cancellation is
+    /// acknowledged; until then the buffer stays the controller's.
+    fn sent(&mut self) -> Result<bool, LinkError> {
+        let Some(sending) = &self.sending else {
+            return Ok(true);
+        };
+        let mut controller = self.controller.borrow_mut();
+        let mut c = controller.device(self.id).map_err(link_error)?;
+        let result = match c.completed_ticket(&sending.ticket) {
+            Some(result) => result,
+            None if sending.deadline.passed() => {
+                c.cancel(self.binding.output.dci()).map_err(link_error)?;
+                self.sending = None;
+                return Err(link_error(BlockError::Timeout));
+            }
+            None => return Ok(false),
+        };
+        let bytes = sending.bytes;
+        match result {
+            Ok(actual) => {
+                self.sending = None;
+                if actual != bytes {
+                    return Err(LinkError::Adapter("USB Ethernet short TX transfer".into()));
+                }
+                Ok(true)
+            }
+            Err(error) => {
+                // A STALL completes the request but the halted hardware can
+                // still reference its old TD until Reset/Set Dequeue succeeds.
+                c.clear(&self.binding.output).map_err(link_error)?;
+                self.sending = None;
+                Err(link_error(error))
+            }
+        }
+    }
+}
+
 impl Link for UsbEthernet {
     fn mac(&self) -> Mac {
         self.mac
@@ -402,10 +482,22 @@ impl Link for UsbEthernet {
     fn carrier(&mut self) -> bool {
         self.update_carrier().unwrap_or(false)
     }
+    /// Queue `frame` and return without waiting for the controller, as
+    /// usbnet_start_xmit submits its URB. While the previous frame is still
+    /// in flight the ring is full: the frame is refused as busy at once.
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         if !self.update_carrier().map_err(link_error)? {
             return Err(LinkError::Adapter("USB Ethernet carrier down".into()));
         }
+        if !self.sent()? {
+            return Err(LinkError::Busy);
+        }
+        let deadline = self
+            .controller
+            .borrow()
+            .clock
+            .try_deadline(TRANSMIT_US)
+            .map_err(|_| LinkError::Adapter("USB Ethernet transmit clock unavailable".into()))?;
         let mut controller = self.controller.borrow_mut();
         let mut c = controller.device(self.id).map_err(link_error)?;
         c.endpoint_ready(self.binding.output.dci())
@@ -415,25 +507,18 @@ impl Link for UsbEthernet {
             .encode(frame, self.send.bytes_mut(), self.binding.output.max_packet)
             .map_err(|why| LinkError::Adapter(why.into()))?;
         fence(Ordering::Release);
-        let actual = match c.transfer(
-            self.binding.output.dci(),
-            self.send.physical(),
-            bytes,
-            1_000_000,
-        ) {
-            Ok(actual) => actual,
-            Err(error) => {
-                // A STALL completes the request but the halted hardware can
-                // still reference its old TD until Reset/Set Dequeue succeeds.
-                c.clear(&self.binding.output).map_err(link_error)?;
-                return Err(link_error(error));
-            }
-        };
-        if actual != bytes {
-            return Err(LinkError::Adapter("USB Ethernet short TX transfer".into()));
-        }
         // The vendor protocol carries its own lengths; Linux submits no ZLP.
-        Ok(())
+        let ticket = c
+            .submit_ticket(self.binding.output.dci(), self.send.physical(), bytes)
+            .map_err(link_error)?;
+        drop(controller);
+        self.sending = Some(Sending {
+            ticket,
+            bytes,
+            deadline,
+        });
+        // A controller that already finished reports the outcome now.
+        self.sent().map(|_| ())
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         if !self.update_carrier().map_err(link_error)? {
@@ -457,9 +542,14 @@ impl Link for UsbEthernet {
         self.queued = None;
         let actual = match result {
             Ok(bytes) => bytes,
-            Err(error) => {
+            Err(_) => {
+                // A failed transfer (a STALL, babble or transaction error)
+                // is counted and dropped once its endpoint is reset, as
+                // r8152 and usbnet resubmit; an endpoint that cannot be
+                // reset is a dead device.
                 c.clear(&endpoint).map_err(link_error)?;
-                return Err(link_error(error));
+                self.rx_dropped = self.rx_dropped.saturating_add(1);
+                return Ok(None);
             }
         };
         if actual > self.receive.len() {
@@ -468,11 +558,12 @@ impl Link for UsbEthernet {
             ));
         }
         fence(Ordering::Acquire);
-        self.pending.extend(
-            self.chip
-                .decode(&self.receive.bytes()[..actual])
-                .map_err(|why| LinkError::Adapter(why.into()))?,
-        );
+        // An aggregate that fails its checks is dropped whole, as a NIC
+        // drops a frame that fails its own.
+        match self.chip.decode(&self.receive.bytes()[..actual]) {
+            Ok(frames) => self.pending.extend(frames),
+            Err(_) => self.rx_dropped = self.rx_dropped.saturating_add(1),
+        }
         Ok(self.pending.pop_front())
     }
 }

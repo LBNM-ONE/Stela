@@ -10,7 +10,8 @@
 //! [`FIRST_DELTA_SECONDS`], whichever comes first, then at doubling
 //! intervals; and whenever the entries held reach half their bound
 //! ([`Entries::pressed`]), so none is refused for want of room while the
-//! writer keeps up.
+//! writer keeps up. Pressed while it writes or merges, it takes them at once
+//! and holds them, one batch, for the segment it starts next.
 //!
 //! The newest two segments are merged, keeping every record and its age,
 //! once the newer is at least half the older: segment sizes stay geometric,
@@ -32,9 +33,34 @@
 //! At a stop, a new segment's write in flight is finished, a merge not yet
 //! committed is left, and what is left and the boot's used-key list are
 //! written.
+//!
+//! Once a segment is written, its records move out of the heap to an arena
+//! ([`Arena`]) outside it, as the pack the loader read is held, a step's
+//! share ([`SETTLE_BYTES`]) at a time, whatever else it does: merges read
+//! them there, and the heap keeps each laid-out segment's index alone. A
+//! merge moves its inputs' records rather than copying them, and copies a
+//! record several segments hold only when merging changes it; when the
+//! arena fills, it is compacted to the records the segments keep, so it
+//! holds what this boot added, not what merges left behind.
+//!
+//! A pack the next boot reads whole converges on the code boots use: a boot
+//! leaves at most [`LEFT_EIGHTHS`] of the limit (the store sheds new entries
+//! past it), so the next reads all of it and its arena, the limit less the
+//! pack read, holds whatever it adds; and once a boot whose file held
+//! records of earlier boots, a full merge keeps [`KEPT_EIGHTHS`] of the
+//! limit, the records boots used most recently first, which leaves room for
+//! the code the boot newly compiles.
+//!
+//! What stays in the heap, beside everything the guest and the GPU need
+//! from it, the writer bounds by the heap
+//! ([`Entries::heap`]): the store sheds new entries while the heap's room is
+//! under [`SHED_SHARE`] or the laid-out segments reach [`RESIDENT_SHARE`]
+//! of it, and once the room falls under [`RELEASE_SHARE`] the writer lets
+//! every segment it holds go, for the rest of the boot: they stay in the
+//! file, and no merge runs, as one would leave them out.
 use super::pack::{
-    Delta, JOURNAL_DOMAIN, Layout, MAX_SEGMENTS, MAX_USED_KEYS, MAX_USED_LISTS, Merge, Merged,
-    Pack, SEGMENT_BLOB, Segment, USED_BLOB, UsedKeys,
+    Arena, Delta, JOURNAL_DOMAIN, Layout, MAX_SEGMENTS, MAX_USED_KEYS, MAX_USED_LISTS, Merge,
+    Merged, Pack, SEGMENT_BLOB, Segment, Settled, USED_BLOB, UsedKeys,
 };
 use super::{Digest, Record};
 use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec, vec::Vec};
@@ -70,6 +96,29 @@ const LOOKS_PER_SECOND: u64 = 10;
 pub const STEP_WORK: usize = 32;
 /// The most bytes a write step queues.
 pub const PIECE_BYTES: u64 = 512 << 10;
+/// The record bytes a step moves to the arena.
+pub const SETTLE_BYTES: usize = 4 << 20;
+/// The eighths of the limit a full merge keeps, once the file holds records
+/// of earlier boots, and the eighths the pack a boot leaves may take.
+pub const KEPT_EIGHTHS: u64 = 4;
+pub const LEFT_EIGHTHS: u64 = 6;
+/// The share of the heap (a fraction's denominator) the segments laid out
+/// this boot may hold.
+pub const RESIDENT_SHARE: u64 = 16;
+/// The store sheds new entries while the heap's room is under this share
+/// of it, and keeps them again once the room is a [`RELEASE_SHARE`] more.
+pub const SHED_SHARE: u64 = 16;
+/// Under this share of room, the writer lets its laid-out segments go.
+pub const RELEASE_SHARE: u64 = 32;
+
+/// The heap the writer's segments and the store's entries share with the
+/// rest of the boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heap {
+    pub total: u64,
+    /// The bytes a large request can still find.
+    pub room: u64,
+}
 
 /// What the writer asks of the boot's store.
 pub trait Entries {
@@ -82,6 +131,21 @@ pub trait Entries {
     /// Whether the entries held for the next segment reached half the
     /// bound past which new ones are refused.
     fn pressed(&mut self) -> bool;
+    /// The heap, when the boot measures it.
+    fn heap(&mut self) -> Option<Heap>;
+    /// Keep no new entry (`true`), the heap being short, or keep them again.
+    fn shed(&mut self, shed: bool);
+    /// The bytes of the entries added since the last take.
+    fn added_bytes(&mut self) -> u64;
+}
+
+/// Why the store sheds new entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShedReason {
+    /// The heap's room is short, or the laid-out segments hold their share.
+    Heap,
+    /// The pack reached the share of the limit a boot leaves.
+    Pack,
 }
 
 /// Why a new segment started.
@@ -122,6 +186,24 @@ pub enum Event {
     /// A waiting segment found no room after a merge either: it is larger
     /// than the file holds beside the merged content, and left out.
     Lost { records: usize },
+    /// The store began shedding new entries for `reason`, the first time
+    /// this boot for it: the heap's room when measured, the pack's bytes
+    /// with those pending, and those the laid-out segments hold.
+    Shed {
+        reason: ShedReason,
+        room: Option<u64>,
+        pack: u64,
+        resident: u64,
+    },
+    /// The arena, compacted, had no room for the next record, `used` bytes
+    /// of it holding records: the rest of the boot's written records stay
+    /// in the heap, within its share ([`RESIDENT_SHARE`]), as `resident`
+    /// bytes did then. Reported once.
+    ArenaFull { used: u64, resident: u64 },
+    /// The heap's room fell under [`RELEASE_SHARE`]: the writer let its
+    /// laid-out segments go (`bytes`), and the records of those not yet
+    /// written and of the entries held (`lost`).
+    Released { room: u64, bytes: u64, lost: usize },
 }
 
 /// What the writer did while the guest ran.
@@ -130,11 +212,20 @@ pub struct Stats {
     pub deltas: u64,
     pub delta_records: u64,
     pub delta_bytes: u64,
-    /// Segments started because the entries held pressed.
+    /// Segments started because the entries held pressed, and batches
+    /// taken while the writer was busy.
     pub pressed: u64,
+    pub held: u64,
     /// Merges of the newest two segments, and full merges.
     pub pairs: u64,
     pub merges: u64,
+    /// Times the store began shedding, and the most bytes the laid-out
+    /// segments held.
+    pub sheds: u64,
+    pub resident_peak: u64,
+    /// Times the arena was compacted, and the bytes that gave back.
+    pub compactions: u64,
+    pub compacted: u64,
 }
 
 /// What [`Writer::stop`] wrote: the segments in the file after it, the
@@ -211,7 +302,23 @@ pub struct Writer<'a> {
     /// slower than [`QUIET_RATE`].
     looked: Option<(u64, u64)>,
     pressed: bool,
+    /// Entries taken while pressed and busy, for the next segment.
+    held: BTreeMap<Digest, Record>,
+    held_bytes: u64,
     quiet_since: Option<u64>,
+    /// The store sheds new entries, the reasons reported so far (a bit
+    /// each), and whether the writer let its segments go.
+    shedding: bool,
+    reported: u8,
+    released: bool,
+    /// The bytes of the segments read: records of earlier boots.
+    read_bytes: u64,
+    /// The bytes of the entries a segment being laid out took.
+    delta_bytes: u64,
+    /// Where written records move, and whether it ran out of room.
+    arena: Arena<'a>,
+    arena_full: bool,
+    arena_reported: bool,
     failed: bool,
     stats: Stats,
 }
@@ -229,16 +336,19 @@ pub struct File<'a> {
     pub used: Vec<UsedKeys>,
     /// A segment was left out or cut.
     pub partial: bool,
+    /// Where the records of the segments this boot writes move.
+    pub arena: Arena<'a>,
 }
 
 impl<'a> Writer<'a> {
-    pub fn new(file: File<'a>, hz: u64) -> Self {
-        Self {
+    pub fn new(mut file: File<'a>, hz: u64) -> Self {
+        let segments = core::mem::take(&mut file.segments);
+        let mut writer = Self {
             translator: file.translator,
             limit: file.limit,
             file_bytes: file.file_bytes,
             committed: file.committed,
-            segments: file.segments.into_iter().map(Segment::from).collect(),
+            segments: Vec::new(),
             used: file.used,
             partial: file.partial,
             merged: false,
@@ -252,10 +362,22 @@ impl<'a> Writer<'a> {
             delta_interval: hz * FIRST_DELTA_SECONDS,
             looked: None,
             pressed: false,
+            held: BTreeMap::new(),
+            held_bytes: 0,
             quiet_since: None,
+            shedding: false,
+            reported: 0,
+            released: false,
+            read_bytes: segments.iter().map(|pack| pack.bytes() as u64).sum(),
+            delta_bytes: 0,
+            arena: file.arena,
+            arena_full: false,
+            arena_reported: false,
             failed: false,
             stats: Stats::default(),
-        }
+        };
+        writer.segments = segments.into_iter().map(Segment::from).collect();
+        writer
     }
 
     pub fn stats(&self) -> Stats {
@@ -268,6 +390,204 @@ impl<'a> Writer<'a> {
 
     pub fn idle(&self) -> bool {
         matches!(self.task, Task::Idle)
+    }
+
+    /// The heap bytes of the segments laid out this boot that memory holds
+    /// for merges and writes.
+    pub fn resident(&self) -> u64 {
+        let laid = self.segments.iter().filter_map(|segment| match segment {
+            Segment::Laid(layout) => Some(layout.owned()),
+            Segment::Packed(_) => None,
+        });
+        let waiting = self.waiting.iter().map(|layout| layout.owned());
+        laid.chain(waiting).sum()
+    }
+
+    /// The arena's bytes holding records, and those left.
+    pub fn arena(&self) -> (u64, u64) {
+        (self.arena.used(), self.arena.left())
+    }
+
+    /// Move a step's share of the records of a segment written to the
+    /// arena, until it has no room even compacted: the first time, the
+    /// event that says so.
+    fn settle(&mut self) -> Option<Event> {
+        // Without an arena (none was set aside) the records stay.
+        let (used, left) = self.arena();
+        if self.arena_full || self.released || used + left == 0 {
+            return None;
+        }
+        // Merges leave the records they merged anew or evicted behind in
+        // the arena: compacted, it holds what the segments keep. The rest
+        // stays in the heap until a merge or write in flight is done, and
+        // the arena is full when compacted it still has no room, until the
+        // next merge commits. Records past it stay in the heap, which its
+        // own shares bound: the arena is the room the pack read leaves, and
+        // a merge of read segments that hold one page each re-encodes that
+        // page there while the read bytes stay for lookups.
+        if self.settle_next() == Some(Settled::Full)
+            && self.compact().is_some()
+            && self.settle_next() == Some(Settled::Full)
+        {
+            self.arena_full = true;
+            if !self.arena_reported {
+                self.arena_reported = true;
+                return Some(Event::ArenaFull {
+                    used: self.arena.used(),
+                    resident: self.resident(),
+                });
+            }
+        }
+        None
+    }
+
+    /// Move a step's share of the first segment written with records
+    /// still in the heap: `None` when there is none.
+    fn settle_next(&mut self) -> Option<Settled> {
+        for segment in &mut self.segments {
+            let Segment::Laid(layout) = segment else {
+                continue;
+            };
+            if layout.settled() {
+                continue;
+            }
+            // A write in flight shares its layout: it moves once written.
+            let Some(layout) = Arc::get_mut(layout) else {
+                continue;
+            };
+            return Some(layout.settle(&mut self.arena, SETTLE_BYTES));
+        }
+        None
+    }
+
+    /// Compact the arena to the records the segments keep, unless a merge or
+    /// write in flight holds some of them: the bytes it gave back.
+    fn compact(&mut self) -> Option<u64> {
+        if matches!(self.task, Task::Merge(..) | Task::Write { .. }) {
+            return None;
+        }
+        let mut layouts = Vec::with_capacity(self.segments.len() + self.waiting.len());
+        for segment in &mut self.segments {
+            if let Segment::Laid(layout) = segment {
+                layouts.push(Arc::get_mut(layout)?);
+            }
+        }
+        for layout in &mut self.waiting {
+            layouts.push(Arc::get_mut(layout)?);
+        }
+        // SAFETY: with no merge or write in flight and every layout held
+        // here alone, the segments hold every slice of the arena in use.
+        let given = unsafe { self.arena.compact(&mut layouts) };
+        self.stats.compactions += 1;
+        self.stats.compacted += given;
+        Some(given)
+    }
+
+    /// Whether the store sheds new entries, and whether the writer let its
+    /// segments go.
+    pub fn shedding(&self) -> (bool, bool) {
+        (self.shedding, self.released)
+    }
+
+    /// Keep the store's entries and the segments laid out within the heap:
+    /// shed new entries while its room or the segments press, and let the
+    /// segments go once its room is nearly gone.
+    fn govern(&mut self, entries: &mut dyn Entries) -> Option<Event> {
+        let heap = entries.heap();
+        let resident = self.resident();
+        self.stats.resident_peak = self.stats.resident_peak.max(resident);
+        if let Some(Heap { total, room }) = heap
+            && !self.released
+            && room < total / RELEASE_SHARE
+        {
+            return Some(self.release(entries, room, resident));
+        }
+        let left = self.left_bytes();
+        let pack = self.pack_bytes(entries);
+        let heap_short = heap.is_some_and(|Heap { total, room }| {
+            room < total / SHED_SHARE || resident >= total / RESIDENT_SHARE
+        });
+        let reason = if heap_short {
+            Some(ShedReason::Heap)
+        } else if pack >= left {
+            Some(ShedReason::Pack)
+        } else {
+            None
+        };
+        let heap_eased = heap
+            .is_none_or(|Heap { total, room }| room >= total / SHED_SHARE + total / RELEASE_SHARE);
+        let keep = reason.is_none() && heap_eased && pack < left.saturating_sub(self.limit / 16);
+        if let Some(reason) = reason
+            && !self.shedding
+        {
+            self.shedding = true;
+            entries.shed(true);
+            self.stats.sheds += 1;
+            let bit = 1 << reason as u8;
+            if self.reported & bit == 0 {
+                self.reported |= bit;
+                return Some(Event::Shed {
+                    reason,
+                    room: heap.map(|heap| heap.room),
+                    pack,
+                    resident,
+                });
+            }
+        }
+        if keep && self.shedding && !self.released {
+            self.shedding = false;
+            entries.shed(false);
+        }
+        None
+    }
+
+    /// The most bytes the pack a boot leaves may take.
+    fn left_bytes(&self) -> u64 {
+        self.limit / 8 * LEFT_EIGHTHS
+    }
+
+    /// The bytes the pack takes and will take: the file's segments, those
+    /// laid out or being written, and the entries taken or added for the
+    /// next (as the heap holds them, more than they take encoded).
+    fn pack_bytes(&self, entries: &mut dyn Entries) -> u64 {
+        let waiting: u64 = self.waiting.iter().map(|layout| layout.bytes()).sum();
+        let task = match &self.task {
+            Task::Delta(..) => self.delta_bytes,
+            Task::Write {
+                done: Done::Segment(layout, _),
+                ..
+            } => layout.bytes(),
+            _ => 0,
+        };
+        self.segment_bytes() + waiting + task + self.held_bytes + entries.added_bytes()
+    }
+
+    /// Let every segment laid out go, with a merge in progress, the entries
+    /// held and those the store holds, and shed new ones for the rest of
+    /// the boot. A segment being laid out or written finishes; it is let go
+    /// once written.
+    fn release(&mut self, entries: &mut dyn Entries, room: u64, bytes: u64) -> Event {
+        self.released = true;
+        if !self.shedding {
+            self.shedding = true;
+            self.stats.sheds += 1;
+        }
+        entries.shed(true);
+        let mut lost = self.waiting.iter().map(|layout| layout.records()).sum();
+        self.waiting.clear();
+        self.merged_since_wait = false;
+        lost += self.held.len();
+        self.held = BTreeMap::new();
+        self.held_bytes = 0;
+        lost += entries.take_added().len();
+        if let Task::Merge(..) = self.task {
+            self.task = Task::Idle;
+        }
+        self.segments
+            .retain(|segment| matches!(segment, Segment::Packed(_)));
+        // Merges read segments from memory: with some let go, none runs.
+        self.partial = true;
+        Event::Released { room, bytes, lost }
     }
 
     /// The file's newest commit, as the writer last committed or read it.
@@ -373,7 +693,20 @@ impl<'a> Writer<'a> {
                 && !self.partial
                 && self.settled
                 && !self.pressed
-                && (segments >= MERGE_AT || self.count(USED_BLOB) >= MERGE_AT))
+                && (segments >= MERGE_AT
+                    || self.count(USED_BLOB) >= MERGE_AT
+                    || (self.read_bytes != 0 && self.segment_bytes() > self.kept_bytes())))
+    }
+
+    /// The most bytes a full merge keeps: once the file holds records of
+    /// earlier boots, [`KEPT_EIGHTHS`] of the limit; before, the share a
+    /// boot leaves, so a first boot's records all stay.
+    fn kept_bytes(&self) -> u64 {
+        if self.read_bytes != 0 {
+            self.limit / 8 * KEPT_EIGHTHS
+        } else {
+            self.left_bytes()
+        }
     }
 
     /// The offsets of the newest two segments when they are due to merge:
@@ -411,13 +744,13 @@ impl<'a> Writer<'a> {
             }
         }
         self.look(now, entries);
-        if self.full_merge_due() && !self.segments.is_empty() {
+        if self.full_merge_due() && !self.segments.is_empty() && !self.released {
             self.merged = true;
             // Beside the file's content, so its commit keeps that content
             // until the merged segment is whole; within its share of the
             // file, so new segments find room until the next merge.
             let share = self.data_bytes() / 8 * MERGED_SHARE;
-            let bound = self.limit.min(share).min(self.free());
+            let bound = self.kept_bytes().min(share).min(self.free());
             let protect = UsedKeys::parse(&self.used_list(entries.found_keys()), &self.translator);
             let segments = core::mem::take(&mut self.segments);
             let mut merge = Merge::new(self.translator, segments, self.used.clone(), bound);
@@ -429,6 +762,12 @@ impl<'a> Writer<'a> {
         }
         if !self.waiting.is_empty() {
             return None;
+        }
+        // A batch taken while busy goes before any merge of the newest two.
+        if !self.held.is_empty() && self.count(SEGMENT_BLOB) + 1 < MAX_SEGMENTS {
+            let held = core::mem::take(&mut self.held);
+            self.held_bytes = 0;
+            return self.start_delta(now, held, entries, Trigger::Pressed);
         }
         if let Some(offsets) = self.pair_due() {
             let pair = self.segments.split_off(self.segments.len() - 2);
@@ -444,9 +783,24 @@ impl<'a> Writer<'a> {
         if self.count(SEGMENT_BLOB) + 1 >= MAX_SEGMENTS {
             return None;
         }
+        let held = core::mem::take(&mut self.held);
+        self.held_bytes = 0;
+        self.start_delta(now, held, entries, trigger)
+    }
+
+    /// Start a segment of `held` and the entries added since.
+    fn start_delta(
+        &mut self,
+        now: u64,
+        mut added: BTreeMap<Digest, Record>,
+        entries: &mut dyn Entries,
+        trigger: Trigger,
+    ) -> Option<Event> {
         self.settled = true;
         self.pressed = false;
-        let added = entries.take_added();
+        let taken = entries.take_added();
+        self.note_added(&taken);
+        join(&mut added, taken);
         if added.is_empty() {
             self.next_delta = self.next_delta.max(now + self.hz * RECHECK_SECONDS);
             return None;
@@ -457,10 +811,42 @@ impl<'a> Writer<'a> {
             self.next_delta = now + self.delta_interval;
             self.delta_interval = (self.delta_interval * 2).min(self.hz * LAST_DELTA_SECONDS);
         }
-        self.note_added(&added);
         self.stats.delta_records += added.len() as u64;
+        self.delta_bytes = added
+            .values()
+            .map(|record| record.retained_bytes() as u64)
+            .sum();
         self.task = Task::Delta(Box::new(Delta::new(self.translator, added)), trigger);
         None
+    }
+
+    /// While busy: take the entries added at once when they press, into
+    /// the batch held for the next segment, while it stays within its share
+    /// of the heap ([`RESIDENT_SHARE`]; one batch where the heap is not
+    /// known), so a long merge or write does not leave the store's bound
+    /// full and its new entries unkept.
+    fn hold(&mut self, now: u64, entries: &mut dyn Entries) {
+        self.look(now, entries);
+        let share = entries
+            .heap()
+            .map_or(0, |Heap { total, .. }| total / RESIDENT_SHARE);
+        if self.pressed && (self.held.is_empty() || self.held_bytes < share) {
+            self.pressed = false;
+            let taken = entries.take_added();
+            self.note_added(&taken);
+            self.stats.held += u64::from(!taken.is_empty());
+            for (key, record) in taken {
+                self.held_bytes += record.retained_bytes() as u64;
+                match self.held.entry(key) {
+                    alloc::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(record);
+                    }
+                    alloc::collections::btree_map::Entry::Occupied(mut slot) => {
+                        slot.get_mut().merge(record);
+                    }
+                }
+            }
+        }
     }
 
     /// The plan that writes `change`, which commits once beside the file's
@@ -509,7 +895,9 @@ impl<'a> Writer<'a> {
                 let (records, bytes) = (layout.records(), layout.bytes());
                 self.stats.deltas += 1;
                 self.stats.delta_bytes += bytes;
-                self.segments.push(Segment::Laid(layout));
+                if !self.released {
+                    self.segments.push(Segment::Laid(layout));
+                }
                 Event::Segment {
                     records,
                     bytes,
@@ -518,13 +906,22 @@ impl<'a> Writer<'a> {
             }
             Done::Merge(layout, Merging::Pair(_)) => {
                 self.stats.pairs += 1;
-                self.segments.push(Segment::Laid(layout));
+                // Its inputs' records merged anew are the arena's to take back.
+                self.arena_full = false;
+                if !self.released {
+                    self.segments.push(Segment::Laid(layout));
+                }
                 Event::MergeCommitted { full: false }
             }
             Done::Merge(layout, Merging::Full) => {
                 self.stats.merges += 1;
+                self.arena_full = false;
                 self.merged_since_wait = !self.waiting.is_empty();
-                self.segments = vec![Segment::Laid(layout)];
+                self.segments = if self.released {
+                    Vec::new()
+                } else {
+                    vec![Segment::Laid(layout)]
+                };
                 self.used.clear();
                 Event::MergeCommitted { full: true }
             }
@@ -545,8 +942,12 @@ impl<'a> Writer<'a> {
         if self.failed {
             return Ok(events);
         }
+        events.extend(self.govern(entries));
+        events.extend(self.settle());
         if self.idle() {
             events.extend(self.begin(clock(), entries));
+        } else {
+            self.hold(clock(), entries);
         }
         loop {
             self.task = match core::mem::replace(&mut self.task, Task::Idle) {
@@ -677,8 +1078,11 @@ impl<'a> Writer<'a> {
             Task::Merge(..) | Task::Write { .. } => stopped.merge_left = true,
             Task::Idle => {}
         }
-        let added = entries.take_added();
-        self.note_added(&added);
+        let mut added = core::mem::take(&mut self.held);
+        self.held_bytes = 0;
+        let taken = entries.take_added();
+        self.note_added(&taken);
+        join(&mut added, taken);
         layouts.extend(Delta::new(self.translator, added).finish());
         let mut change = Change::default();
         let room = MAX_SEGMENTS.saturating_sub(self.count(SEGMENT_BLOB));
@@ -719,3 +1123,17 @@ impl<'a> Writer<'a> {
 
 #[cfg(test)]
 mod tests;
+
+/// Add `from`'s entries to `into`'s.
+fn join(into: &mut BTreeMap<Digest, Record>, from: BTreeMap<Digest, Record>) {
+    for (key, record) in from {
+        match into.entry(key) {
+            alloc::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(record);
+            }
+            alloc::collections::btree_map::Entry::Occupied(mut slot) => {
+                slot.get_mut().merge(record)
+            }
+        }
+    }
+}

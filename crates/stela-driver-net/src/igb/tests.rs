@@ -460,20 +460,111 @@ fn i210_recovers_a_stale_smbi_latch_only_once() {
 }
 
 #[test]
-fn unknown_phy_media_and_firmware_owned_reset_do_not_start_a_link() {
+fn unknown_phy_and_media_do_not_start_a_link() {
     let unknown = Model::new(Chip::I82576, 0x1234_5670, true);
     assert!(initialize(&unknown, Chip::I82576).is_err());
     assert_eq!(unknown.phy_value(PHY_ADVERTISE), 0);
-    let firmware_owned = Model::new(Chip::I82576, PHY_IGP3, true);
-    firmware_owned.set(MANC, MANC_BLOCK_PHY);
-    assert!(initialize(&firmware_owned, Chip::I82576).is_err());
-    assert!(firmware_owned.mdio_writes.borrow().is_empty());
     let media = Model::new(Chip::I82576, PHY_IGP3, true);
     media.set(CTRL_EXT, CTRL_EXT_MODE);
     assert!(initialize(&media, Chip::I82576).is_err());
     assert!(media.nvm_reads.borrow().is_empty());
     let mismatch = Model::new(Chip::I350, PHY_82580, true);
     assert!(initialize(&mismatch, Chip::I350).is_err());
+}
+
+#[test]
+fn a_stop_drains_the_bus_master_resets_the_mac_and_hands_control_back() {
+    for (chip, phy, flash) in [
+        (Chip::I82575, PHY_IGP3, true),
+        (Chip::I350, PHY_I350, true),
+        (Chip::I211, PHY_I210, false),
+    ] {
+        let io = Model::new(chip, phy, flash);
+        io.lock_after.set(1);
+        initialize(&io, chip).unwrap_or_else(|error| panic!("{error:?}"));
+        assert_ne!(io.get(CTRL_EXT) & CTRL_EXT_DRIVER, 0);
+        io.set(RCTL, RCTL_EN | RCTL_BAM);
+        io.set(TCTL, TCTL_EN | TCTL_PSP);
+        io.writes.borrow_mut().clear();
+        let clock = ModelClock::default();
+        let mut hardware = Hardware::new(io.as_ref(), &clock, chip);
+        hardware.stop().unwrap();
+        hardware.release_control();
+        let writes = io.writes.borrow();
+        let at = |found: &dyn Fn(usize, u32) -> bool| {
+            writes
+                .iter()
+                .position(|&(offset, value)| found(offset, value))
+                .unwrap()
+        };
+        // igb_down: receive, then transmit, off before igb_reset drains the
+        // bus master and resets the MAC.
+        let receive = at(&|offset, value| offset == RCTL && value == RCTL_BAM);
+        let transmit = at(&|offset, value| offset == TCTL && value == TCTL_PSP);
+        let master = at(&|offset, value| offset == CTRL && value & CTRL_MASTER_DISABLE != 0);
+        let reset = at(&|offset, value| offset == CTRL && value & CTRL_RST != 0);
+        assert!(receive < transmit && transmit < master && master < reset);
+        // igb_release_hw_control.
+        assert_eq!(io.get(CTRL_EXT) & CTRL_EXT_DRIVER, 0);
+    }
+    // A bus master that never drains fails the stop before any reset, so
+    // the owner keeps the rings.
+    let io = Model::new(Chip::I350, PHY_I350, true);
+    io.lock_after.set(1);
+    initialize(&io, Chip::I350).unwrap();
+    io.fault.set(Fault::Master);
+    io.writes.borrow_mut().clear();
+    let clock = ModelClock::default();
+    let mut hardware = Hardware::new(io.as_ref(), &clock, Chip::I350);
+    assert_eq!(hardware.stop(), Err(BlockError::Timeout));
+    assert!(
+        !io.writes
+            .borrow()
+            .iter()
+            .any(|&(offset, value)| offset == CTRL && value & CTRL_RST != 0)
+    );
+}
+
+#[test]
+fn a_wake_configuration_left_armed_is_cleared_by_the_reset() {
+    for (chip, phy, flash) in [
+        (Chip::I82576, PHY_IGP3, true),
+        (Chip::I350, PHY_I350, true),
+        (Chip::I211, PHY_I210, false),
+    ] {
+        let io = Model::new(chip, phy, flash);
+        io.lock_after.set(1);
+        io.set(WUC, 0x3); // APME and PME_EN, as Windows leaves them for WoL.
+        initialize(&io, chip).unwrap_or_else(|error| panic!("{error:?}"));
+        assert_eq!(io.get(WUC), 0);
+    }
+}
+
+#[test]
+fn a_management_owned_phy_is_powered_up_but_neither_reset_nor_renegotiated() {
+    // igb_check_reset_block: an SOL/IDE-R session owns the PHY and its link.
+    // Linux skips igb_phy_hw_reset and igb_setup_link, and starts the MAC.
+    for (chip, phy) in [
+        (Chip::I82576, PHY_IGP3),
+        (Chip::I350, PHY_I350),
+        (Chip::I210, PHY_I210),
+    ] {
+        let owned = Model::new(chip, phy, true);
+        owned.set(MANC, MANC_BLOCK_PHY);
+        initialize(&owned, chip).unwrap_or_else(|error| panic!("{error:?}"));
+        assert!(
+            !owned
+                .writes
+                .borrow()
+                .iter()
+                .any(|&(register, value)| register == CTRL && value & CTRL_PHY_RST != 0)
+        );
+        assert_eq!(owned.phy_value(PHY_ADVERTISE), 0);
+        assert_eq!(owned.phy_value(PHY_GIGABIT), 0x1f00);
+        assert_eq!(owned.phy_value(PHY_CONTROL) & PHY_POWERDOWN, 0);
+        assert_eq!(owned.phy_value(PHY_CONTROL) & PHY_RESTART, 0);
+        owned.assert_released();
+    }
 }
 
 #[test]
@@ -712,8 +803,9 @@ impl DmaFixture {
             device: unsafe {
                 Mmio::new(registers.as_mut_ptr() as u64, size_of_val(&registers[..]))
             },
-            receive: Ring::new(&mut dma).unwrap(),
-            transmit: Ring::new(&mut dma).unwrap(),
+            chip: Chip::I210,
+            receive: ManuallyDrop::new(Ring::new(&mut dma).unwrap()),
+            transmit: ManuallyDrop::new(Ring::new(&mut dma).unwrap()),
             dropping: false,
             faulted: false,
             mac: Model::MAC,
@@ -844,7 +936,7 @@ fn full_transmit_ring_refuses_overwrite_and_recovers_only_completed_slots() {
     let buffers: Vec<Vec<u8>> = (0..DESCRIPTORS)
         .map(|index| fixture.net.transmit.buffer(index).to_vec())
         .collect();
-    assert!(fixture.net.transmit(&[8; 60]).is_err());
+    assert_eq!(fixture.net.transmit(&[8; 60]), Err(LinkError::Busy));
     assert_eq!(fixture.net.transmit.descriptors.bytes(), descriptors);
     for (index, buffer) in buffers.iter().enumerate() {
         assert_eq!(fixture.net.transmit.buffer(index), &buffer[..]);

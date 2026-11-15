@@ -94,6 +94,29 @@ fn a_device_that_keeps_no_writes_fails_the_check() {
     );
 }
 
+/// What the device start's store before each device costs: its start
+/// line's tail block and the header, each made durable, and no read.
+#[test]
+fn storing_one_device_start_line_writes_two_blocks() {
+    for block in [512, 4096] {
+        let mut disk = Recorder::new(HEADER_BYTES + 8 * 4096, block);
+        let mut writer = Writer::open(&mut disk).unwrap();
+        writer.append(b"earlier lines\n");
+        writer.flush(&mut disk).unwrap();
+        for device in 0..32 {
+            disk.events.clear();
+            let reads = disk.reads;
+            writer.append(
+                alloc::format!("HOST DEVICE PCI 0000:{device:02x}:00.0 start\n").as_bytes(),
+            );
+            writer.flush(&mut disk).unwrap();
+            let writes = disk.events.iter().filter(|event| event.is_some()).count();
+            assert_eq!(writes, 2, "block {block} device {device}");
+            assert_eq!(disk.reads, reads);
+        }
+    }
+}
+
 #[test]
 fn a_resumed_log_continues_the_same_boot() {
     let mut disk = Recorder::new(HEADER_BYTES + 4 * 4096, 512);
@@ -186,6 +209,32 @@ fn the_ring_wraps_and_the_reader_keeps_order() {
             disk.log().unwrap().stream,
             stream[stream.len() - ring as usize..]
         );
+    }
+}
+
+#[test]
+fn reading_back_from_the_head_gives_the_newest_stream_and_stops_when_enough() {
+    for block in [512, 4096] {
+        let ring = 4 * u64::from(block);
+        let mut disk = Recorder::new(HEADER_BYTES + ring, block);
+        // A blank region holds no stream.
+        assert!(read_newest(&mut disk, 100, |_| false).unwrap().is_empty());
+        let mut writer = Writer::open(&mut disk).unwrap();
+        for line in 0..(3 * ring / 10) {
+            writer.append(format!("line {line:04}\n").as_bytes());
+        }
+        writer.flush(&mut disk).unwrap();
+        // Wrapped, with its head inside a block.
+        let whole = disk.log().unwrap().stream;
+        assert!(disk.log().unwrap().overwritten() > 0);
+        for chunk in [1, 100, u64::from(block), 3 * u64::from(block) + 7, 1 << 20] {
+            assert_eq!(read_newest(&mut disk, chunk, |_| false).unwrap(), whole);
+            // Stopping early gives a suffix that answers.
+            let newest = read_newest(&mut disk, chunk, |read| read.len() >= 300).unwrap();
+            assert!(newest.len() >= 300, "{chunk}");
+            assert!(whole.ends_with(&newest), "{chunk}");
+            assert!(newest.len() < 300 + chunk.max(u64::from(block)) as usize);
+        }
     }
 }
 

@@ -18,11 +18,11 @@ pub fn configure() -> cc::Build {
         "the native C backends currently target x86-64"
     );
     let mut build = compiler();
-    build
-        .flag("-ffreestanding")
-        .flag("-fno-stack-protector")
-        .flag("-mno-red-zone")
-        .flag("-mgeneral-regs-only");
+    build.flag("-ffreestanding");
+    for flag in crate::UNHARDENED {
+        build.flag(flag);
+    }
+    build.flag("-mno-red-zone").flag("-mgeneral-regs-only");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("uefi") {
         // Native Linux code assumes LP64, as on Linux. Cygwin's target keeps
         // that data model while emitting COFF with the UEFI Win64 C ABI;
@@ -58,11 +58,11 @@ pub fn hosted() -> Option<cc::Build> {
 
 /// Clang for every target, unless the caller chose a compiler: the
 /// upstream sources' warning profile (`-Wno-everything`) is clang's, and
-/// GCC holds their headers to Stela's warnings.
+/// GCC holds their headers to Stela's warnings. [`crate::clang`] names it.
 pub fn compiler() -> cc::Build {
     let mut build = cc::Build::new();
     if !selected("CC") {
-        build.compiler("clang");
+        build.compiler(crate::clang());
     }
     build.std("gnu11").warnings_into_errors(true);
     for warning in WARNINGS {

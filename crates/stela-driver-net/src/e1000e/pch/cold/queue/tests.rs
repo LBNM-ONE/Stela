@@ -353,26 +353,163 @@ fn link_reconnect_and_speed_changes_apply_82579_workarounds() {
     assert!(net.carrier());
     assert!(!net.controller.is_poisoned());
 }
+/// Drive a link change through carrier, transmit and receive calls in
+/// turn until it completes, checking that no call waits more than 60 ms of
+/// model time and that, while it runs, the link is down and neither ring
+/// moves. Returns the calls taken.
+fn step_link_change(net: &mut Net, state: &Rc<RefCell<Model>>) -> usize {
+    let mut calls = 0;
+    loop {
+        let before = state.borrow().time;
+        let tails = (
+            state.borrow().mac.get(&TDT).copied(),
+            state.borrow().mac.get(&RDT).copied(),
+        );
+        match calls % 3 {
+            0 => {
+                let up = net.carrier();
+                assert_eq!(up, net.change.is_none());
+            }
+            1 => {
+                let sent = net.transmit(&[0x5a; 60]);
+                if net.change.is_some() {
+                    assert_eq!(sent, Err(LinkError::NoCarrier));
+                }
+            }
+            _ => {
+                let received = net.receive();
+                if net.change.is_some() {
+                    assert_eq!(received, Ok(None));
+                }
+            }
+        }
+        calls += 1;
+        let waited = state.borrow().time - before;
+        assert!(waited <= 60_000, "call {calls} waited {waited} us");
+        if net.change.is_none() {
+            return calls;
+        }
+        assert_eq!(
+            (
+                state.borrow().mac.get(&TDT).copied(),
+                state.borrow().mac.get(&RDT).copied()
+            ),
+            tails
+        );
+    }
+}
+/// A link change waits on the PHY semaphore the Intel ME holds and on a
+/// slow management bus a step at a time, as Linux sleeps in
+/// `e1000_acquire_swflag_ich8lan` and `e1000e_read_phy_reg_mdic`: no call
+/// waits more than 60 ms, and the change ends with the same PHY, EMI and
+/// MAC registers as one that never waited.
 #[test]
-fn unretired_tx_cannot_be_overwritten_and_stall_poison_keeps_owner() {
+fn a_link_change_waits_in_steps_and_ends_as_an_uncontended_one() {
+    let run = |contended: bool| {
+        let mut memory = Memory::new();
+        let (state, _released, controller) = setup_lpt(0x15a0, 0);
+        let mut net = open(controller, &mut memory);
+        assert!(net.carrier());
+        let start = {
+            let mut m = state.borrow_mut();
+            m.mac
+                .insert(super::super::STATUS, LINK_UP | FULL_DUPLEX | (1 << 6));
+            if contended {
+                m.firmware_flag_until = m.time + 90_000;
+                m.mdic_cycle_us = 30_000;
+            }
+            m.time
+        };
+        let calls = step_link_change(&mut net, &state);
+        assert!(net.carrier());
+        assert_eq!(net.failure(), None);
+        assert!(!net.controller.is_poisoned());
+        let m = state.borrow();
+        // The call that completes the change may then send or offer, and
+        // each run has its own ring memory.
+        let mut mac = m.mac.clone();
+        for at in [TDT, RDT, TDBAL, RDBAL] {
+            mac.remove(&at);
+        }
+        (calls, m.time - start, m.phy.clone(), m.emi.clone(), mac)
+    };
+    let (calls, waited, phy, emi, mac) = run(true);
+    let (quick, _, unwaited_phy, unwaited_emi, unwaited_mac) = run(false);
+    assert_eq!(quick, 1);
+    assert!(waited > 500_000, "{waited}");
+    assert!(calls > 10, "{calls}");
+    assert_eq!(phy, unwaited_phy);
+    assert_eq!(emi, unwaited_emi);
+    assert_eq!(mac, unwaited_mac);
+}
+/// A semaphore the Intel ME never gives back fails the link change after
+/// Linux's 100 ms, a step at a time, and keeps the owner; a stop or drop
+/// gives a change under way on a slow management bus two steps, then keeps
+/// the controller it holds.
+#[test]
+fn a_link_change_on_a_held_semaphore_fails_in_steps_and_a_drop_keeps_the_owner() {
     let mut memory = Memory::new();
-    let (state, released, controller) = setup();
+    let (state, _released, controller) = setup_lpt(0x15a0, 0);
+    let mut net = open(controller, &mut memory);
+    assert!(net.carrier());
+    {
+        let mut m = state.borrow_mut();
+        m.mac.insert(super::super::STATUS, LINK_UP | FULL_DUPLEX);
+        m.firmware_flag_until = u64::MAX;
+    }
+    let mut calls = 0;
+    while net.failure().is_none() {
+        let before = state.borrow().time;
+        assert!(!net.carrier());
+        assert!(state.borrow().time - before <= 60_000);
+        calls += 1;
+    }
+    assert!(calls >= 3);
+    assert!(matches!(
+        net.failure(),
+        Some(Error::Phy(super::super::super::Error {
+            primary: super::super::Fault::SemaphoreBusy,
+            ..
+        }))
+    ));
+    assert!(net.controller.is_poisoned());
+    assert!(net.transmit(&[1; 60]).is_err());
+
+    let (state, released, controller) = setup_lpt(0x15a0, 0);
+    let mut net = open(controller, &mut memory);
+    assert!(net.carrier());
+    {
+        let mut m = state.borrow_mut();
+        m.mac.insert(super::super::STATUS, LINK_UP | FULL_DUPLEX);
+        m.mdic_cycle_us = 30_000;
+    }
+    assert!(!net.carrier());
+    assert!(net.change.is_some());
+    assert_eq!(net.shutdown(), Err(Error::LinkChangeUnfinished));
+    let before = state.borrow().time;
+    drop(net);
+    assert!(state.borrow().time - before <= 100_000);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+}
+/// A full ring refuses the frame as busy at once, without waiting, and
+/// overwrites no descriptor the controller still holds; the adapter stays
+/// usable, as Linux's `NETDEV_TX_BUSY` leaves it.
+#[test]
+fn a_full_ring_is_busy_at_once_and_overwrites_nothing() {
+    let mut memory = Memory::new();
+    let (state, _released, controller) = setup();
     let mut net = open(controller, &mut memory);
     for _ in 0..DESCRIPTORS - 1 {
         net.transmit(&[0x55; 60]).unwrap();
     }
     let before = net.transmit.descriptors.bytes().to_vec();
     let time = state.borrow().time;
-    assert!(net.transmit(&[0x99; 60]).is_err());
-    assert_eq!(state.borrow().time - time, 100_000);
+    assert_eq!(net.transmit(&[0x99; 60]), Err(LinkError::Busy));
+    assert_eq!(state.borrow().time, time);
     assert_eq!(net.transmit.descriptors.bytes(), before);
-    assert_eq!(net.failure(), Some(&Error::QueueStalled));
-    let accesses = state.borrow().accesses;
-    assert!(net.receive().is_err());
-    assert!(net.shutdown().is_err());
-    assert_eq!(state.borrow().accesses, accesses);
-    drop(net);
-    assert_eq!(released.load(Ordering::SeqCst), 0);
+    assert_eq!(net.failure(), None);
+    assert!(!net.controller.is_poisoned());
+    assert!(net.receive().is_ok());
 }
 #[test]
 fn uncertain_tx_rx_doorbells_and_stop_drain_never_release_owner() {
@@ -1274,10 +1411,11 @@ fn source_nvm_outcomes_compose_through_every_cold_reset_packet_and_stop() {
                 }
             }
             let result = i219::tests::start(i219::tests::sample_device(family), io, timer);
-            if expected != 0 {
+            // Linux repairs a cleared valid bit in flash and then runs the
+            // adapter; Stela runs it with the image unwritten.
+            if expected == 1 {
                 let kind = match result {
                     Err(Error::Nvm(nvm::Error::Checksum(_))) => 1,
-                    Err(Error::Nvm(nvm::Error::RepairRequired)) => 2,
                     _ => panic!(
                         "accepted invalid family image{family:?} marker{marker} check{check}"
                     ),
@@ -1593,4 +1731,52 @@ fn lost_minimum_is_typed_through_link_and_cannot_resume_device_effects() {
     assert_eq!(released.load(Ordering::SeqCst), 0);
     // NVM's unused clone may drop; PHY keeps the actual shared provider alive.
     assert_eq!(state.borrow().timer_drops.load(Ordering::SeqCst), 1);
+}
+#[test]
+fn an_i219_left_in_ulp_without_a_cable_starts_with_its_link_down() {
+    let mut memory = Memory::new();
+    let (state, _, io, timer) = super::super::spt::tests::fixture_spt();
+    state.borrow_mut().phy_asleep = true;
+    // SAFETY: one synchronous modeled Function/config/PHY/flash.
+    let controller = unsafe { Controller::new_i219(0x15b8, io, timer) }.unwrap();
+    let mut net = open(controller, &mut memory);
+    assert!(!net.carrier());
+    assert_eq!(net.transmit(&[0; 60]), Err(LinkError::NoCarrier));
+    assert!(!net.controller.is_poisoned());
+}
+
+/// An adapter started with no cable runs and reports no link, on every PCH
+/// cohort: it neither fails its start nor poisons itself, a frame meets "no
+/// carrier", and a cable plugged in later brings the link up.
+#[test]
+fn an_adapter_without_a_cable_starts_and_reports_no_link() {
+    let cohorts: [fn() -> Setup; 2] = [setup, || setup_lpt(0x153a, 0)];
+    for (cohort, setup) in cohorts.into_iter().enumerate() {
+        let (state, released, controller) = setup();
+        let status = state.borrow().mac[&super::super::STATUS];
+        {
+            let mut m = state.borrow_mut();
+            m.mac.insert(super::super::STATUS, 0);
+            m.phy.insert((2, 0, 1), 0);
+        }
+        let mut memory = Memory::new();
+        let mut net = open(controller, &mut memory);
+        for _ in 0..3 {
+            assert!(!net.carrier(), "cohort {cohort}");
+        }
+        assert_eq!(net.transmit(&[0; 60]), Err(LinkError::NoCarrier));
+        assert!(!net.controller.is_poisoned());
+        assert!(net.failure().is_none());
+        // The cable goes in.
+        {
+            let mut m = state.borrow_mut();
+            m.mac.insert(super::super::STATUS, status);
+            m.mac.insert(super::super::ICR, LINK_EVENT);
+            m.phy.insert((2, 0, 1), PHY_LINK_READY);
+        }
+        assert!(net.carrier(), "cohort {cohort}");
+        net.shutdown().unwrap();
+        drop(net);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
 }

@@ -20,6 +20,22 @@ pub(super) struct Board<D> {
     /// ([`wake_after`]): a sleeping PE's host core takes an interrupt.
     pub(super) woken: [AtomicU64; Call::ALL.len()],
     pub(super) wake_ticks: [AtomicU64; Call::ALL.len()],
+    /// By [`Call`], the host work releases left ([`Kick::released`]): the
+    /// releases that did it on the calling core, the ticks it took there,
+    /// and the releases that handed it to a sleeping PE instead.
+    pub(super) stepped: [AtomicU64; Call::ALL.len()],
+    pub(super) step_ticks: [AtomicU64; Call::ALL.len()],
+    pub(super) handed: [AtomicU64; Call::ALL.len()],
+    /// By [`Call`], the releases that handed a host interrupt's work
+    /// ([`Kick::signal_due`]) to a sleeping PE.
+    pub(super) signals: [AtomicU64; Call::ALL.len()],
+    /// By [`Call`], the releases that took such work's step themselves
+    /// with no PE asleep ([`Kick::signal_step`]); its ticks count in
+    /// `step_ticks`.
+    pub(super) signal_steps: [AtomicU64; Call::ALL.len()],
+    /// By PE, the ticks of host work its releases did on its core, which a
+    /// device write's settle reports apart ([`super::super::WriteSettled`]).
+    pub(super) released: Box<[AtomicU64]>,
     /// The latest count any machine passed, which every later call sees at
     /// least: the PEs' counters agree only to within their reads.
     pub(super) now: AtomicU64,
@@ -396,14 +412,51 @@ impl<D: Devices> Drop for Held<'_, D> {
         // maintenance broadcast would wait for it. A PE outside it for a
         // guest exit (a storage doorbell's) hands the work to a PE that
         // sleeps waiting for an interrupt, whose idle core does it at its
-        // host service, and goes on with its guest; with none asleep it does
-        // the work itself, as before.
+        // host service, and goes on with its guest; with none asleep, or
+        // when the work only starts commands, which costs less than that
+        // PE's wake, it does the work itself.
         let hub = &self.board.hub;
-        if hub.serves_released(self.pe)
-            && hub.kick.release_due()
-            && !hub.hand_off_service(self.pe)
-            && hub.kick.released()
-        {
+        // At most one piece of host work a release, so no stream of
+        // signals can keep a PE from its guest.
+        let mut acted = false;
+        if hub.serves_released(self.pe) && hub.kick.release_due() {
+            acted = true;
+            if !hub.kick.release_inline() && hub.hand_off_service(self.pe) {
+                self.board.handed[call].fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.step_here(call, || hub.kick.released());
+                self.board.stepped[call].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        // A host interrupt this core held pending while its guest ran (a
+        // host disk's completion signal) goes to a PE that sleeps waiting
+        // for an interrupt, which takes it at its host service, rather than
+        // waiting for this core's slice end. With none asleep, a PE outside
+        // its run loop takes one bounded step of it here, once a signal.
+        if !acted && hub.kick.signal_due() {
+            if hub.hand_off_service(self.pe) {
+                self.board.signals[call].fetch_add(1, Ordering::Relaxed);
+            } else if hub.serves_released(self.pe) {
+                self.step_here(call, || hub.kick.signal_step());
+                self.board.signal_steps[call].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl<D: Devices> Held<'_, D> {
+    /// Do host work on this core after the release, timing it for `call`;
+    /// what completed reaches the home machine at once.
+    fn step_here(&self, call: usize, work: impl FnOnce() -> bool) {
+        let hub = &self.board.hub;
+        let start = hub.ticks();
+        let completed = work();
+        let spent = hub.ticks().wrapping_sub(start);
+        self.board.step_ticks[call].fetch_add(spent, Ordering::Relaxed);
+        if let Some(released) = self.board.released.get(self.pe) {
+            released.fetch_add(spent, Ordering::Relaxed);
+        }
+        if completed {
             self.board.call_home();
         }
     }
@@ -426,6 +479,15 @@ pub struct LockTimes {
     /// Calls that changed another PE's lines, and the ticks waking those PEs.
     pub woken: u64,
     pub wake: u64,
+    /// Releases that did the host's work on the calling core, the ticks it
+    /// took, and releases that handed it to a sleeping PE.
+    pub stepped: u64,
+    pub step: u64,
+    pub handed: u64,
+    /// Releases that handed a host interrupt's work to a sleeping PE.
+    pub signals: u64,
+    /// Releases that took a host interrupt's step themselves.
+    pub signal_steps: u64,
 }
 
 /// The board's devices, shared by every PE's machine.
@@ -437,9 +499,83 @@ pub struct SharedDevices<D> {
     local: Vec<Option<Option<Arc<dyn LocalRegisters>>>>,
     /// [`Devices::passive_registers`], asked for once the board is built.
     passive: Option<Arc<dyn PassiveRegisters>>,
+    /// Plain reads this handle served through the devices
+    /// ([`Devices::plain_epoch`]), which it serves again without them while
+    /// their model's epoch holds.
+    plain: PlainReads,
+    /// The plain read the last scalar read served ([`Devices::take_plain_read`]).
+    last_plain: Option<super::super::PlainRead>,
     /// The ticks this handle's calls waited for the lock since
     /// [`Devices::take_lock_wait`].
     waited: AtomicU64,
+}
+
+/// The plain reads one handle keeps ([`SharedDevices::plain`]).
+const PLAIN_READS: usize = 32;
+
+/// One handle's plain reads: each read's address and size, its model's epoch,
+/// the count the epoch held before the read, and the value it gave.
+#[derive(Default)]
+struct PlainReads {
+    reads: Vec<PlainRead>,
+    /// The entry the next new read replaces once all are taken.
+    next: usize,
+}
+
+struct PlainRead {
+    physical: u64,
+    bytes: u8,
+    epoch: Arc<AtomicU64>,
+    seen: u64,
+    value: u64,
+}
+
+impl PlainReads {
+    /// The plain read of `bytes` at `physical`, while no access that may
+    /// change its model began since.
+    fn read(&self, physical: u64, bytes: u8) -> Option<&PlainRead> {
+        let read = self
+            .reads
+            .iter()
+            .find(|read| read.physical == physical && read.bytes == bytes)?;
+        (read.epoch.load(Ordering::SeqCst) == read.seen).then_some(read)
+    }
+
+    /// Keep `value`, read while `epoch` held `seen`, if it still holds it
+    /// (an access that may change the model began during the read
+    /// otherwise): whether it did.
+    fn keep(
+        &mut self,
+        physical: u64,
+        bytes: u8,
+        epoch: &Arc<AtomicU64>,
+        seen: u64,
+        value: u64,
+    ) -> bool {
+        if epoch.load(Ordering::SeqCst) != seen {
+            return false;
+        }
+        let read = PlainRead {
+            physical,
+            bytes,
+            epoch: Arc::clone(epoch),
+            seen,
+            value,
+        };
+        if let Some(kept) = self
+            .reads
+            .iter_mut()
+            .find(|kept| kept.physical == physical && kept.bytes == bytes)
+        {
+            *kept = read;
+        } else if self.reads.len() < PLAIN_READS {
+            self.reads.push(read);
+        } else {
+            self.reads[self.next] = read;
+            self.next = (self.next + 1) % PLAIN_READS;
+        }
+        true
+    }
 }
 
 impl<D: Devices> SharedDevices<D> {
@@ -478,6 +614,12 @@ impl<D: Devices> SharedDevices<D> {
             longest: Default::default(),
             woken: Default::default(),
             wake_ticks: Default::default(),
+            stepped: Default::default(),
+            step_ticks: Default::default(),
+            handed: Default::default(),
+            signals: Default::default(),
+            signal_steps: Default::default(),
+            released: (0..pes).map(|_| AtomicU64::new(0)).collect(),
             now: AtomicU64::new(0),
             pins: (0..pes).map(|_| AtomicU8::new(UNLATCHED)).collect(),
             dma: AtomicU64::new(u64::MAX),
@@ -497,6 +639,8 @@ impl<D: Devices> SharedDevices<D> {
             home: true,
             local: Vec::new(),
             passive,
+            plain: PlainReads::default(),
+            last_plain: None,
             waited: AtomicU64::new(0),
         }
     }
@@ -508,6 +652,8 @@ impl<D: Devices> SharedDevices<D> {
             home: false,
             local: Vec::new(),
             passive: self.passive.clone(),
+            plain: PlainReads::default(),
+            last_plain: None,
             waited: AtomicU64::new(0),
         }
     }
@@ -596,6 +742,11 @@ impl<D: Devices> SharedDevices<D> {
             held: self.board.held[call].load(Ordering::Relaxed),
             woken: self.board.woken[call].load(Ordering::Relaxed),
             wake: self.board.wake_ticks[call].load(Ordering::Relaxed),
+            stepped: self.board.stepped[call].load(Ordering::Relaxed),
+            step: self.board.step_ticks[call].load(Ordering::Relaxed),
+            handed: self.board.handed[call].load(Ordering::Relaxed),
+            signals: self.board.signals[call].load(Ordering::Relaxed),
+            signal_steps: self.board.signal_steps[call].load(Ordering::Relaxed),
             longest: self.board.longest[call].swap(0, Ordering::Relaxed),
         })
     }
@@ -721,9 +872,58 @@ impl<D: Devices> Devices for SharedDevices<D> {
         if let Some(value) = self.passive.as_ref().and_then(|p| p.read(physical, bytes)) {
             return ScalarRead::Served(Ok(value));
         }
-        self.changing(Call::Access, cpu, now, |devices, now| {
-            devices.read_scalar(cpu, physical, bytes, now)
-        })
+        self.last_plain = None;
+        // A device deadline that passed may change what a model reads.
+        let until = self.board.time.load(Ordering::Acquire);
+        if now < until
+            && let Some(read) = self.plain.read(physical, bytes)
+        {
+            let value = read.value;
+            self.last_plain = Some(super::super::PlainRead {
+                epoch: Arc::clone(&read.epoch),
+                seen: read.seen,
+                value,
+                until,
+            });
+            return ScalarRead::Served(Ok(value));
+        }
+        let (read, plain, next, until) = self.changing(Call::Access, cpu, now, |devices, now| {
+            let plain = devices.plain_epoch(physical, bytes);
+            let read = devices.read_scalar(cpu, physical, bytes, now);
+            // A read that changed its model can leave the register plain,
+            // such as an event register whose last event the read took: a
+            // read now changes nothing and gives what every read gives
+            // until the model changes, which moves the epoch under this
+            // lock before any effect of the change is seen. Read it once
+            // more, under the same lock, for the next read to be served.
+            let next =
+                match (&read, &plain) {
+                    (ScalarRead::Served(Ok(_)), None) => devices
+                        .plain_epoch(physical, bytes)
+                        .and_then(|(epoch, seen)| {
+                            match devices.read_scalar(cpu, physical, bytes, now) {
+                                ScalarRead::Served(Ok(value)) => Some((epoch, seen, value)),
+                                _ => None,
+                            }
+                        }),
+                    _ => None,
+                };
+            (read, plain, next, self.board.time.load(Ordering::Acquire))
+        });
+        if let (ScalarRead::Served(Ok(value)), Some((epoch, seen))) = (&read, plain)
+            && self.plain.keep(physical, bytes, &epoch, seen, *value)
+        {
+            self.last_plain = Some(super::super::PlainRead {
+                epoch,
+                seen,
+                value: *value,
+                until,
+            });
+        }
+        if let Some((epoch, seen, value)) = next {
+            self.plain.keep(physical, bytes, &epoch, seen, value);
+        }
+        read
     }
     fn requires_canonical_read(&self, cpu: usize, physical: u64, shape: DeviceReadShape) -> bool {
         self.with(|devices| devices.requires_canonical_read(cpu, physical, shape))
@@ -831,6 +1031,8 @@ impl<D: Devices> Devices for SharedDevices<D> {
         now: u64,
         mut processors: super::super::ProcessorWrite<'_>,
     ) -> Option<super::super::WriteSettled> {
+        let released = self.board.released.get(cpu);
+        let before = released.map_or(0, |released| released.load(Ordering::Relaxed));
         let (outcome, copies) = self.changing(Call::Access, cpu, now, |devices, now| {
             if devices.requires_canonical_write(cpu, physical, bytes) {
                 return (None, Vec::new());
@@ -846,6 +1048,10 @@ impl<D: Devices> Devices for SharedDevices<D> {
             (outcome, copies)
         });
         let mut outcome = outcome?;
+        outcome.unlocked_at = processors.native_host().profile_ticks();
+        outcome.released = released.map_or(0, |released| {
+            released.load(Ordering::Relaxed).wrapping_sub(before)
+        });
         if !copies.is_empty()
             && let Some(settled) = &mut outcome.settled
         {
@@ -1092,6 +1298,12 @@ impl<D: Devices> Devices for SharedDevices<D> {
     }
     fn device_name(&self, physical: u64) -> Option<&'static str> {
         self.with(|devices| devices.device_name(physical))
+    }
+    fn register_name(&self, physical: u64) -> Option<&'static str> {
+        self.with(|devices| devices.register_name(physical))
+    }
+    fn take_plain_read(&mut self) -> Option<super::super::PlainRead> {
+        self.last_plain.take()
     }
     fn take_lock_wait(&mut self) -> u64 {
         self.waited.swap(0, Ordering::Relaxed)

@@ -197,7 +197,7 @@ fn exact_initial_i219_cohort_uses_integrated_nvm_and_forced_ulp_exit() {
 }
 #[test]
 fn foreign_required_flush_and_live_config_failures_refuse_without_foreign_dma() {
-    for failure in 0..4 {
+    for failure in 0..3 {
         let (state, released, io, timer) = fixture_spt();
         {
             let mut m = state.borrow_mut();
@@ -212,23 +212,31 @@ fn foreign_required_flush_and_live_config_failures_refuse_without_foreign_dma() 
                 2 => {
                     m.fail_at = Some(5);
                 }
-                3 => {
-                    m.power_stuck = true;
-                }
                 _ => unreachable!(),
             }
         }
         assert!(start_spt(0x156f, io, timer).is_err());
         let m = state.borrow();
-        if failure < 3 {
-            assert!(
-                !m.operations
-                    .iter()
-                    .any(|o| o[0] == 1 && matches!(o[1], super::super::CTRL | 0x3818))
-            );
-        }
+        assert!(
+            !m.operations
+                .iter()
+                .any(|o| o[0] == 1 && matches!(o[1], super::super::CTRL | 0x3818))
+        );
         assert_eq!(released.load(Ordering::SeqCst), 0);
     }
+}
+
+/// `e1000_init_phy_workarounds_pchlan`: a ULP exit whose power cycle never
+/// reports done is noted, as Linux logs "Failed to disable ULP", and the
+/// start goes on to the PHY access checks, which settle it.
+#[test]
+fn a_ulp_exit_that_fails_is_noted_and_the_start_goes_on() {
+    let (state, _, io, timer) = fixture_spt();
+    state.borrow_mut().power_stuck = true;
+    let controller = start_spt(0x156f, io, timer).unwrap();
+    assert!(controller.ulp_exit_failed());
+    assert!(!controller.is_poisoned());
+    drop(controller);
 }
 #[test]
 fn ulp_mode_switch_recovers_only_the_specific_mdi_transition_and_verifies_state() {
@@ -280,12 +288,7 @@ fn ulp_mode_switch_recovers_only_the_specific_mdi_transition_and_verifies_state(
     ] {
         assert!(!smbus_response_error(Fault::MdicResponse(bad)));
     }
-    for bad in [
-        Fault::Access,
-        Fault::Removed,
-        Fault::OutsideBar,
-        Fault::ResetBlocked,
-    ] {
+    for bad in [Fault::Access, Fault::Removed, Fault::OutsideBar] {
         assert!(!smbus_read_unavailable(bad));
     }
 }
@@ -329,30 +332,23 @@ fn every_spt_cold_access_failure_keeps_owner_and_prevents_packet_dma() {
     }
 }
 #[test]
-fn spt_firmware_reset_phy_nvm_and_readiness_failures_never_enable_packet_dma() {
-    for failure in 0..7 {
+fn spt_phy_nvm_and_readiness_failures_never_enable_packet_dma() {
+    // An adapter the Intel ME manages, or whose PHY reset it blocks, starts
+    // as Linux starts it: see `an_i219_the_me_manages_leaves_ulp_through_the_me`.
+    for failure in 0..5 {
         let (state, released, io, timer) = fixture_spt();
         {
             let mut m = state.borrow_mut();
             match failure {
                 0 => {
-                    m.mac.insert(
-                        super::super::super::FWSM,
-                        super::super::super::FW_VALID | super::super::super::RESET_PERMITTED,
-                    );
-                }
-                1 => {
-                    m.mac.insert(super::super::super::FWSM, 0);
-                }
-                2 => {
                     m.phy.insert((2, 0, 3), 0x93);
                 }
-                3 => {
+                1 => {
                     m.words[63] ^= 1;
                 }
-                4 => m.init_missing = true,
-                5 => m.reset_missing = true,
-                6 => m.reset_stuck = true,
+                2 => m.init_missing = true,
+                3 => m.reset_missing = true,
+                4 => m.reset_stuck = true,
                 _ => unreachable!(),
             }
         }
@@ -362,4 +358,116 @@ fn spt_firmware_reset_phy_nvm_and_readiness_failures_never_enable_packet_dma() {
             && matches!(o[1], super::super::RCTL | super::super::TCTL)
             && o[2] & 2 != 0));
     }
+}
+#[test]
+fn a_phy_left_in_ulp_answers_after_the_lanphypc_toggle() {
+    // 15b8 is the I219-V of the SPT table; 156f the initial SPT cohort.
+    for device in [0x15b8, 0x156f] {
+        let (state, released, io, timer) = fixture_spt();
+        state.borrow_mut().phy_asleep = true;
+        // SAFETY: one synchronous modeled Function/config/PHY/flash.
+        let controller = unsafe { Controller::new_i219(device, io, timer) }.unwrap();
+        assert_eq!(controller.identity().id, 0x0154_00a0);
+        {
+            let m = state.borrow();
+            let toggle = m
+                .operations
+                .iter()
+                .position(|o| {
+                    o[0] == 1 && o[1] == super::super::CTRL && o[2] & LANPHYPC_OVERRIDE != 0
+                })
+                .unwrap();
+            let first_phy = m
+                .operations
+                .iter()
+                .position(|o| o[0] == 1 && o[1] == super::super::super::MDIC)
+                .unwrap();
+            assert!(toggle < first_phy, "a PHY cycle came before LANPHYPC");
+            assert_eq!(m.phy[&(1, 779, 16)] & ULP_CLEAR, 0);
+            assert_eq!(m.mac[&CTRL_EXT] & FORCE_SMBUS, 0);
+        }
+        assert!(!controller.is_poisoned());
+        drop(controller);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// A PHY reset the ME blocks is left out with its configuration wait and
+/// post-reset steps, and the adapter starts. The check that the ME blocks
+/// a reset right after one runs only after a reset that ran: the ME is
+/// waited for 300 ms (31 reads) once per reset left out, two PHY resets
+/// and the PHY part of the global reset, and never for a reset that did
+/// not happen (the old order spent a fifth wait there).
+#[test]
+fn a_blocked_phy_reset_spends_no_wait_on_the_after_reset_check() {
+    let (state, _, io, timer) = fixture_spt();
+    state.borrow_mut().mac.insert(super::super::super::FWSM, 0);
+    let controller = start_spt(0x1570, io, timer).unwrap();
+    let fwsm_reads = state
+        .borrow()
+        .operations
+        .iter()
+        .filter(|o| o[0] == 0 && o[1] == super::super::super::FWSM)
+        .count();
+    // A fourth wait is the OEM bits' autonegotiation restart after the
+    // global reset; the two single reads are `managed`'s, at the start and
+    // in the post-reset steps.
+    assert_eq!(fwsm_reads, 4 * 31 + 2);
+    drop(controller);
+}
+
+/// An I219 the Intel ME manages: the ME takes its PHY out of ULP on the
+/// host's H2ME request, so no LANPHYPC toggle runs, and the adapter starts.
+#[test]
+fn an_i219_the_me_manages_leaves_ulp_through_the_me() {
+    let (state, released, io, timer) = fixture_spt();
+    {
+        let mut m = state.borrow_mut();
+        m.phy_asleep = true;
+        m.mac.insert(
+            super::super::super::FWSM,
+            super::super::super::FW_VALID
+                | super::super::super::RESET_PERMITTED
+                | super::super::ULP_CONFIG_DONE,
+        );
+    }
+    // SAFETY: one synchronous modeled Function/config/PHY/flash.
+    let controller = unsafe { Controller::new_i219(0x15b8, io, timer) }.unwrap();
+    {
+        let m = state.borrow();
+        assert!(
+            !m.operations
+                .iter()
+                .any(|o| o[0] == 1 && o[1] == super::super::CTRL && o[2] & LANPHYPC_OVERRIDE != 0),
+            "the host toggled LANPHYPC under a managing ME"
+        );
+        assert_eq!(
+            m.mac[&super::super::H2ME] & super::super::H2ME_ENFORCE_SETTINGS,
+            0
+        );
+    }
+    assert!(!controller.is_poisoned());
+    drop(controller);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+
+    let (state, released, io, timer) = fixture_spt();
+    {
+        let mut m = state.borrow_mut();
+        m.me_stuck = true;
+        m.mac.insert(
+            super::super::super::FWSM,
+            super::super::super::FW_VALID
+                | super::super::super::RESET_PERMITTED
+                | super::super::ULP_CONFIG_DONE,
+        );
+    }
+    // An ME that never finishes the ULP exit is noted, as Linux logs
+    // "Failed to disable ULP", and the start goes on to the PHY access
+    // checks, which find this PHY answering.
+    // SAFETY: as above.
+    let controller = unsafe { Controller::new_i219(0x15b8, io, timer) }.unwrap();
+    assert!(controller.ulp_exit_failed());
+    assert!(!controller.is_poisoned());
+    drop(controller);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
 }

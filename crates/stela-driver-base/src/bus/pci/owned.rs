@@ -86,6 +86,18 @@ impl OwnedConfig {
         unsafe { self.storage.region_mut().release_bus_forwarding_seal() }
     }
 
+    /// Assert or release Secondary Bus Reset on this routing-sealed bridge,
+    /// the sealed Bridge Control word otherwise unchanged.
+    ///
+    /// # Safety
+    /// The caller owns every function below the bridge, each stopped or
+    /// contained, restores or keeps refusing each after the reset, and
+    /// releases the reset it asserted.
+    pub unsafe fn set_secondary_bus_reset(&mut self, asserted: bool) -> Result<(), ConfigError> {
+        // SAFETY: forwarded.
+        unsafe { self.storage.region_mut().set_secondary_bus_reset(asserted) }
+    }
+
     pub fn prepare(grant: DriverGrant) -> PreparedConfig<DriverGrant> {
         envelope::prepare(grant)
     }
@@ -263,6 +275,18 @@ impl UnpublishedConfig {
     }
     pub fn try_write32(&mut self, offset: u16, value: u32) -> Result<(), ConfigError> {
         self.storage.region_mut().try_write32(offset, value)
+    }
+}
+impl super::requester::containment::MasterSeal for UnpublishedConfig {
+    fn seal_bus_master(&mut self) -> Result<(), ConfigError> {
+        self.storage.region_mut().seal_bus_master()
+    }
+    fn seal_hardwired_bus_master(&mut self, disabled: u16) -> Result<(), ConfigError> {
+        if super::requester::containment::hardwired_master(self, disabled)? {
+            self.storage.region_mut().seal_hardwired_bus_master()
+        } else {
+            self.storage.region_mut().seal_bus_master()
+        }
     }
 }
 impl ConfigSpace for UnpublishedConfig {

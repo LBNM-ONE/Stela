@@ -60,6 +60,11 @@ pub(super) struct Medium {
     /// It names the IPSW on Apple's servers instead of holding it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(super) remote: bool,
+    /// Pieces a repair read and found damaged ([`Medium::damaged_pieces`]):
+    /// written again like missing ones, and removed only once nothing can
+    /// refuse the repair. Never recorded.
+    #[serde(skip)]
+    pub(super) damaged: Vec<String>,
 }
 
 impl Medium {
@@ -161,6 +166,12 @@ impl Medium {
                 Err(_) => problems.push(format!("{} is missing", path.display())),
             }
         }
+        for piece in &self.damaged {
+            problems.push(format!(
+                "{} differs from its recorded SHA-256",
+                directory.join(piece).display()
+            ));
+        }
         for file in [PIECE_HASHES_FILE, BLOCK_HASHES_FILE] {
             if !directory.join(file).is_file() {
                 problems.push(format!("{} is missing", directory.join(file).display()));
@@ -168,6 +179,82 @@ impl Medium {
         }
         problems
     }
+}
+
+impl Medium {
+    /// The pieces whose bytes differ from the SHA-256 `payload.json`
+    /// records for them, each read whole: what a block check during an
+    /// install would refuse. Missing or short pieces are [`Medium::problems`]
+    /// and are named here too.
+    pub(super) fn damaged_pieces(&self) -> Result<Vec<String>> {
+        let directory = self.directory();
+        let manifest = fs::read(directory.join(MANIFEST_FILE))
+            .with_context(|| format!("reading {}", directory.join(MANIFEST_FILE).display()))?;
+        let parsed = stela_formats::payload::PayloadManifest::parse(&manifest)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", directory.display()))?;
+        let Layout::Pieces { pieces, .. } = &parsed.layout else {
+            return Ok(Vec::new());
+        };
+        let total = pieces.iter().map(|piece| piece.bytes).sum();
+        let progress =
+            crate::progress::Phase::bytes("Checking every piece of the install medium", total);
+        let mut damaged = Vec::new();
+        for (index, piece) in pieces.iter().enumerate() {
+            let path = directory.join(piece_name(index));
+            let intact = fs::metadata(&path).is_ok_and(|m| m.len() == piece.bytes)
+                && hash_file(&path, piece.bytes, &progress).is_ok_and(|sha| sha == piece.sha256);
+            if !intact {
+                damaged.push(piece_name(index));
+            }
+        }
+        progress.finish();
+        Ok(damaged)
+    }
+}
+
+/// The pieces of the install medium the USB's boot log says failed their
+/// block check during an install (`DAMAGED_LOG_LINE`, `ipsw.003 block 12`),
+/// in lines written after byte `after` of the log's stream: the log's head
+/// when a repair last checked the medium ([`log_head`]). Each piece once.
+pub(super) fn reported_damage(esp: &Path, after: u64) -> Vec<String> {
+    use stela_formats::payload::pieces::DAMAGED_LOG_LINE;
+    let Some(log) = fs::read(esp.join(efi::BOOT_LOG))
+        .ok()
+        .and_then(|region| stela_runtime::pc::boot_log::read(&region).ok())
+    else {
+        return Vec::new();
+    };
+    let start = log.head - log.stream.len() as u64;
+    let mut found: Vec<String> = Vec::new();
+    let mut offset = 0u64;
+    for line in log.stream.split(|&byte| byte == b'\n') {
+        offset += line.len() as u64 + 1;
+        if start + offset <= after {
+            continue;
+        }
+        let text = String::from_utf8_lossy(line);
+        let Some((_, block)) = text.split_once(DAMAGED_LOG_LINE) else {
+            continue;
+        };
+        let piece = block
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if !piece.is_empty() && !found.contains(&piece) {
+            found.push(piece);
+        }
+    }
+    found
+}
+
+/// The end of the USB's boot log stream: what a check of the medium now
+/// has seen ([`reported_damage`]). Zero without a log.
+pub(super) fn log_head(esp: &Path) -> u64 {
+    fs::read(esp.join(efi::BOOT_LOG))
+        .ok()
+        .and_then(|region| stela_runtime::pc::boot_log::read(&region).ok())
+        .map_or(0, |log| log.head)
 }
 
 /// `stela/install/<build>` on `volume`.
@@ -256,17 +343,25 @@ pub(super) fn needed_bytes(volume: &Path, build: &str, ipsw_bytes: u64, piece_by
 }
 
 /// The bytes of the IPSW's pieces not on `volume` at their size: what a
-/// download onto it fetches, the intact pieces being kept.
-pub(super) fn missing_bytes(volume: &Path, build: &str, ipsw_bytes: u64, piece_bytes: u64) -> u64 {
+/// download onto it fetches, the intact pieces being kept. The `damaged`
+/// pieces ([`Medium::damaged`]) count as missing.
+pub(super) fn missing_bytes(
+    volume: &Path,
+    build: &str,
+    ipsw_bytes: u64,
+    piece_bytes: u64,
+    damaged: &[String],
+) -> u64 {
     let directory = directory(volume, build);
     piece_sizes(ipsw_bytes, piece_bytes)
         .into_iter()
         .enumerate()
         .filter(|(index, size)| {
-            fs::metadata(directory.join(piece_name(*index)))
-                .map(|m| m.len())
-                .ok()
-                != Some(*size)
+            damaged.contains(&piece_name(*index))
+                || fs::metadata(directory.join(piece_name(*index)))
+                    .map(|m| m.len())
+                    .ok()
+                    != Some(*size)
         })
         .map(|(_, size)| size)
         .sum()
@@ -413,7 +508,7 @@ fn read_piece(
     })?;
     if let Some(out) = out {
         out.sync_all()?;
-        crate::progress::drop_cached(&out);
+        crate::progress::drop_cached(&out)?;
     }
     Ok(())
 }
@@ -739,6 +834,7 @@ pub(super) mod tests {
                 partition_guid: "G".into(),
                 manifest_sha256: first.manifest_sha256.clone(),
                 remote: false,
+                damaged: Vec::new(),
             }
             .problems()
             .is_empty()
@@ -845,6 +941,7 @@ pub(super) mod tests {
             partition_guid: "G".into(),
             manifest_sha256: String::new(),
             remote: false,
+            damaged: Vec::new(),
         };
         assert_eq!(medium.problems().len(), 1);
     }
@@ -877,6 +974,7 @@ pub(super) mod tests {
             partition_guid: String::new(),
             manifest_sha256: write_remote(&volume, remote).unwrap(),
             remote: true,
+            damaged: Vec::new(),
         };
         assert!(medium.problems().is_empty(), "{:?}", medium.problems());
         let mut names: Vec<_> = fs::read_dir(medium.directory())
@@ -901,6 +999,7 @@ pub(super) mod tests {
             partition_guid: String::new(),
             manifest_sha256: String::new(),
             remote: false,
+            damaged: Vec::new(),
         };
         assert_eq!(
             medium("26A434").removable_directory().unwrap(),

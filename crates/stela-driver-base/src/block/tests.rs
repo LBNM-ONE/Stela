@@ -22,6 +22,8 @@ struct Delayed {
     /// and the finishes that reached the device.
     together: bool,
     finishes: Rc<Cell<usize>>,
+    /// The commits that reached the device ([`BlockDevice::commit`]).
+    commits: Rc<Cell<usize>>,
 }
 
 type Probes = (
@@ -45,6 +47,7 @@ impl Delayed {
             last_read_address: Default::default(),
             together: false,
             finishes: Default::default(),
+            commits: Default::default(),
         };
         (delayed, probes)
     }
@@ -94,6 +97,9 @@ impl BlockDevice for Delayed {
         self.next += 1;
         self.started.push_back((tag, command));
         Ok(tag)
+    }
+    fn commit(&mut self) {
+        self.commits.set(self.commits.get() + 1);
     }
     fn finish(&mut self, tag: u32) -> Option<Finished> {
         self.finishes.set(self.finishes.get() + 1);
@@ -959,4 +965,127 @@ fn a_disk_that_reaps_one_at_a_time_is_asked_for_each() {
     assert_eq!(finishes.get(), 3);
     assert_eq!(window.finished(tickets[1]), Some(Ok(None)));
     assert_eq!(window.finished(tickets[2]), Some(Ok(None)));
+}
+
+/// A window's starts with more to follow reach the device in order and tell
+/// it once, at the commit; a plain start and a look tell it at once.
+#[test]
+fn a_window_tells_its_device_of_a_batch_once() {
+    let (delayed, (released, _, given)) = Delayed::new(RamDisk::new("batch", 8, 512), 4);
+    let commits = delayed.commits.clone();
+    let mut window = Shared::new(Box::new(delayed)).whole();
+    let first = window.start_more(write(0, 1)).unwrap();
+    let second = window.start_more(write(1, 2)).unwrap();
+    assert_eq!(given.borrow().as_slice(), &[write(0, 1), write(1, 2)]);
+    assert_eq!(commits.get(), 0);
+    window.commit();
+    assert_eq!(commits.get(), 1);
+    window.start(write(2, 3)).unwrap();
+    assert_eq!(commits.get(), 2);
+    released.set(3);
+    assert_eq!(window.finish(first), Some(Ok(None)));
+    assert_eq!(window.finish(second), Some(Ok(None)));
+}
+
+/// A merged read's first request keeps the device's buffer, cut to its
+/// part; each later request gets its own part, in order.
+#[test]
+fn a_merged_reads_first_part_keeps_the_devices_buffer() {
+    let mut ram = RamDisk::new("merged", 16, 512);
+    let data: Vec<u8> = (0..1536).map(|byte| (byte % 251) as u8).collect();
+    ram.write(4, &data).unwrap();
+    let (delayed, (released, _, given)) = Delayed::new(ram, 1);
+    let address = delayed.last_read_address.clone();
+    let mut window = Shared::new(Box::new(delayed)).whole();
+    // The first command holds the device; the three reads wait and join.
+    let first = window.start(write(0, 1)).unwrap();
+    let reads: Vec<u32> = [(4, 512), (5, 512), (6, 512)]
+        .into_iter()
+        .map(|(lba, bytes)| window.start(Command::Read { lba, bytes }).unwrap())
+        .collect();
+    released.set(usize::MAX);
+    assert_eq!(window.finish(first), Some(Ok(None)));
+    let parts: Vec<Vec<u8>> = reads
+        .iter()
+        .map(|&read| window.finish(read).unwrap().unwrap().unwrap())
+        .collect();
+    assert_eq!(
+        given.borrow().last(),
+        Some(&Command::Read {
+            lba: 4,
+            bytes: 1536
+        })
+    );
+    for (index, part) in parts.iter().enumerate() {
+        assert_eq!(part.as_slice(), &data[index * 512..][..512]);
+    }
+    assert_eq!(parts[0].as_ptr() as usize, address.get());
+}
+
+/// While another owner holds the disk, which may itself wait long for a
+/// lock its device needs, a window's looks come back later instead of
+/// waiting: no result, no room, a possible completion, and a commit that
+/// the next call taking the disk makes.
+#[test]
+fn a_window_never_waits_to_look_at_a_disk_another_owner_holds() {
+    let (delayed, (released, _, _)) = Delayed::new(RamDisk::new("held", 8, 512), 4);
+    let commits = delayed.commits.clone();
+    let disk = Shared::new(Box::new(delayed));
+    let mut window = disk.whole();
+    let tag = window.start_more(write(0, 1)).unwrap();
+    released.set(1);
+    {
+        let _held = disk.lock();
+        assert!(disk.try_lock().is_none());
+        window.commit();
+        assert_eq!(commits.get(), 0);
+        assert!(!window.room());
+        assert!(window.posted());
+        assert_eq!(window.finished(tag), None);
+        assert_eq!(window.finish(tag), None);
+    }
+    assert!(window.room());
+    assert_eq!(window.finish(tag), Some(Ok(None)));
+    assert_eq!(commits.get(), 1);
+    // A plain start tells the device of a put-off commit too.
+    let tag = window.start_more(write(1, 2)).unwrap();
+    {
+        let _held = disk.lock();
+        window.commit();
+    }
+    window.start(write(2, 3)).unwrap();
+    assert_eq!(commits.get(), 2);
+    released.set(2);
+    assert_eq!(window.finish(tag), Some(Ok(None)));
+}
+
+/// Another owner may take the disk between a window's `room` and its
+/// start: the start waits for it instead of refusing, as its caller found
+/// room (a NOR store failed on this, and the machine stopped).
+#[test]
+fn a_window_start_waits_for_an_owner_that_took_the_disk_after_room() {
+    extern crate std;
+    use std::{sync::mpsc, thread, time::Duration};
+    let disk = Shared::new(Box::new(RamDisk::new("raced", 8, 512)));
+    let mut window = disk.whole();
+    assert!(window.room());
+    let (taken, wait) = mpsc::channel();
+    let other = disk.clone();
+    let owner = thread::spawn(move || {
+        let _held = other.lock();
+        taken.send(()).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+    wait.recv().unwrap();
+    assert!(!window.room());
+    let tag = window.start(write(0, 1)).unwrap();
+    owner.join().unwrap();
+    let mut result = None;
+    for _ in 0..1000 {
+        result = window.finish(tag);
+        if result.is_some() {
+            break;
+        }
+    }
+    assert_eq!(result, Some(Ok(None)));
 }

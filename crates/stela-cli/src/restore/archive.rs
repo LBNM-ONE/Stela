@@ -24,6 +24,12 @@ pub struct MemberDigest {
     pub im4p_description: Option<String>,
 }
 
+/// The BuildManifest of the IPSW in `archive`, a local file or one read by
+/// ranges.
+pub fn build_manifest<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<Vec<u8>> {
+    read_limited(archive, "BuildManifest.plist", MANIFEST_LIMIT)
+}
+
 fn read_limited<R: Read + Seek>(
     archive: &mut zip::ZipArchive<R>,
     name: &str,
@@ -105,7 +111,7 @@ pub fn manifest(
     hash_members: bool,
 ) -> Result<super::manifest::RestoreManifest> {
     let mut archive = zip::ZipArchive::new(File::open(image)?)?;
-    let bytes = read_limited(&mut archive, "BuildManifest.plist", MANIFEST_LIMIT)?;
+    let bytes = build_manifest(&mut archive)?;
     let mut report = super::manifest::inspect(&bytes, model)?;
     if hash_members {
         let mut digests = BTreeMap::new();
@@ -167,7 +173,7 @@ pub fn extract(image: &Path, name: &str, output: &Path, maximum: u64) -> Result<
     pending.as_file().sync_all()?;
     let receipt = serde_json::json!({"schema_version":1,"archive":image.canonicalize()?.display().to_string(),"member":name,"bytes":bytes,"sha256":hex::encode(hash.finalize()),"zip_crc32_checked":true,
         "note":"Extraction and ZIP CRC only; see the archive download receipt for source-image verification. Manifest digests are not inferred or reinterpreted."});
-    pending.persist_noclobber(output).map_err(|e| e.error)?;
+    crate::efi::persist_new(pending, output)?;
     stela_engine::write_json(&receipt_path, &receipt)?;
     Ok(receipt)
 }

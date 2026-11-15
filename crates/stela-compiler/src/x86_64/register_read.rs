@@ -56,8 +56,8 @@
 //! into an energy accumulator's reading.
 //!
 //! A [`send_event_thunk`] sets the event register byte the cell's `value`
-//! names, and an [`event_wait_thunk`] consumes a set one; both clobber RCX
-//! and RDX.
+//! names, and an [`event_wait_thunk`] consumes a set one, spinning briefly
+//! for one another PE sets; both clobber RCX and RDX.
 //!
 //! A [`cycle_counter_thunk`] computes a cycle counter at the count where
 //! its cell went stale but the read stays plain, and opens the cell on it;
@@ -561,20 +561,391 @@ pub fn send_event_thunk(pc: GuestAddress, cell: Place) -> Thunk {
     finish(code, miss, pc)
 }
 
-/// The thunk completing WFE at `pc` while the cell at `cell` is open and the
-/// event register, the byte the cell's `value` points at, is set: it clears
-/// the register in one exchange, as another PE may set it, and completes;
-/// else it exits at `pc` for the engine to wait. It also clobbers RCX and
-/// RDX.
-pub fn event_wait_thunk(pc: GuestAddress, cell: Place) -> Thunk {
-    let (mut code, miss) = open(cell);
+/// How long an [`event_wait_thunk`] spins for the event register before it
+/// exits: 48 counts of the 24 MHz system count, 2 us. Another PE that sets
+/// the register within it saves the waiting PE an exit and a wait in the
+/// engine; a spin that misses costs this much host time.
+pub const WFE_SPIN_COUNTS: u8 = 48;
+
+/// The most turns one spin takes whatever the count does: a held count
+/// (`CountState::ceiling`) stops it, and nothing may hold a PE. A turn
+/// takes far more than 2 us / 1024 on every host, so the count ends a spin
+/// first.
+const WFE_SPIN_TURNS: i32 = 1024;
+
+/// What [`event_wait_thunk`]s count of their spins, and the spin in
+/// progress, which the engine takes when native code returns.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventSpin {
+    /// Spins that found the event register set: the WFE completed.
+    pub completed: u64,
+    /// Spins that ended otherwise, and exited.
+    pub missed: u64,
+    /// WFEs that could spin but for an exclusive monitor, and exited.
+    pub held: u64,
+    /// The system counts spent in spins.
+    pub counts: u64,
+    /// The count the spin in progress began at, and its turns left.
+    pub start: u64,
+    pub turns: u64,
+}
+
+const SPIN_COMPLETED: i8 = core::mem::offset_of!(EventSpin, completed) as i8;
+const SPIN_MISSED: i8 = core::mem::offset_of!(EventSpin, missed) as i8;
+const SPIN_HELD: i8 = core::mem::offset_of!(EventSpin, held) as i8;
+const SPIN_COUNTS: i8 = core::mem::offset_of!(EventSpin, counts) as i8;
+const SPIN_START: i8 = core::mem::offset_of!(EventSpin, start) as i8;
+const SPIN_TURNS: i8 = core::mem::offset_of!(EventSpin, turns) as i8;
+const INTERRUPT_EPOCH: i8 =
+    core::mem::offset_of!(super::chain::ChainControl, interrupt_epoch) as i8;
+const OBSERVED_INTERRUPT_EPOCH: i8 =
+    core::mem::offset_of!(super::chain::ChainControl, observed_interrupt_epoch) as i8;
+
+/// Where an [`event_wait_thunk`] finds the event register and what ends its
+/// spin: `events` a cell whose `value` is the register's byte; `waits` a
+/// cell open where a WFE that finds the register clear waits rather than
+/// traps and another PE runs meanwhile to set it; `monitor` the word nonzero
+/// while the engine holds an exclusive monitor; the control
+/// ([`super::chain::ChainControl`]), whose interrupt epoch moves when
+/// anything is posted for the PE; the count before which time alone changes
+/// no interrupt line ([`crate::x86_64::transition::Places::lines_until`]),
+/// the count reader, and the spin's counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventWaitPlaces {
+    pub events: Place,
+    pub waits: Place,
+    pub monitor: Place,
+    pub control: Place,
+    pub lines_until: Place,
+    pub count: Place,
+    pub spin: Place,
+}
+
+/// The thunk completing WFE at `pc` while the `events` cell is open and the
+/// event register is set: it clears the register in one exchange, as
+/// another PE may set it, and completes. With the register clear, where the
+/// WFE would wait (`waits` open), it spins for up to [`WFE_SPIN_COUNTS`]
+/// for the register and completes as soon as it finds it set. It spins only
+/// while nothing else would wake the WFE, all of which the engine's wait
+/// sees: no interrupt was waiting at entry ([`GuestState::pending`]),
+/// nothing was posted for the PE since the engine last looked (a device
+/// line, mail with another PE's SEV, a host call or stop: the interrupt
+/// epoch), and time changes no line (the count below `lines_until`), each
+/// looked at again every turn. Nor does it spin with an exclusive monitor
+/// held, in the frame or the engine, as another PE's store that clears it
+/// sends the event without setting this register. Else, and once the spin
+/// ends without the register, it exits at `pc` for the engine to wait. An
+/// event stream edge within a spin is the engine's to see as it waits: the
+/// spin delays it no more than a host would. It also clobbers RCX and RDX.
+pub fn event_wait_thunk(pc: GuestAddress, places: EventWaitPlaces) -> Thunk {
+    use Gpr::{Rax, Rcx, Rdx};
+    use Size::{Byte, Dword, Qword};
+    let spin = |offset| Mem::base_disp8(Rcx, offset);
+    let (mut code, closed) = open(places.events);
     let mut asm = Asm::new(&mut code);
-    asm.mov_load(Size::Qword, Gpr::Rcx, Mem::base_disp8(Gpr::Rax, VALUE));
-    asm.alu(Alu::Xor, Size::Dword, Gpr::Rdx, Gpr::Rdx);
-    asm.xchg(Size::Byte, Mem::base(Gpr::Rcx, 0), Gpr::Rdx);
-    asm.test(Size::Byte, Gpr::Rdx, Gpr::Rdx);
+    asm.mov_load(Qword, Rcx, Mem::base_disp8(Rax, VALUE));
+    asm.alu(Alu::Xor, Dword, Rdx, Rdx);
+    asm.xchg(Byte, Mem::base(Rcx, 0), Rdx);
+    asm.test(Byte, Rdx, Rdx);
+    let set = asm.jcc(Cond::Ne);
+    // Whether the WFE may spin.
+    asm.place(Rax, places.waits);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), 0);
+    let traps = asm.jcc(Cond::E);
+    let pending = frame_field(core::mem::offset_of!(GuestState, pending));
+    asm.alu_imm8(Alu::Cmp, Dword, pending, 0);
+    let interrupt = asm.jcc(Cond::Ne);
+    let posted = |asm: &mut Asm<'_>| {
+        asm.place(Rcx, places.control);
+        asm.mov_load(Qword, Rdx, Mem::base_disp8(Rcx, INTERRUPT_EPOCH));
+        asm.alu_load(
+            Alu::Cmp,
+            Qword,
+            Rdx,
+            Mem::base_disp8(Rcx, OBSERVED_INTERRUPT_EPOCH),
+        );
+        asm.jcc(Cond::Ne)
+    };
+    let notified = posted(&mut asm);
+    let bytes = frame_field(core::mem::offset_of!(GuestState, exclusive_bytes));
+    asm.alu_imm8(Alu::Cmp, Dword, bytes, 0);
+    let framed = asm.jcc(Cond::Ne);
+    asm.place(Rax, places.monitor);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), 0);
+    let monitored = asm.jcc(Cond::Ne);
+    read_count(&mut asm, places.count);
+    asm.place(Rax, places.lines_until);
+    asm.alu_load(Alu::Cmp, Qword, Rdx, Mem::base(Rax, 0));
+    let due = asm.jcc(Cond::Ae);
+    asm.place(Rcx, places.spin);
+    asm.mov_store(Qword, spin(SPIN_START), Rdx);
+    asm.mov_rm_imm32(Qword, spin(SPIN_TURNS), WFE_SPIN_TURNS);
+    let top = asm.len();
+    asm.pause();
+    // Read the register shared and exchange it only once set.
+    asm.place(Rax, places.events);
+    asm.mov_load(Qword, Rcx, Mem::base_disp8(Rax, VALUE));
+    asm.movzx(Dword, Rdx, Byte, Mem::base(Rcx, 0));
+    asm.test(Dword, Rdx, Rdx);
     let clear = asm.jcc(Cond::E);
-    finish_unless(code, [miss, clear], pc)
+    asm.alu(Alu::Xor, Dword, Rdx, Rdx);
+    asm.xchg(Byte, Mem::base(Rcx, 0), Rdx);
+    asm.test(Byte, Rdx, Rdx);
+    let taken = asm.jcc(Cond::E);
+    // The counts spent into the spin's total, and the outcome's count.
+    let spent = |asm: &mut Asm<'_>, outcome: i8| {
+        read_count(asm, places.count);
+        asm.place(Rcx, places.spin);
+        asm.alu_load(Alu::Sub, Qword, Rdx, spin(SPIN_START));
+        asm.alu(Alu::Add, Qword, spin(SPIN_COUNTS), Rdx);
+        asm.alu_imm8(Alu::Add, Qword, spin(outcome), 1);
+    };
+    spent(&mut asm, SPIN_COMPLETED);
+    let found = asm.jmp();
+    asm.bind(clear);
+    asm.bind(taken);
+    let woken = posted(&mut asm);
+    asm.place(Rcx, places.spin);
+    asm.alu_imm8(Alu::Sub, Qword, spin(SPIN_TURNS), 1);
+    let turns = asm.jcc(Cond::E);
+    read_count(&mut asm, places.count);
+    asm.place(Rax, places.lines_until);
+    asm.alu_load(Alu::Cmp, Qword, Rdx, Mem::base(Rax, 0));
+    let lines = asm.jcc(Cond::Ae);
+    asm.place(Rcx, places.spin);
+    asm.alu_load(Alu::Sub, Qword, Rdx, spin(SPIN_START));
+    asm.alu_imm8(Alu::Cmp, Qword, Rdx, WFE_SPIN_COUNTS as i8);
+    let again = asm.jcc(Cond::B);
+    asm.bind_back(again, top);
+    for end in [woken, turns, lines] {
+        asm.bind(end);
+    }
+    spent(&mut asm, SPIN_MISSED);
+    let missed = asm.jmp();
+    asm.bind(framed);
+    asm.bind(monitored);
+    asm.place(Rcx, places.spin);
+    asm.alu_imm8(Alu::Add, Qword, spin(SPIN_HELD), 1);
+    let held = asm.jmp();
+    asm.bind(set);
+    asm.bind(found);
+    finish_unless(
+        code,
+        [closed, traps, interrupt, notified, due, missed, held],
+        pc,
+    )
+}
+
+/// A PE's view of the board's frozen fast-IPI table (the engine's
+/// `fast_ipi::Table`) for [`fast_ipi_request_thunk`] and
+/// [`fast_ipi_status_thunk`]: the table's first entry, its clusters and
+/// CPUs per cluster, this PE's own cluster, number and IPI_SR address, the
+/// PEs a request found halted (bit `pe`), which the engine wakes when
+/// native code returns, and the entry of the request in progress.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FastIpi {
+    pub base: u64,
+    pub clusters: u64,
+    pub cpus: u64,
+    pub cluster: u64,
+    pub pe: u64,
+    pub status: u64,
+    pub wakes: u64,
+    pub target: u64,
+}
+
+/// The bytes of one entry of the table [`FastIpi::base`] names, and the
+/// offsets of its words: the target's IPI_SR (`u64`), deferred-IPI flag
+/// (`u8`), line-change counter (`u64`), interruption epoch (`u64`), halted
+/// flag (`u8`) and PE number, each but the last an address.
+pub const FAST_IPI_TARGET_BYTES: usize = 48;
+pub const FAST_IPI_TARGET_STATUS: usize = 0;
+pub const FAST_IPI_TARGET_ARMED: usize = 8;
+pub const FAST_IPI_TARGET_LINES: usize = 16;
+pub const FAST_IPI_TARGET_INTERRUPT: usize = 24;
+pub const FAST_IPI_TARGET_SLEEPING: usize = 32;
+pub const FAST_IPI_TARGET_PE: usize = 40;
+
+const IPI_BASE: i8 = core::mem::offset_of!(FastIpi, base) as i8;
+const IPI_CLUSTERS: i8 = core::mem::offset_of!(FastIpi, clusters) as i8;
+const IPI_CPUS: i8 = core::mem::offset_of!(FastIpi, cpus) as i8;
+const IPI_CLUSTER: i8 = core::mem::offset_of!(FastIpi, cluster) as i8;
+const IPI_PE: i8 = core::mem::offset_of!(FastIpi, pe) as i8;
+const IPI_STATUS: i8 = core::mem::offset_of!(FastIpi, status) as i8;
+const IPI_WAKES: i8 = core::mem::offset_of!(FastIpi, wakes) as i8;
+const IPI_TARGET: i8 = core::mem::offset_of!(FastIpi, target) as i8;
+
+/// IPI_RR's CPU [7:0], CLUSTER [23:16] and TYPE [29:28].
+const RR_CPU: i32 = 0xff;
+const RR_CLUSTER: u64 = 0xff << 16;
+const RR_TYPE: u64 = 0b11 << 28;
+
+/// Where fast-IPI thunks find their words: the per-state cell open where
+/// the MSR completes plainly, the PE's [`FastIpi`], the control
+/// ([`super::chain::ChainControl`]) and the native ISR_EL1 read's cell
+/// ([`interrupt_status_thunk`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastIpiPlaces {
+    pub cell: Place,
+    pub ipi: Place,
+    pub control: Place,
+    pub interrupt_status: Place,
+}
+
+/// Add 1 to the epoch at `[RCX + offset]` unless it is `u64::MAX`, which
+/// stays, in a LOCK CMPXCHG loop. Clobbers RAX and RDX.
+fn bump_epoch(asm: &mut Asm<'_>, offset: i8) {
+    use Gpr::{Rax, Rcx, Rdx};
+    use Size::Qword;
+    let epoch = Mem::base_disp8(Rcx, offset);
+    asm.mov_load(Qword, Rax, epoch);
+    let top = asm.len();
+    asm.alu_imm8(Alu::Cmp, Qword, Rax, -1);
+    let saturated = asm.jcc(Cond::E);
+    asm.lea(Qword, Rdx, Mem::base_disp8(Rax, 1));
+    asm.lock();
+    asm.cmpxchg(Qword, epoch, Rdx);
+    let lost = asm.jcc(Cond::Ne);
+    asm.bind_back(lost, top);
+    asm.bind(saturated);
+}
+
+/// The thunk completing an immediate fast-IPI request, MSR IPI_RR_LOCAL
+/// (or IPI_RR_GLOBAL with `global`) at `pc` with Xt, while the cell is
+/// open, step for step as the engine's reference send (`fast_ipi::Table::
+/// send`) does, else exiting at `pc` having changed nothing: the value
+/// holds only CPU, TYPE 0 and, global, CLUSTER; the target is present and
+/// not this PE; its deferred IPI is not armed. It ORs PENDING into the
+/// target's IPI_SR (LOCK CMPXCHG), and where that was clear adds 1 to its
+/// line-change counter (LOCK ADD), to its interruption epoch unless
+/// saturated, and, finding it halted, sets its bit in [`FastIpi::wakes`]
+/// and moves this PE's own interruption epoch, so its run ends at the next
+/// chained transfer and the engine wakes the target (`Devices::
+/// wake_signalled`) without running the MSR again. It clobbers RAX, RCX
+/// and RDX.
+pub fn fast_ipi_request_thunk(
+    pc: GuestAddress,
+    rt: u8,
+    global: bool,
+    places: FastIpiPlaces,
+) -> Thunk {
+    use Gpr::{Rax, Rcx, Rdx};
+    use Size::{Byte, Dword, Qword};
+    let ipi = |offset| Mem::base_disp8(Rax, offset);
+    let target = |offset: usize| Mem::base_disp8(Rdx, offset as i8);
+    let (mut code, closed) = open(places.cell);
+    let mut asm = Asm::new(&mut code);
+    if rt == 31 {
+        asm.alu(Alu::Xor, Dword, Rcx, Rcx);
+    } else {
+        asm.mov_load(Qword, Rcx, register(rt));
+    }
+    let fields = RR_CPU as u64 | if global { RR_CLUSTER } else { 0 };
+    asm.mov_imm64(Rdx, !fields | RR_TYPE);
+    asm.test(Qword, Rcx, Rdx);
+    let malformed = asm.jcc(Cond::Ne);
+    asm.place(Rax, places.ipi);
+    if global {
+        asm.mov(Qword, Rdx, Rcx);
+        asm.shift_imm(ShiftOp::Shr, Qword, Rdx, 16);
+    } else {
+        asm.mov_load(Qword, Rdx, ipi(IPI_CLUSTER));
+    }
+    asm.alu_load(Alu::Cmp, Qword, Rdx, ipi(IPI_CLUSTERS));
+    let no_cluster = asm.jcc(Cond::Ae);
+    asm.alu_imm32(Alu::And, Dword, Rcx, RR_CPU);
+    asm.alu_load(Alu::Cmp, Qword, Rcx, ipi(IPI_CPUS));
+    let no_cpu = asm.jcc(Cond::Ae);
+    asm.imul(Qword, Rdx, ipi(IPI_CPUS));
+    asm.alu(Alu::Add, Qword, Rdx, Rcx);
+    asm.imul_imm32(Qword, Rdx, Rdx, FAST_IPI_TARGET_BYTES as i32);
+    asm.alu_load(Alu::Add, Qword, Rdx, ipi(IPI_BASE));
+    asm.alu_imm8(Alu::Cmp, Qword, target(FAST_IPI_TARGET_STATUS), 0);
+    let absent = asm.jcc(Cond::E);
+    asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_PE));
+    asm.alu_load(Alu::Cmp, Qword, Rcx, ipi(IPI_PE));
+    let own = asm.jcc(Cond::E);
+    asm.alu_imm8(Alu::Cmp, Qword, Rcx, 64);
+    let unnamed = asm.jcc(Cond::Ae);
+    asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_ARMED));
+    asm.movzx(Dword, Rcx, Byte, Mem::base(Rcx, 0));
+    asm.test(Dword, Rcx, Rcx);
+    let armed = asm.jcc(Cond::Ne);
+    // Committed from here on.
+    asm.mov_store(Qword, ipi(IPI_TARGET), Rdx);
+    asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_STATUS));
+    asm.mov_load(Qword, Rax, Mem::base(Rcx, 0));
+    let top = asm.len();
+    asm.mov(Qword, Rdx, Rax);
+    asm.alu_imm8(Alu::Or, Qword, Rdx, 1);
+    asm.lock();
+    asm.cmpxchg(Qword, Mem::base(Rcx, 0), Rdx);
+    let lost = asm.jcc(Cond::Ne);
+    asm.bind_back(lost, top);
+    asm.test(Qword, Rax, Rax);
+    let pending = asm.jcc(Cond::Ne);
+    let reload = |asm: &mut Asm<'_>| {
+        asm.place(Rax, places.ipi);
+        asm.mov_load(Qword, Rdx, ipi(IPI_TARGET));
+    };
+    reload(&mut asm);
+    asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_LINES));
+    asm.lock();
+    asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, 0), 1);
+    asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_INTERRUPT));
+    bump_epoch(&mut asm, 0);
+    reload(&mut asm);
+    asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_SLEEPING));
+    asm.movzx(Dword, Rcx, Byte, Mem::base(Rcx, 0));
+    asm.test(Dword, Rcx, Rcx);
+    let running = asm.jcc(Cond::E);
+    asm.mov_load(Qword, Rcx, target(FAST_IPI_TARGET_PE));
+    asm.mov_imm32(Rdx, 1);
+    asm.shift_cl(ShiftOp::Shl, Qword, Rdx);
+    asm.alu(Alu::Or, Qword, ipi(IPI_WAKES), Rdx);
+    asm.place(Rcx, places.control);
+    bump_epoch(&mut asm, INTERRUPT_EPOCH);
+    asm.bind(pending);
+    asm.bind(running);
+    finish_unless(
+        code,
+        [
+            closed, malformed, no_cluster, no_cpu, absent, own, unnamed, armed,
+        ],
+        pc,
+    )
+}
+
+/// The thunk completing MSR IPI_SR at `pc` with Xt while the cell is open:
+/// 1 clears PENDING in this PE's IPI_SR in one exchange, as other PEs set
+/// it, and closes the native ISR_EL1 read, whose waiting FIQ was taken at
+/// entry; 0 changes nothing; any other value, or a PE whose word the
+/// engine has not named, exits. It clobbers RAX, RCX and RDX.
+pub fn fast_ipi_status_thunk(pc: GuestAddress, rt: u8, places: FastIpiPlaces) -> Thunk {
+    use Gpr::{Rax, Rcx, Rdx};
+    use Size::{Dword, Qword};
+    let (mut code, closed) = open(places.cell);
+    if rt == 31 {
+        return finish(code, closed, pc);
+    }
+    let mut asm = Asm::new(&mut code);
+    asm.mov_load(Qword, Rcx, register(rt));
+    asm.test(Qword, Rcx, Rcx);
+    let nothing = asm.jcc(Cond::E);
+    asm.alu_imm8(Alu::Cmp, Qword, Rcx, 1);
+    let other = asm.jcc(Cond::Ne);
+    asm.place(Rax, places.ipi);
+    asm.mov_load(Qword, Rcx, Mem::base_disp8(Rax, IPI_STATUS));
+    asm.test(Qword, Rcx, Rcx);
+    let unknown = asm.jcc(Cond::E);
+    asm.alu(Alu::Xor, Dword, Rdx, Rdx);
+    asm.xchg(Qword, Mem::base(Rcx, 0), Rdx);
+    asm.place(Rax, places.interrupt_status);
+    asm.mov_rm_imm32(Qword, Mem::base(Rax, 0), 0);
+    asm.bind(nothing);
+    finish_unless(code, [closed, other, unknown], pc)
 }
 
 /// The thunk completing `write` at `pc` in the frame while the cell at
@@ -1005,12 +1376,15 @@ pub enum TimerAccess {
 /// Where a [`timer_thunk`] finds its channel and the engine's words: two
 /// cells whose `value` is the address of the compare's storage and the
 /// control's, the count before which the engine looks at the lines again
-/// ([`crate::x86_64::transition::Places::lines_until`]) and the count reader.
+/// ([`crate::x86_64::transition::Places::lines_until`]), the native ISR_EL1
+/// read's cell, open until a count ([`interrupt_status_thunk`]), and the
+/// count reader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TimerPlaces {
     pub compare: Place,
     pub control: Place,
     pub lines_until: Place,
+    pub interrupt_status: Place,
     pub count: Place,
 }
 
@@ -1023,15 +1397,17 @@ const TIMER_STATUS_SHIFT: u8 = 2;
 
 /// The thunk completing `access` of a timer channel at `pc` with Xt, else
 /// exiting at `pc`. Both cells must be open. A write completes only when it
-/// leaves the channel's output low and its next rise no earlier than the
-/// engine's `lines_until`, which must name a count (not 0): the output was
-/// low (disabled, masked or before the compare), and once the write is done
-/// it is disabled, masked or armed for a compare after the count and at or
-/// past `lines_until`. The engine, which looks at the lines again at
-/// `lines_until`, then finds the new compare in storage; anything else,
-/// which could raise or lower the line or move its rise earlier, exits. A
-/// count that passes the new compare after the thunk read it is at or past
-/// `lines_until` too. It clobbers RAX, RCX and RDX.
+/// leaves the channel's output low, and the engine's `lines_until` names a
+/// count (not 0): the output was low (disabled, masked or before the
+/// compare), and once the write is done it is disabled, masked or armed for
+/// a compare after the count. A compare before `lines_until` pulls it, and
+/// the deadline of an open ISR_EL1 cell, down to the compare: every native
+/// path that could let the line's rise pass unseen (an unmasking ERET or
+/// GEXIT, an ISR_EL1 read, a WFE's spin) stops there, and the engine, which
+/// looks at the lines again at the next boundary, finds the new compare in
+/// storage. Anything else, which could raise or lower the line now, exits.
+/// A count that passes the new compare after the thunk read it is at or
+/// past those deadlines too. It clobbers RAX, RCX and RDX.
 pub fn timer_thunk(pc: GuestAddress, rt: u8, access: TimerAccess, places: TimerPlaces) -> Thunk {
     use Gpr::{Rax, Rcx, Rdx};
     use Size::{Dword, Qword};
@@ -1127,9 +1503,17 @@ pub fn timer_thunk(pc: GuestAddress, rt: u8, access: TimerAccess, places: TimerP
     // Armed: after the count, and no earlier than the engine looks again.
     asm.alu(Alu::Cmp, Qword, Rax, Rdx);
     let at_once = asm.jcc(Cond::Be);
+    // Earlier than the engine looks again: pull its deadlines down.
     asm.place(Rdx, places.lines_until);
     asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rdx, 0));
-    let earlier = asm.jcc(Cond::B);
+    let later = asm.jcc(Cond::Ae);
+    asm.mov_store(Qword, Mem::base(Rdx, 0), Rax);
+    asm.place(Rdx, places.interrupt_status);
+    asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rdx, 0));
+    let read_later = asm.jcc(Cond::Ae);
+    asm.mov_store(Qword, Mem::base(Rdx, 0), Rax);
+    asm.bind(later);
+    asm.bind(read_later);
     asm.bind(quiet);
     let target = match access {
         TimerAccess::WriteControl(_) => places.control,
@@ -1139,7 +1523,156 @@ pub fn timer_thunk(pc: GuestAddress, rt: u8, access: TimerAccess, places: TimerP
     asm.mov_store(Qword, Mem::base(Rax, 0), Rcx);
     finish_unless(
         code,
-        [closed, control_closed, unknown, was_high, at_once, earlier],
+        [closed, control_closed, unknown, was_high, at_once],
+        pc,
+    )
+}
+
+/// A plain device read a [`device_read_thunk`] serves again: the device
+/// site's physical address (`site`, 0 for none), the address it read
+/// (`address`, the base register plus the offset), the `key` of the state it
+/// read in ([`device_read_key`]), the model's epoch word (`epoch`, its
+/// address) and the count it held (`seen`), the value read, and the system
+/// count before which no device deadline came (`until`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceRead {
+    pub site: u64,
+    pub address: u64,
+    pub key: u64,
+    pub epoch: u64,
+    pub seen: u64,
+    pub value: u64,
+    pub until: u64,
+}
+
+const READ_SITE: i8 = core::mem::offset_of!(DeviceRead, site) as i8;
+const READ_ADDRESS: i8 = core::mem::offset_of!(DeviceRead, address) as i8;
+const READ_KEY: i8 = core::mem::offset_of!(DeviceRead, key) as i8;
+const READ_EPOCH: i8 = core::mem::offset_of!(DeviceRead, epoch) as i8;
+const READ_SEEN: i8 = core::mem::offset_of!(DeviceRead, seen) as i8;
+const READ_VALUE: i8 = core::mem::offset_of!(DeviceRead, value) as i8;
+const READ_UNTIL: i8 = core::mem::offset_of!(DeviceRead, until) as i8;
+
+/// The [`DeviceRead`]s a PE keeps, a slot per site ([`device_read_slot`]).
+pub const DEVICE_READS: usize = 64;
+
+/// The slot of the device site at physical address `site`.
+pub const fn device_read_slot(site: u64) -> usize {
+    ((site >> 2).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - DEVICE_READS.ilog2())) as usize
+}
+
+/// The key a [`DeviceRead`] made in mirror state `state` with PSTATE.PAN
+/// `pan` holds while the state's key cell holds `device_read_key(generation,
+/// state, false)`: the PE's translation and its controls as they were.
+pub const fn device_read_key(generation: u64, state: usize, pan: bool) -> u64 {
+    generation << 4 | (state as u64) << 1 | pan as u64
+}
+
+/// A load a [`device_read_thunk`] completes: `LDR` or `LDUR` of a B, H, W or X
+/// register, zero-extending, without writeback, from a base other than SP
+/// (`rn`) plus `offset`, into `rt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceLoad {
+    pub rn: u8,
+    pub offset: i32,
+    pub rt: u8,
+    pub bytes: u8,
+}
+
+impl DeviceLoad {
+    /// The load `word` makes, if a [`device_read_thunk`] completes it.
+    pub fn of(word: u32) -> Option<Self> {
+        let size = word >> 30;
+        let rn = (word >> 5 & 31) as u8;
+        let rt = (word & 31) as u8;
+        let offset = if word & 0x3fc0_0000 == 0x3940_0000 {
+            // LDR (immediate, unsigned offset).
+            ((word >> 10 & 0xfff) << size) as i32
+        } else if word & 0x3fe0_0c00 == 0x3840_0000 {
+            // LDUR.
+            ((word << 11) as i32) >> 23
+        } else {
+            return None;
+        };
+        (rn != 31).then_some(Self {
+            rn,
+            offset,
+            rt,
+            bytes: 1 << size,
+        })
+    }
+}
+
+/// Where a [`device_read_thunk`] finds its reads: the PE's [`DeviceRead`]s,
+/// the key cell of its state, whose `value` the read's key must match, and
+/// the count reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceReadPlaces {
+    pub reads: Place,
+    pub key: Place,
+    pub count: Place,
+}
+
+/// The thunk completing the plain device load `load` of the site at `pc`
+/// and physical `site` natively, while the [`DeviceRead`] of its slot holds
+/// that site, the address the load reads now, the key of the PE's state
+/// and PSTATE.PAN, a model epoch that still holds the count it held, and a
+/// count below `until`: it writes the read's value to Xt and leaves through
+/// a direct exit to the next instruction. Else it exits at `pc`. It also
+/// clobbers RCX and RDX.
+pub fn device_read_thunk(
+    pc: GuestAddress,
+    site: u64,
+    load: DeviceLoad,
+    places: DeviceReadPlaces,
+) -> Thunk {
+    use Gpr::{Rax, Rcx, Rdx};
+    use Size::Qword;
+    let slot = Place::new(
+        places.reads.anchor,
+        places.reads.offset + device_read_slot(site) * core::mem::size_of::<DeviceRead>(),
+    );
+    let read = |offset| Mem::base_disp8(Rcx, offset);
+    let (mut code, closed) = open(places.key);
+    let mut asm = Asm::new(&mut code);
+    asm.mov_load(Qword, Rdx, Mem::base_disp8(Rax, VALUE));
+    asm.alu_load(
+        Alu::Or,
+        Qword,
+        Rdx,
+        frame_field(core::mem::offset_of!(GuestState, pan)),
+    );
+    asm.place(Rcx, slot);
+    asm.alu_load(Alu::Cmp, Qword, Rdx, read(READ_KEY));
+    let other_key = asm.jcc(Cond::Ne);
+    asm.mov_imm64(Rax, site);
+    asm.alu_load(Alu::Cmp, Qword, Rax, read(READ_SITE));
+    let other_site = asm.jcc(Cond::Ne);
+    asm.mov_load(Qword, Rax, register(load.rn));
+    if load.offset != 0 {
+        asm.alu_imm32(Alu::Add, Qword, Rax, load.offset);
+    }
+    asm.alu_load(Alu::Cmp, Qword, Rax, read(READ_ADDRESS));
+    let other_address = asm.jcc(Cond::Ne);
+    asm.mov_load(Qword, Rax, read(READ_EPOCH));
+    asm.mov_load(Qword, Rax, Mem::base(Rax, 0));
+    asm.alu_load(Alu::Cmp, Qword, Rax, read(READ_SEEN));
+    let changed = asm.jcc(Cond::Ne);
+    asm.alu_imm8(Alu::Cmp, Qword, read(READ_UNTIL), -1);
+    let timeless = asm.jcc(Cond::E);
+    read_count(&mut asm, places.count);
+    asm.place(Rcx, slot);
+    asm.alu_load(Alu::Cmp, Qword, Rdx, read(READ_UNTIL));
+    let due = asm.jcc(Cond::Ae);
+    asm.bind(timeless);
+    if load.rt != 31 {
+        asm.mov_load(Qword, Rax, read(READ_VALUE));
+        asm.mov_store(Qword, register(load.rt), Rax);
+    }
+    finish_unless(
+        code,
+        [closed, other_key, other_site, other_address, changed, due],
         pc,
     )
 }
@@ -1741,28 +2274,370 @@ mod tests {
         assert_eq!((state.x, last()), (before, 500));
     }
 
+    #[test]
+    fn device_loads_name_their_base_offset_and_width() {
+        // ldr w8, [x9, #0x14]; ldr x0, [x1]; ldrb w2, [x3, #1]; ldrh w4, [x5, #6]
+        assert_eq!(
+            DeviceLoad::of(0xb940_1528),
+            Some(DeviceLoad {
+                rn: 9,
+                offset: 0x14,
+                rt: 8,
+                bytes: 4
+            })
+        );
+        assert_eq!(
+            DeviceLoad::of(0xf940_0020),
+            Some(DeviceLoad {
+                rn: 1,
+                offset: 0,
+                rt: 0,
+                bytes: 8
+            })
+        );
+        assert_eq!(
+            DeviceLoad::of(0x3940_0462),
+            Some(DeviceLoad {
+                rn: 3,
+                offset: 1,
+                rt: 2,
+                bytes: 1
+            })
+        );
+        assert_eq!(
+            DeviceLoad::of(0x7940_0ca4),
+            Some(DeviceLoad {
+                rn: 5,
+                offset: 6,
+                rt: 4,
+                bytes: 2
+            })
+        );
+        // ldur w0, [x1, #-4]
+        assert_eq!(
+            DeviceLoad::of(0xb85f_c020),
+            Some(DeviceLoad {
+                rn: 1,
+                offset: -4,
+                rt: 0,
+                bytes: 4
+            })
+        );
+        // ldr x0, [sp]; ldrsw x0, [x1]; str w0, [x1]; ldr w0, [x1], #4;
+        // ldr w0, [x1, x2]
+        for other in [
+            0xf940_03e0_u32,
+            0xb980_0020,
+            0xb900_0020,
+            0xb840_4420,
+            0xb862_6820,
+        ] {
+            assert_eq!(DeviceLoad::of(other), None, "{other:#x}");
+        }
+    }
+
+    /// A device read runs on the host: it completes from its slot while the
+    /// key, site, address, epoch and count all agree, and exits otherwise.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn device_reads_complete_from_their_slot_while_everything_agrees() {
+        use crate::GuestState;
+        use core::mem::offset_of;
+        use core::sync::atomic::Ordering::Relaxed;
+        #[repr(C)]
+        struct Data {
+            key: Cell,
+            reads: [DeviceRead; DEVICE_READS],
+        }
+        const SITE: u64 = 0x8_0000_1234;
+        let load = DeviceLoad {
+            rn: 1,
+            offset: 0x10,
+            rt: 2,
+            bytes: 4,
+        };
+        let mut data = alloc::boxed::Box::new(Data {
+            key: Cell::default(),
+            reads: [DeviceRead::default(); DEVICE_READS],
+        });
+        let base = &mut *data as *mut Data;
+        let epoch = alloc::boxed::Box::new(AtomicU64::new(7));
+        let published = alloc::boxed::Box::new(CountState::default());
+        published.offset.store(100, Relaxed);
+        published.ceiling.store(u64::MAX, Relaxed);
+        let mut count = alloc::boxed::Box::new(Count {
+            state: &*published as *const CountState as u64,
+            ..Count::default()
+        });
+        let places = DeviceReadPlaces {
+            reads: Place::new(Anchor::Mirrors, offset_of!(Data, reads)),
+            key: Place::new(Anchor::Mirrors, offset_of!(Data, key)),
+            count: READER,
+        };
+        let thunk = device_read_thunk(PC, SITE, load, places);
+        let mut state = GuestState::default();
+        state.anchors[Anchor::Mirrors] = base as u64;
+        state.anchors[Anchor::Count] = &mut *count as *mut Count as u64;
+        state.x[1] = 0xffff_fe00_1000_0000;
+        let key = device_read_key(3, 1, false);
+        let slot = device_read_slot(SITE);
+        // SAFETY: `base` points into the live box; written between runs.
+        let data = |f: &mut dyn FnMut(&mut Data)| unsafe { f(&mut *base) };
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        data(&mut |d| {
+            d.key = Cell {
+                readable: 1,
+                value: key,
+            };
+            d.reads[slot] = DeviceRead {
+                site: SITE,
+                address: 0xffff_fe00_1000_0010,
+                key,
+                epoch: &*epoch as *const AtomicU64 as u64,
+                seen: 7,
+                value: 0xabcd,
+                until: u64::MAX,
+            };
+        });
+        assert_eq!(run(&thunk.code, &mut state), NEXT);
+        assert_eq!(state.x[2], 0xabcd);
+        state.x[2] = 0;
+        // Another address, PAN, key, epoch or a passed deadline exit.
+        state.x[1] += 8;
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        state.x[1] -= 8;
+        state.pan = 1;
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        state.pan = 0;
+        data(&mut |d| d.key.value = device_read_key(4, 1, false));
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        data(&mut |d| d.key.value = key);
+        epoch.store(8, Relaxed);
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        epoch.store(7, Relaxed);
+        data(&mut |d| d.reads[slot].until = 50);
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        data(&mut |d| d.reads[slot].until = 1000);
+        assert_eq!(run(&thunk.code, &mut state), NEXT);
+        assert_eq!(state.x[2], 0xabcd);
+        data(&mut |d| d.reads[slot].site = SITE + 4);
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        data(&mut |d| d.reads[slot].site = SITE);
+        data(&mut |d| d.key.readable = 0);
+        assert_eq!(run(&thunk.code, &mut state), MISS);
+        assert_eq!(state.x[2], 0xabcd);
+    }
+
+    /// What the event thunks of these tests find at [`Anchor::Mirrors`].
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[repr(C)]
+    #[derive(Default)]
+    struct Waits {
+        events: Cell,
+        waits: Cell,
+        monitor: u64,
+        lines_until: u64,
+        spin: EventSpin,
+    }
+
+    /// The event thunks of these tests, and their words: an event register,
+    /// a control and a count that `per_tsc` moves (0 holds it at 100).
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    struct Events {
+        send: Thunk,
+        wait: Thunk,
+        event: alloc::boxed::Box<core::sync::atomic::AtomicU8>,
+        waits: alloc::boxed::Box<Waits>,
+        control: alloc::boxed::Box<crate::x86_64::chain::ChainControl>,
+        _published: alloc::boxed::Box<CountState>,
+        count: alloc::boxed::Box<Count>,
+        state: crate::GuestState,
+    }
+
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    impl Events {
+        fn new(per_tsc: u64) -> Self {
+            use core::mem::offset_of;
+            use core::sync::atomic::Ordering::Relaxed;
+            let place = |offset: usize| Place::new(Anchor::Mirrors, offset);
+            let events = place(offset_of!(Waits, events));
+            let places = EventWaitPlaces {
+                events,
+                waits: place(offset_of!(Waits, waits)),
+                monitor: place(offset_of!(Waits, monitor)),
+                control: Place::new(Anchor::Control, 0),
+                lines_until: place(offset_of!(Waits, lines_until)),
+                count: READER,
+                spin: place(offset_of!(Waits, spin)),
+            };
+            let published = alloc::boxed::Box::new(CountState::default());
+            published.offset.store(100, Relaxed);
+            published.ceiling.store(u64::MAX, Relaxed);
+            let mut events = Self {
+                send: send_event_thunk(PC, events),
+                wait: event_wait_thunk(PC, places),
+                event: alloc::boxed::Box::default(),
+                waits: alloc::boxed::Box::default(),
+                control: alloc::boxed::Box::default(),
+                count: alloc::boxed::Box::new(Count {
+                    state: &*published as *const CountState as u64,
+                    per_tsc,
+                    ..Count::default()
+                }),
+                _published: published,
+                state: crate::GuestState::default(),
+            };
+            let anchors = &mut events.state.anchors;
+            anchors[Anchor::Mirrors] = &mut *events.waits as *mut Waits as u64;
+            anchors[Anchor::Control] =
+                &mut *events.control as *mut crate::x86_64::chain::ChainControl as u64;
+            anchors[Anchor::Count] = &mut *events.count as *mut Count as u64;
+            events
+        }
+
+        fn open(&mut self) {
+            self.waits.events = Cell {
+                readable: 1,
+                value: &*self.event as *const core::sync::atomic::AtomicU8 as u64,
+            };
+        }
+
+        fn wait(&mut self) -> Exit {
+            run(&self.wait.code, &mut self.state)
+        }
+
+        /// Run the WFE while another thread does `act` once the spin began,
+        /// if it began and that thread sees it before the WFE returns.
+        fn wait_while(&mut self, act: impl FnOnce(&Self) + Send) -> Exit {
+            use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+            self.waits.spin.turns = 0;
+            let turns = &raw const self.waits.spin.turns as usize;
+            let this = self as *mut Self as usize;
+            let returned = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let returned = &returned;
+                scope.spawn(move || {
+                    // SAFETY: the spin's word, which the thunk writes with
+                    // aligned stores while this thread reads it atomically.
+                    let turns = unsafe { AtomicU64::from_ptr(turns as *mut u64) };
+                    while turns.load(SeqCst) == 0 && !returned.load(SeqCst) {
+                        core::hint::spin_loop();
+                    }
+                    if !returned.load(SeqCst) {
+                        // SAFETY: the words `act` touches are atomics or
+                        // ones the thunk only reads.
+                        act(unsafe { &*(this as *const Self) });
+                    }
+                });
+                // SAFETY: `act` touches no word the thunk writes.
+                let exit = unsafe { (*(this as *mut Self)).wait() };
+                returned.store(true, SeqCst);
+                exit
+            })
+        }
+    }
+
     /// SEVL sets the event register; WFE clears a set one and completes, and
-    /// leaves a clear one, or a closed cell, to the engine.
+    /// leaves a clear one, or a closed cell, to the engine where it waits
+    /// otherwise than by spinning.
     #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn event_thunks_set_and_consume_the_event_register() {
-        use crate::GuestState;
-        let mut event = alloc::boxed::Box::new(0u8);
-        let mut cell = alloc::boxed::Box::new(Cell::default());
-        let (send, wait) = (send_event_thunk(PC, CELL), event_wait_thunk(PC, CELL));
-        let mut state = GuestState::default();
-        state.anchors[Anchor::Mirrors] = &mut *cell as *mut Cell as u64;
-        assert_eq!(run(&send.code, &mut state), MISS);
-        *cell = Cell {
-            readable: 1,
-            value: &mut *event as *mut u8 as u64,
-        };
-        assert_eq!(run(&wait.code, &mut state), MISS);
-        assert_eq!(run(&send.code, &mut state), NEXT);
-        assert_eq!(*event, 1);
-        assert_eq!(run(&wait.code, &mut state), NEXT);
-        assert_eq!(*event, 0);
-        assert_eq!(run(&wait.code, &mut state), MISS);
+        use core::sync::atomic::Ordering::Relaxed;
+        let mut events = Events::new(0);
+        assert_eq!(run(&events.send.code, &mut events.state), MISS);
+        events.open();
+        assert_eq!(events.wait(), MISS);
+        assert_eq!(run(&events.send.code, &mut events.state), NEXT);
+        assert_eq!(events.event.load(Relaxed), 1);
+        assert_eq!(events.wait(), NEXT);
+        assert_eq!(events.event.load(Relaxed), 0);
+        assert_eq!(events.wait(), MISS);
+        assert_eq!(events.waits.spin, EventSpin::default(), "no spin");
+    }
+
+    /// Where the WFE would wait, a clear event register makes it spin: it
+    /// exits at once with an interrupt waiting, anything posted or the count
+    /// at `lines_until`, counting nothing, and with a monitor held, counting
+    /// that; a spin ends after [`WFE_SPIN_COUNTS`] of the count, or its
+    /// turns where the count holds, counting a miss and the counts spent.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn event_waits_spin_only_while_nothing_else_wakes_them() {
+        let mut events = Events::new(0);
+        events.open();
+        events.waits.waits.readable = 1;
+        events.waits.lines_until = u64::MAX;
+        let quiet = EventSpin::default();
+        events.state.pending = 0b10;
+        assert_eq!(events.wait(), MISS);
+        events.state.pending = 0;
+        events.control.interrupt_epoch = 1;
+        assert_eq!(events.wait(), MISS);
+        events.control.observed_interrupt_epoch = 1;
+        // The count holds at 100.
+        events.waits.lines_until = 100;
+        assert_eq!(events.wait(), MISS);
+        assert_eq!(events.waits.spin, quiet, "no spin");
+        events.waits.lines_until = 101;
+        events.state.exclusive_bytes = 8;
+        assert_eq!(events.wait(), MISS);
+        events.state.exclusive_bytes = 0;
+        events.waits.monitor = 1;
+        assert_eq!(events.wait(), MISS);
+        events.waits.monitor = 0;
+        assert_eq!((events.waits.spin.held, events.waits.spin.missed), (2, 0));
+        // A held count: the turns end the spin, none counted.
+        assert_eq!(events.wait(), MISS);
+        let spin = events.waits.spin;
+        assert_eq!((spin.missed, spin.counts, spin.turns), (1, 0, 0));
+        // A count at half the TSC's rate: the counts end it.
+        let mut events = Events::new(1 << 63);
+        events.open();
+        events.waits.waits.readable = 1;
+        events.waits.lines_until = u64::MAX;
+        assert_eq!(events.wait(), MISS);
+        let spin = events.waits.spin;
+        assert_eq!((spin.completed, spin.missed), (0, 1));
+        assert!(spin.counts >= u64::from(WFE_SPIN_COUNTS), "{spin:?}");
+        assert_ne!(spin.turns, 0, "{spin:?}");
+    }
+
+    /// Another PE's event during the spin completes the WFE, consuming the
+    /// register; a notification during it ends it. Each runs until the
+    /// other thread acted during a spin, which a scheduler may delay.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn event_waits_complete_on_an_event_set_during_the_spin() {
+        use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        let mut events = Events::new(0);
+        events.open();
+        events.waits.waits.readable = 1;
+        events.waits.lines_until = u64::MAX;
+        let completed = (0..100).any(|_| {
+            let exit = events.wait_while(|events| events.event.store(1, Relaxed));
+            events.event.store(0, Relaxed);
+            exit == NEXT
+        });
+        assert!(completed);
+        assert_eq!(events.waits.spin.completed, 1);
+        let missed = events.waits.spin.missed;
+        let ended = (0..100).any(|_| {
+            let before = events.waits.spin.missed;
+            let epoch = &raw const events.control.interrupt_epoch as usize;
+            assert_eq!(
+                events.wait_while(move |_| {
+                    // SAFETY: the control's epoch, which the thunk reads.
+                    unsafe { AtomicU64::from_ptr(epoch as *mut u64) }.fetch_add(1, Relaxed);
+                }),
+                MISS
+            );
+            let observed = events.control.interrupt_epoch;
+            events.control.observed_interrupt_epoch = observed;
+            events.waits.spin.missed == before + 1 && events.waits.spin.turns != 0
+        });
+        assert!(ended);
+        assert!(events.waits.spin.missed > missed);
     }
 
     /// An energy read scales the ticks of the count since the origin, none
@@ -2108,10 +2983,11 @@ mod tests {
     }
 
     /// Timer thunks run on the host against a count the test moves: writes
-    /// that keep the output low and arm no compare before `lines_until`
-    /// complete into storage, every other write exits with storage as it
-    /// was, and CTL reads give ENABLE and IMASK as stored with ISTATUS from
-    /// the count.
+    /// that keep the output low complete into storage, one that arms a
+    /// compare before `lines_until` pulling it and an open ISR_EL1 cell's
+    /// deadline down to the compare; every other write exits with storage
+    /// as it was, and CTL reads give ENABLE and IMASK as stored with
+    /// ISTATUS from the count.
     #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn timer_thunks_complete_only_writes_that_raise_nothing_before_the_engine_looks() {
@@ -2126,6 +3002,7 @@ mod tests {
             cval: u64,
             ctl: u64,
             lines_until: u64,
+            status: Cell,
         }
         const ENABLE: u64 = 1;
         const IMASK: u64 = 2;
@@ -2135,6 +3012,7 @@ mod tests {
             compare: place(offset_of!(Timer, compare)),
             control: place(offset_of!(Timer, control)),
             lines_until: place(offset_of!(Timer, lines_until)),
+            interrupt_status: place(offset_of!(Timer, status)),
             count: READER,
         };
         let mut timer = alloc::boxed::Box::new(Timer::default());
@@ -2212,14 +3090,26 @@ mod tests {
             NEXT,
             (180, ENABLE),
         );
-        // Earlier than the engine looks again: exit.
-        expect(100, 150, armed, &value, 30, MISS, armed);
+        // Earlier than the engine looks again: completes and pulls its
+        // deadlines down to the compare, an open ISR_EL1 cell's only.
+        for (status, pulled) in [(150, 130), (0, 0), (120, 120)] {
+            data(&mut |d| d.status.readable = status);
+            expect(100, 150, armed, &value, 30, NEXT, (130, ENABLE));
+            data(&mut |d| {
+                assert_eq!((d.lines_until, d.status.readable), (130, pulled));
+            });
+        }
+        data(&mut |d| d.status.readable = 0);
+        // A later one leaves them.
+        expect(100, 150, armed, &value, 80, NEXT, (180, ENABLE));
+        data(&mut |d| assert_eq!(d.lines_until, 150));
         // Due at once, or already past: exit.
         expect(100, 150, armed, &value, 0, MISS, armed);
         expect(100, 150, armed, &value, 0xffff_fff6, MISS, armed);
         // CVAL: at lines_until itself completes.
         expect(100, 150, armed, &compare, 150, NEXT, (150, ENABLE));
-        expect(100, 150, armed, &compare, 149, MISS, armed);
+        expect(100, 150, armed, &compare, 149, NEXT, (149, ENABLE));
+        data(&mut |d| assert_eq!(d.lines_until, 149));
         // The output is high (armed and past its compare): every write exits.
         expect(100, 150, (90, ENABLE), &compare, 500, MISS, (90, ENABLE));
         expect(100, 150, (90, ENABLE), &control, 0, MISS, (90, ENABLE));
@@ -2256,14 +3146,24 @@ mod tests {
             MISS,
             (90, ENABLE | IMASK),
         );
-        // Enabling arms the stored compare: before lines_until exits.
-        expect(100, 150, (120, 0), &control, ENABLE, MISS, (120, 0));
+        // Enabling arms the stored compare, before lines_until pulling it.
+        expect(100, 150, (120, 0), &control, ENABLE, NEXT, (120, ENABLE));
+        data(&mut |d| assert_eq!(d.lines_until, 120));
         expect(100, 150, (160, 0), &control, ENABLE, NEXT, (160, ENABLE));
-        // No count named (0): every write exits; none armed (MAX): only a
-        // write that arms a compare exits.
+        // No count named (0): every write exits; none (MAX): a write that
+        // arms a compare names it.
         expect(100, 0, armed, &control, 0, MISS, armed);
         expect(100, u64::MAX, armed, &control, 0, NEXT, (200, 0));
-        expect(100, u64::MAX, armed, &value, 1 << 20, MISS, armed);
+        expect(
+            100,
+            u64::MAX,
+            armed,
+            &value,
+            1 << 20,
+            NEXT,
+            (100 + (1 << 20), ENABLE),
+        );
+        data(&mut |d| assert_eq!(d.lines_until, 100 + (1 << 20)));
         expect(
             100,
             u64::MAX,

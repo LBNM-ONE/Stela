@@ -65,7 +65,7 @@ fn restored_members<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
 pub const RECOVERY_COMMENT: &[u8] = b"Stela recovery members";
 
 /// The archive comment of the boot inputs a setup keeps on its USB
-/// ([`copy_named`] of `boot::restore_inputs`): fewer members still than a
+/// ([`copy_named`] of `boot::restore_inputs_in`): fewer members still than a
 /// recovery archive, enough to prepare restore bundles.
 pub const INPUTS_COMMENT: &[u8] = b"Stela boot inputs";
 
@@ -589,7 +589,7 @@ fn finish_inventory(
                 let mut file = tempfile::NamedTempFile::new_in(directory)?;
                 file.write_all(key.key_pem.as_bytes())?;
                 file.as_file().sync_all()?;
-                file.persist_noclobber(&path).map_err(|error| error.error)?;
+                crate::efi::persist_new(file, &path)?;
             }
             keys.push(
                 json!({"member": key.member, "header_sha256": key.header_sha256,
@@ -731,7 +731,13 @@ pub fn remote_inventory<R: Read + Seek>(
 /// The product version and build of an IPSW's restore identity for
 /// `model`, from its ZIP directory and `Restore.plist` alone.
 pub fn identity(image: &Path, model: &str) -> Result<(String, String)> {
-    let mut archive = ZipArchive::new(File::open(image)?)?;
+    identity_of(File::open(image)?, model)
+}
+
+/// [`identity`] of an IPSW read from `source`, a local file or one read by
+/// ranges, whose directory and BuildManifest alone are read.
+pub fn identity_of<R: Read + Seek>(source: R, model: &str) -> Result<(String, String)> {
+    let mut archive = ZipArchive::new(source)?;
     let recovery = partial(&archive);
     let (_, restore) = profile_manifest(&mut archive, model, recovery)?;
     Ok((restore.product_version, restore.product_build))
@@ -754,10 +760,17 @@ pub fn trim<R: Read + Seek>(source: R, model: &str, output: &Path, what: &str) -
     let progress = crate::progress::Phase::bytes(what, total);
     let part = output.with_extension("part");
     // A partial archive cannot be resumed: it is removed on any failure.
-    let written = copy_members(&mut archive, &names, &part, RECOVERY_COMMENT, &progress)
-        .inspect_err(|_| {
-            let _ = fs::remove_file(&part);
-        })?;
+    let written = copy_members(
+        &mut archive,
+        &names,
+        &part,
+        RECOVERY_COMMENT,
+        &progress,
+        None,
+    )
+    .inspect_err(|_| {
+        let _ = fs::remove_file(&part);
+    })?;
     fs::rename(&part, output)?;
     progress.finish();
     Ok(written)
@@ -782,34 +795,57 @@ fn recovery_members<R: Read + Seek>(
     Ok((names, total))
 }
 
-/// The bytes [`trim`] would copy from the IPSW `source` for `model`, read
-/// from its ZIP directory alone; and the whole IPSW's.
-pub fn recovery_bytes<R: Read + Seek>(mut source: R, model: &str) -> Result<(u64, u64)> {
-    let whole = source.seek(std::io::SeekFrom::End(0))?;
-    let mut archive = ZipArchive::new(source)?;
-    Ok((recovery_members(&mut archive, model)?.1, whole))
+/// The bytes of `names` in the IPSW `source`, as copied (stored).
+pub fn members_bytes(source: &Path, names: &[String]) -> Result<u64> {
+    members_bytes_in(&mut ZipArchive::new(File::open(source)?)?, names, false)
 }
 
-/// The bytes of `names` in the IPSW `source`.
-pub fn members_bytes(source: &Path, names: &[String]) -> Result<u64> {
-    let mut archive = ZipArchive::new(File::open(source)?)?;
+/// The bytes of `names` in `archive`: as stored in it (`compressed`), which
+/// is what reading them by ranges downloads, or as copied.
+pub fn members_bytes_in<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    names: &[String],
+    compressed: bool,
+) -> Result<u64> {
     names.iter().try_fold(0u64, |total, name| -> Result<u64> {
+        let member = archive.by_name(name)?;
         total
-            .checked_add(archive.by_name(name)?.size())
+            .checked_add(match compressed {
+                true => member.compressed_size(),
+                false => member.size(),
+            })
             .context("member size overflow")
     })
 }
 
 /// Copy `names` of the IPSW `source` into a new stored archive at
-/// `output` with [`INPUTS_COMMENT`], written beside it and renamed when
-/// complete. Returns the bytes written for the members.
+/// `output` with [`INPUTS_COMMENT`] ([`copy_named_from`]).
 pub fn copy_named(source: &Path, names: &[String], output: &Path, what: &str) -> Result<u64> {
-    let mut archive = ZipArchive::new(File::open(source)?)?;
-    let total = members_bytes(source, names)?;
+    copy_named_from(
+        &mut ZipArchive::new(File::open(source)?)?,
+        names,
+        output,
+        what,
+        None,
+    )
+}
+
+/// Copy `names` of `archive`, a local IPSW or one read by ranges (whose
+/// reads `limit` ends at each member's last byte), into a new stored
+/// archive at `output` with [`INPUTS_COMMENT`], written beside it and
+/// renamed when complete. Returns the bytes written for the members.
+pub fn copy_named_from<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    names: &[String],
+    output: &Path,
+    what: &str,
+    limit: Option<&super::remote::Limit>,
+) -> Result<u64> {
+    let total = members_bytes_in(archive, names, false)?;
     let progress = crate::progress::Phase::bytes(what, total);
     let part = output.with_extension("part");
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    let written = copy_members(&mut archive, &names, &part, INPUTS_COMMENT, &progress)
+    let written = copy_members(archive, &names, &part, INPUTS_COMMENT, &progress, limit)
         .inspect_err(|_| {
             let _ = fs::remove_file(&part);
         })?;
@@ -819,13 +855,14 @@ pub fn copy_named(source: &Path, names: &[String], output: &Path, what: &str) ->
 }
 
 /// Copy `names` of `archive` into a new stored archive `part` with
-/// `comment`.
+/// `comment`; `limit` ends a ranged reader's reads at each member's end.
 fn copy_members<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     names: &[&str],
     part: &Path,
     comment: &[u8],
     progress: &crate::progress::Phase,
+    limit: Option<&super::remote::Limit>,
 ) -> Result<u64> {
     use zip::{CompressionMethod, write::SimpleFileOptions};
     let mut writer = zip::ZipWriter::new(File::create(part)?);
@@ -834,6 +871,10 @@ fn copy_members<R: Read + Seek>(
         let index = archive
             .index_for_name(name)
             .with_context(|| format!("the IPSW lacks {name}"))?;
+        if let Some(limit) = limit {
+            let member = archive.by_index_raw(index)?;
+            limit.set(member.data_start() + member.compressed_size());
+        }
         let mut member = archive.by_index(index)?;
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
@@ -951,8 +992,7 @@ pub fn write(options: &WriteOptions<'_>) -> Result<serde_json::Value> {
     file.write_all(manifest.to_json().as_bytes())?;
     file.write_all(b"\n")?;
     file.as_file().sync_all()?;
-    file.persist_noclobber(&manifest_path)
-        .map_err(|error| error.error)?;
+    crate::efi::persist_new(file, &manifest_path)?;
     Ok(json!({
         "manifest": manifest_path,
         "build": manifest.product_build,

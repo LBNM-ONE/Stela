@@ -19,9 +19,10 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     assert_eq!(digests.len(), objects.len());
     let (count, bytes) = size();
     assert_eq!(count, objects.len());
-    assert_eq!(count, recipes().count(), "no two recipes share a file yet");
-    // The recipes' recorded lengths: 75 files, 118.4 MiB.
-    assert_eq!((count, bytes), (75, 124_174_880), "{count} {bytes}");
+    // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS do.
+    assert_eq!(count + 2, recipes().count());
+    // The recipes' recorded lengths: 97 files, 118.5 MiB.
+    assert_eq!((count, bytes), (97, 124_284_312), "{count} {bytes}");
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 63_571_696);
     let manifest = manifest(&complete()).unwrap();
@@ -77,12 +78,20 @@ fn members(selection: &Selection) -> Vec<&'static str> {
     members
 }
 
-const BLUETOOTH: [&str; 5] = [
+/// The USB Bluetooth and Ethernet files every boot reads, sorted.
+const USB: [&str; 12] = [
     "intel/ibt-20-1-3.ddc",
     "intel/ibt-20-1-3.sfi",
     "mediatek/BT_RAM_CODE_MT7922_1_1_hdr.bin",
     "mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin",
     "mediatek/mt7925/BT_RAM_CODE_MT7925_1_1_hdr.bin",
+    "rtl_nic/rtl8153a-2.fw",
+    "rtl_nic/rtl8153a-3.fw",
+    "rtl_nic/rtl8153a-4.fw",
+    "rtl_nic/rtl8153b-2.fw",
+    "rtl_nic/rtl8153c-1.fw",
+    "rtl_nic/rtl8156a-2.fw",
+    "rtl_nic/rtl8156b-2.fw",
 ];
 
 fn pci(vendor: u16, device: u16, class: u8) -> Pci {
@@ -95,9 +104,9 @@ fn pci(vendor: u16, device: u16, class: u8) -> Pci {
 
 #[test]
 fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
-    // No device of a supported family: the USB Bluetooth files alone.
+    // No device of a supported family: the USB Bluetooth and Ethernet files alone.
     let none = select(&[pci(0x8086, 0x125c, 0x02), pci(0x1b36, 0x000d, 0x0c)]);
-    assert_eq!(members(&none), BLUETOOTH);
+    assert_eq!(members(&none), USB);
     assert!(none.unknown.is_empty());
     // An RTX 5080 (GB203) and its audio function, an MT7925 and an RTL8168.
     let pc = select(&[
@@ -106,7 +115,7 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
         pci(0x14c3, 0x7925, 0x02),
         pci(0x10ec, 0x8168, 0x02),
     ]);
-    let mut expected: Vec<&str> = BLUETOOTH.to_vec();
+    let mut expected: Vec<&str> = USB.to_vec();
     expected.extend([
         "mediatek/mt7925/WIFI_MT7925_PATCH_MCU_1_1_hdr.bin",
         "mediatek/mt7925/WIFI_RAM_CODE_MT7925_1_1.bin",
@@ -118,7 +127,11 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     ]);
     expected.extend(recipes::REALTEK.iter().map(|recipe| recipe.image.member));
     expected.sort_unstable();
+    expected.dedup();
     assert_eq!(members(&pc), expected);
+    // A Realtek chip under an alias ID, such as a Killer E2600, reads them too.
+    let killer = select(&[pci(0x10ec, 0x2600, 0x02)]);
+    assert!(members(&killer).contains(&"rtl_nic/rtl8168h-2.fw"));
     assert_eq!(
         pc.wanted
             .iter()
@@ -131,7 +144,7 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     assert!(pc.bytes() < 70_000_000, "{}", pc.bytes());
     // An AX210: its image and PNVM and the database.
     let ax210 = select(&[pci(0x8086, 0x2725, 0x02)]);
-    let mut expected: Vec<&str> = BLUETOOTH.to_vec();
+    let mut expected: Vec<&str> = USB.to_vec();
     expected.extend([
         "intel/iwlwifi/iwlwifi-ty-a0-gf-a0-89.ucode",
         "intel/iwlwifi/iwlwifi-ty-a0-gf-a0.pnvm",
@@ -147,7 +160,7 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
         pci(0x1002, 0xab40, 0x04),
         pci(0x1002, 0x164e, 0x03),
     ]);
-    let mut expected: Vec<&str> = BLUETOOTH.to_vec();
+    let mut expected: Vec<&str> = USB.to_vec();
     expected.extend(recipes::AMDGPU.iter().map(|recipe| recipe.image.member));
     expected.sort_unstable();
     assert_eq!(members(&navi48), expected);
@@ -155,7 +168,7 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     // An NVIDIA display chip no recipe covers is named once.
     let old = select(&[pci(0x10de, 0x1b80, 0x03), pci(0x10de, 0x1b80, 0x03)]);
     assert_eq!(old.unknown, ["pci 10de:1b80"]);
-    assert_eq!(members(&old), BLUETOOTH);
+    assert_eq!(members(&old), USB);
 }
 
 #[test]

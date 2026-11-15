@@ -3,8 +3,8 @@
 // Copyright (c) 2026 Stela contributors
 //! Exact PCI-table-selected I219 SPT/CNP/TGP/ADP cohorts. Family selection is
 //! pinned to the donor's PCI table, not the product suffix or PHY ID.
-//! In particular CMP12 selects SPT; CMP10/11 select CNP. MTP and later MACs
-//! require additional PHY/K1/retry and real platform-quirk permission and refuse.
+//! In particular CMP12 selects SPT; CMP10/11 select CNP. MTP and PTP, with
+//! their PHY, K1, retry and board-quirk rules, are selected in `mtp`.
 use super::{Controller, Delay, Error, lpt};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,16 +159,17 @@ pub(super) mod tests {
                     unsafe { Controller::claim_i219(sample_device(family), io, timer) }.unwrap();
                 let result = controller.validate_nvm();
                 let kind = match result {
+                    // Linux repairs the image in flash; Stela runs it unwritten.
+                    Ok(()) if controller.nvm.repair_left_out() => 2,
                     Ok(()) => 0,
                     Err(Error::Nvm(nvm::Error::Checksum(_))) => 1,
-                    Err(Error::Nvm(nvm::Error::RepairRequired)) => 2,
                     Err(other) => panic!("unexpected family NVM error{other:?}"),
                 };
                 assert_eq!(
                     kind, expected,
                     "family={family:?} marker={marker} check={check}"
                 );
-                if kind == 0 {
+                if kind != 1 {
                     assert_eq!(
                         controller.nvm.station().unwrap().0,
                         [2, 0x11, 0x22, 0x33, 0x44, 0x55]

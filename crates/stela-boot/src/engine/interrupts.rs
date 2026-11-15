@@ -17,6 +17,9 @@ pub const TIMER_VECTOR: u8 = 0x40;
 pub(crate) const NATIVE_WAKE_VECTOR: u8 = 0x60;
 /// The MMIO aperture's TLB shootdown (`native_mmio::shootdown`).
 pub(crate) const SHOOTDOWN_VECTOR: u8 = 0x61;
+/// A host device's completion signal (`host::completion_signal`): a
+/// doorbell that also counts the signals apart from other cores' doorbells.
+pub(crate) const SIGNAL_VECTOR: u8 = 0x62;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 const CODE_SELECTOR: u16 = 0x08;
 const DATA_SELECTOR: u16 = 0x10;
@@ -341,7 +344,27 @@ vectors!(
     64 none,
     80 none, 81 none, 82 none, 83 none, 84 none, 85 none, 86 none, 87 none,
     88 none, 89 none, 90 none, 91 none, 92 none, 93 none, 94 none, 95 none,
-    96 none, 97 none, 255 none,
+    96 none, 97 none, 98 none, 255 none,
+);
+
+/// Whether the table gives `vector` a stub, and so a gate: an interrupt on
+/// a vector with no gate is a general protection fault.
+const fn has_stub(vector: u8) -> bool {
+    let mut index = 0;
+    while index < VECTOR_NUMBERS.len() {
+        if VECTOR_NUMBERS[index] == vector as usize {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+const _: () = assert!(
+    has_stub(TIMER_VECTOR)
+        && has_stub(NATIVE_WAKE_VECTOR)
+        && has_stub(SHOOTDOWN_VECTOR)
+        && has_stub(SIGNAL_VECTOR)
+        && has_stub(SPURIOUS_VECTOR)
 );
 
 unsafe extern "C" {
@@ -528,6 +551,7 @@ pub(crate) extern "sysv64" fn interrupt(frame: &mut Frame, saved: &SavedState<'_
         }
         TIMER_VECTOR => host::timer_interrupt(),
         NATIVE_WAKE_VECTOR => host::wake_interrupt(),
+        SIGNAL_VECTOR => host::signal_interrupt(),
         SHOOTDOWN_VECTOR => host::shootdown_interrupt(),
         SPURIOUS_VECTOR => host::spurious_interrupt(),
         vector @ 32.. => host::stray_interrupt(vector),
@@ -631,11 +655,13 @@ pub fn fatal(frame: &Frame) -> ! {
     };
     output::fatal(format_args!(
         "unexpected x86 exception in the system engine: vector={} error={:#x} rip={:#x} \
-         (image+{:#x}) cr2={:#x} cr3={:#x} drivers={drivers} stack={callers}",
+         (image+{:#x}) code={} rax={:#x} cr2={:#x} cr3={:#x} drivers={drivers} stack={callers}",
         frame.vector,
         frame.error,
         frame.rip,
         frame.rip.wrapping_sub(&raw const __ImageBase as u64),
+        output::Code::at(frame.rip),
+        frame.rax,
         cr2(),
         cr3()
     ))

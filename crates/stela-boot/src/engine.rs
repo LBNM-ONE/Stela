@@ -869,16 +869,20 @@ fn show_reset(otherwise: &str, action: &str, hold: u64) {
         return;
     }
     show_stop(&guest_down(String::from(otherwise)));
-    crate::status::info(
-        "Its full log is on this USB: on another computer, `stela setup boot-log --usb USB` \
-         prints it.",
-    );
+    output::flush_log();
+    if output::usb_log_kept() {
+        crate::status::info(
+            "Its full log is on this USB: on another computer, plug in this USB and run `stela \
+             log`, which saves it to log.txt.",
+        );
+    }
     crate::status::countdown(action, hold);
 }
 
 /// [`show_stop`], then halt until the PC is turned off.
 fn stop_here(text: &str, code: u32) -> ! {
     show_stop(text);
+    output::flush_log();
     crate::status::info(output::stopped_text());
     output::terminate(code)
 }
@@ -1360,10 +1364,36 @@ fn machine_report<H: Host>(machine: &mut Machine<H, parallel::Board>) {
     general_registers(cpu);
 }
 
-/// Whether this processor stopped inside the host drivers, whose lock it
-/// holds: storing a log from here would wait on itself.
+/// Whether this processor holds the host drivers' lock where a log store
+/// from here would wait on itself: stopped inside a driver call, or inside
+/// the device start other than between two drivers' calls
+/// ([`storage::between_drivers_here`]).
 pub(crate) fn inside_host_drivers() -> bool {
-    storage::host_drivers_held_here()
+    storage::host_drivers_held_here() && !storage::between_drivers_here()
+}
+
+/// Whether this processor is starting the host's devices, holding their
+/// lock by design rather than stopped inside a driver: the start stores
+/// the USB's log itself between two devices.
+pub(crate) fn starting_host_devices() -> bool {
+    storage::starting_devices_here()
+}
+
+/// Store the USB's log from inside the GPU's start, which holds the host
+/// drivers' lock outside every storage driver's call; whether this
+/// processor is where that can be done (`storage::store_usb_log_in_gpu_start`).
+pub(crate) fn store_usb_log_in_gpu_start() -> bool {
+    storage::store_usb_log_in_gpu_start()
+}
+
+/// Run a stop's firmware call in the loader's root `root`
+/// (`storage::at_stop_in_loader_root`).
+///
+/// # Safety
+/// As for `storage::at_stop_in_loader_root`.
+pub(crate) unsafe fn in_loader_root_at_stop<T>(root: u64, call: impl FnOnce() -> T) -> T {
+    // SAFETY: the caller's.
+    unsafe { storage::at_stop_in_loader_root(root, call) }
 }
 
 /// Unload the GPUs' firmware before a fatal stop, where one can

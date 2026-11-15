@@ -492,7 +492,10 @@ const _: () = assert!(ItlbMiss::Cold as usize + 1 == ItlbMiss::COUNT);
 /// - contexts made;
 /// - TLBIs another PE sent that the PE's mail merged into a range;
 /// - pages a context made anew walked again at once, which its forgotten
-///   predecessor of the same key had taken (`Machine::refill_pages`).
+///   predecessor of the same key had taken (`Machine::refill_pages`);
+/// - of the entries dropped in every context: those of the upper half,
+///   those a TLBI without an ASID dropped in the lower half, and those of
+///   a global page a TLBI with an ASID dropped there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ItlbSource {
     FillsLower,
@@ -507,13 +510,16 @@ pub(super) enum ItlbSource {
     Made,
     MailMerged,
     Refilled,
+    DropUpper,
+    DropNoAsid,
+    DropGlobal,
 }
 
 impl ItlbSource {
-    pub(super) const COUNT: usize = 12;
+    pub(super) const COUNT: usize = 15;
 }
 
-const _: () = assert!(ItlbSource::Refilled as usize + 1 == ItlbSource::COUNT);
+const _: () = assert!(ItlbSource::DropGlobal as usize + 1 == ItlbSource::COUNT);
 // A fill counts at `FillsLower` plus its half.
 const _: () = assert!(ItlbSource::FillsUpper as usize == ItlbSource::FillsLower as usize + 1);
 
@@ -588,7 +594,7 @@ pub struct Statistics {
     pub itlb_drops: [u64; 5],
     /// The ITLB's fills, drops and forgotten contexts by where they came
     /// from, in `ItlbSource`'s order.
-    pub itlb_sources: [u64; 12],
+    pub itlb_sources: [u64; ItlbSource::COUNT],
     pub compiled: u64,
     /// Of `compiled`, the blocks that run their iterations inside
     /// themselves (`CompiledBlock::self_loop`).
@@ -614,12 +620,23 @@ pub struct Statistics {
     pub page_ticks: u64,
     pub shared_ticks: u64,
     pub install_ticks: u64,
+    /// Counter ticks fetches spent walking the translation of a PC the
+    /// ITLB or block table lacked, and walking again the pages of dropped
+    /// entries and remade contexts (`Machine::refill_pages`).
+    pub walk_ticks: u64,
+    pub refill_ticks: u64,
     /// Fetch pages read again whose key a check of their bytes gave
     /// without hashing them ([`stored::page_check`]).
     pub known_keys: u64,
     /// Fetch pages read again whose known key the store held no record
     /// for: not looked up again.
     pub known_absent: u64,
+    /// Blocks offered to the store while memory was low.
+    pub offered_low: u64,
+    /// Fetches whose page the store held a record for that gave no block:
+    /// it held no entry at the block's offset and context, or one that did
+    /// not relocate to this page.
+    pub record_misses: [u64; 2],
     /// Device transfers run because their deadline came, and the devices'
     /// interrupt lines and deadline asked anew because a cached answer
     /// expired, with the profile clock ticks each took under step timing.
@@ -769,8 +786,12 @@ impl core::ops::AddAssign for Statistics {
             page_ticks,
             known_keys,
             known_absent,
+            offered_low,
+            record_misses,
             shared_ticks,
             install_ticks,
+            walk_ticks,
+            refill_ticks,
             due_transfers,
             transfer_ticks,
             native_transitions,
@@ -897,6 +918,9 @@ impl core::ops::AddAssign for Statistics {
         for (total, count) in self.itlb_sources.iter_mut().zip(itlb_sources) {
             *total += count;
         }
+        for (total, count) in self.record_misses.iter_mut().zip(record_misses) {
+            *total += count;
+        }
         self.stamped_in_use = self.stamped_in_use.max(stamped_in_use);
         for (total, count) in self
             .store_sources
@@ -924,8 +948,11 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.page_ticks, page_ticks),
             (&mut self.known_keys, known_keys),
             (&mut self.known_absent, known_absent),
+            (&mut self.offered_low, offered_low),
             (&mut self.shared_ticks, shared_ticks),
             (&mut self.install_ticks, install_ticks),
+            (&mut self.walk_ticks, walk_ticks),
+            (&mut self.refill_ticks, refill_ticks),
             (&mut self.due_transfers, due_transfers),
             (&mut self.transfer_ticks, transfer_ticks),
             (&mut self.line_queries, line_queries),

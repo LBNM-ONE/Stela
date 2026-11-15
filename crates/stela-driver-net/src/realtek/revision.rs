@@ -171,13 +171,32 @@ pub(super) fn detect(txconfig: u32) -> Option<Revision> {
     })
 }
 
+/// Every Realtek PCI device ID this driver takes as a candidate: first the
+/// IDs with a chip family of their own, then the aliases.
+pub const PCI_DEVICES: &[u16] = &[
+    0x8161, 0x8168, 0x8169, 0x8125, 0x8126, 0x2502, 0x2600, 0x8129, 0x8162, 0x8167, 0x3000, 0x5000,
+    0x0e10,
+];
+/// The IDs [`pci_family`] gives a family of their own.
+const PRIMARY_PCI_DEVICES: usize = 5;
 // Same-vendor aliases use the pinned donor's common XID dispatch; they are
 // candidates, not a claim that any unknown or unsupported revision can run.
-const PCI_ALIASES: &[u16] = &[
-    0x2502, 0x2600, 0x8129, 0x8162, 0x8167, 0x3000, 0x5000, 0x0e10,
-];
+const PCI_ALIASES: &[u16] = PCI_DEVICES.split_at(PRIMARY_PCI_DEVICES).1;
 pub(super) fn pci_candidate(device: u16) -> bool {
-    matches!(device, 0x8161 | 0x8168 | 0x8169 | 0x8125 | 0x8126) || PCI_ALIASES.contains(&device)
+    PCI_DEVICES.contains(&device)
+}
+
+/// Every implemented revision that loads a firmware file, once for each
+/// table entry, the RTL9151AS once for each extended word its marker takes.
+pub(super) fn with_firmware() -> impl Iterator<Item = Revision> {
+    let primary = ENTRIES.iter().filter_map(|e| {
+        let revision = detect(u32::from(e.1) << 20)?;
+        (revision.implemented() && revision.firmware.is_some()).then_some(revision)
+    });
+    let extended = [0, 0x8000_0000]
+        .into_iter()
+        .filter_map(|raw| detect_extended(0x7c8 << 20, raw));
+    primary.chain(extended)
 }
 
 pub(super) fn pci_family(device: u16, revision: Revision) -> bool {

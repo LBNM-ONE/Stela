@@ -243,6 +243,7 @@ impl AhciDisk {
                 running: Vec::new(),
                 next_tag: 0,
                 looks: 0,
+                signal: None,
             });
             let disk = kept.get_mut().disk.as_mut().expect("same initialized disk");
             let port = disk.port;
@@ -561,7 +562,10 @@ impl AhciDisk {
         if lpm.dipm {
             dipm(self, FEATURE_SATA_DISABLE)?;
         }
-        // sata_link_scr_lpm; the port's PhyRdy interrupt is already masked.
+        // sata_link_scr_lpm. Linux masks the port's PhyRdy interrupt
+        // first, as PxIE does here for a port that sends messages; a look
+        // drops PRCS by the policy too, since PxIS latches it whatever PxIE
+        // masks.
         let scr_lpm = || {
             let mut control = port.read32(PORT_SATA_CONTROL);
             if policy == LPM_MAX_POWER {
@@ -584,6 +588,7 @@ impl AhciDisk {
         // ahci_set_lpm restricts the link first when saving power, and
         // lifts the restrictions last at max_power.
         if policy != LPM_MAX_POWER {
+            self.mask_interrupts(port, policy);
             scr_lpm();
         }
         if lpm.capabilities & CAP_AGGRESSIVE_LPM != 0 {
@@ -619,6 +624,8 @@ impl AhciDisk {
         }
         if policy == LPM_MAX_POWER {
             scr_lpm();
+            // ahci_set_lpm turns the PhyRdy interrupt back on last.
+            self.mask_interrupts(port, policy);
         }
         let old = self.lpm.policy;
         self.lpm.policy = policy;
@@ -628,8 +635,10 @@ impl AhciDisk {
             && let Err(error) = dipm(self, FEATURE_SATA_ENABLE)
         {
             self.lpm.policy = old;
+            self.mask_interrupts(port, old);
             return Err(error);
         }
+        self.lpm.changed = self.clock.try_start().ok();
         Ok(())
     }
 

@@ -2,9 +2,11 @@
 // Copyright(c) 1999 - 2018 Intel Corporation.
 // Copyright (c) 2026 Stela contributors
 //! Initial SPT I219 LM/V (156f/1570), with the integrated flash window,
-//! unmanaged force-ULP exit and descriptor-flush status. Later I219 generations
-//! are not selected by their common I217 PHY ID. Initial PHY identity must be
-//! accessible; firmware/SMM, ME ownership and other users remain excluded.
+//! forced ULP exit and descriptor-flush status. Later I219 generations are not
+//! selected by their common I217 PHY ID. The PHY is first read after the
+//! forced ULP exit, which the Intel ME performs when it manages the adapter
+//! and a LANPHYPC toggle otherwise; firmware/SMM and other users remain
+//! excluded.
 use super::{
     Controller, Delay, Error, Fault, Identity, Kind, Phy, Profile, Register, Registers, i219, lpt,
     nvm,
@@ -55,8 +57,8 @@ impl<R: lpt::LptRegisters, D: Delay + Clone> Controller<R, D> {
     /// requirements apply, with vendor8086/class020000/device156f/1570.
     /// Config/MMIO/integrated MAC+e000 flash/PHY share one kept
     /// Function/reset epoch. LTR words remain immutable, while config e4 is a
-    /// real live read at every required reset/stop point. The initial PHY is
-    /// accessible and identifies as I217 before the forced interconnect cycle.
+    /// real live read at every required reset/stop point. The PHY identifies
+    /// as I217 once the forced interconnect cycle has brought it up.
     /// A foreign ring requiring flush is refused without touching foreign RAM.
     /// No native config/MMIO/DMA provider or probe admission is supplied here.
     pub unsafe fn new_spt(device: u16, io: R, delay: D) -> Result<Self, Error> {
@@ -115,6 +117,7 @@ impl<R: lpt::LptRegisters, D: Delay + Clone> Controller<R, D> {
             poisoned: false,
             profile: profile(limits),
             config_read: Some(R::read_config16),
+            ulp_exit_failed: false,
         })
     }
 }
@@ -151,41 +154,68 @@ impl<R: Registers + nvm::Registers, D: Delay + Clone> Controller<R, D> {
         Ok(())
     }
     pub(super) fn initialize_i219(&mut self) -> Result<(), Error> {
-        self.qualify()?;
         self.inherited_ring_check()?;
-        self.identity = self.phy.identify()?;
         self.validate_nvm()?;
         self.station = self.nvm.station()?;
+        let managed = self.managed()?;
         self.gate(true)?;
-        self.spt_ulp_exit()?;
+        // As `e1000_init_phy_workarounds_pchlan`, force ULP off before the
+        // first PHY read: a PHY the last OS left in ULP, as it does with no
+        // cable at shutdown, or behind SMBus answers no MDIO cycle until
+        // then. The ME does it on request when it manages the adapter, a
+        // LANPHYPC toggle otherwise. A failed exit is noted, as Linux logs
+        // "Failed to disable ULP", and the start goes on: whether the PHY
+        // answers is settled by the recovery that follows, which wakes it
+        // as Linux does. Its identity is checked right after.
+        let exit = if managed {
+            self.me_ulp_exit()
+        } else {
+            self.spt_ulp_exit()
+        };
+        self.ulp_exit_failed = exit.is_err();
+        self.recover_phy_access(managed)?;
+        self.identity = self.phy.identify()?;
         // The donor releases SWFLAG before this hardware PHY reset. No PHY
         // transaction wrapper may span it, or the later full-chip reset.
-        self.phy_reset()?;
-        self.configuration_done()?;
-        self.post_reset()?;
+        // A reset the ME blocks is left out with its configuration wait and
+        // post-reset steps, as `e1000e_phy_hw_reset_generic` and
+        // `e1000_post_phy_reset_ich8lan` return at once then.
+        if self.reset_phy()? {
+            self.configuration_done(true)?;
+            self.post_reset()?;
+        }
         self.phy.wait_minimum(50_000)?;
-        self.qualify()?;
         self.identity = self.phy.identify()?;
-        if self.phy.read(ULP_CONFIG)? & ULP_CLEAR != 0 {
+        // The ME keeps the ULP configuration and the interconnect of an
+        // adapter it manages as it chose; Linux reads neither back then. A
+        // ULP exit that failed leaves the configuration as it was, as Linux
+        // does, and only a clean exit is read back.
+        if !managed && !self.ulp_exit_failed && self.phy.read(ULP_CONFIG)? & ULP_CLEAR != 0 {
             return Err(Error::UlpState);
         }
-        if self.phy.read(SMB_CONTROL)? & 1 != 0 || self.read(CTRL_EXT)? & FORCE_SMBUS != 0 {
+        if !managed
+            && (self.phy.read(SMB_CONTROL)? & 1 != 0 || self.read(CTRL_EXT)? & FORCE_SMBUS != 0)
+        {
             return Err(Error::SmbusMode);
         }
         self.mtp_initial_k1(true)?;
         // The source initialization flow follows forced ULP exit with another
         // generic PHY reset before normal MAC reset/PHY post-configuration.
-        self.phy_reset()?;
-        self.configuration_done()?;
+        let reset = self.reset_phy()?;
+        if reset {
+            self.configuration_done(true)?;
+        }
         self.mtp_initial_k1(false)?;
-        self.qualify()?;
+        if reset && self.reset_blocked()? {
+            return Err(Error::BlockedAfterReset);
+        }
         self.identity = self.phy.identify()?;
         self.write(super::PBA, super::RX_ALLOCATION_KIB)?;
         self.inherited_ring_check()?;
         let value = self.read(FEXTNVM11)?;
         self.write(FEXTNVM11, value | DISABLE_MULR_FIX)?;
-        self.global_reset()?;
-        self.configuration_done()?;
+        let reset = self.global_reset()?;
+        self.configuration_done(reset)?;
         self.post_reset()?;
         self.write(super::IMC, u32::MAX)?;
         self.read(super::ICR)?;

@@ -4788,6 +4788,22 @@
   },
   {
     "package": "stela-engine",
+    "test": "compression_costs",
+    "source": "crates/stela-engine/src/machine/engine/compression.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing measurement; run on request"
+  },
+  {
+    "package": "stela-compiler",
+    "test": "decode_costs_over_distinct_pages",
+    "source": "crates/stela-compiler/src/wkdm/codec.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "host timing measurement; run on request"
+  },
+  {
+    "package": "stela-engine",
     "test": "segment_lookup_costs",
     "source": "crates/stela-engine/src/translations/pack.rs",
     "kind": "manual",
@@ -4889,5 +4905,13 @@
     "kind": "manual",
     "inputs": [],
     "reason": "timing, release only; run on request"
+  },
+  {
+    "package": "xtask",
+    "test": "explicit_flags_override_a_hardened_default",
+    "source": "xtask/src/gpu/toolchain.rs",
+    "kind": "manual",
+    "inputs": [],
+    "reason": "needs a supported host Clang and llvm-nm; simulates a distribution Clang that hardens by default; run on request"
   }
 ]

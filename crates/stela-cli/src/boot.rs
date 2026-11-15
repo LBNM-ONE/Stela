@@ -22,7 +22,7 @@ use stela_loader::trust_cache::CodeHash;
 
 mod board_firmware;
 mod disk;
-mod members;
+pub(crate) mod members;
 mod ticket;
 
 const MANIFEST_FILE: &str = "bundle.json";
@@ -534,14 +534,29 @@ pub(crate) fn prepare(arguments: &[String]) -> Result<()> {
     line.prepare.run()
 }
 
-/// The members of `ipsw` that [`prepare`] reads for `model`'s erase
-/// restore bundle (`--restore`), the list its reads are held to.
+/// [`restore_inputs_in`] of the IPSW file `ipsw`.
+#[cfg(test)]
 pub(crate) fn restore_inputs(ipsw: &std::path::Path, model: &str) -> Result<Vec<String>> {
+    restore_inputs_in(
+        &mut zip::ZipArchive::new(std::fs::File::open(ipsw)?)?,
+        model,
+    )
+}
+
+/// The members of the IPSW in `archive` (a local file, the USB's install
+/// medium or one read by ranges) that [`prepare`] reads for `model`'s erase
+/// restore bundle (`--restore`), the list its reads are held to: its
+/// directory and BuildManifest alone are read.
+pub(crate) fn restore_inputs_in<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    model: &str,
+) -> Result<Vec<String>> {
     let profile = components::Profile::of(model)?;
-    let report = restore::archive::manifest(ipsw, None, false)?;
+    let manifest = restore::archive::build_manifest(archive)?;
+    let report = restore::manifest::inspect(&manifest, None)?;
     let identity = components::identity(&report, &profile, Purpose::Erase)?;
     Ok(members::names(
-        ipsw,
+        &mut |name| Ok(archive.index_for_name(name).is_some()),
         &members::Choice {
             report: &report,
             profile: &profile,
@@ -822,7 +837,7 @@ impl Prepare {
         // Every member read from here on is one of this list, which a
         // setup keeps to prepare the bundle again (`members`).
         let names = members::names(
-            &ipsw,
+            &mut |name| restore::archive::has_member(&ipsw, name),
             &members::Choice {
                 report: &report,
                 profile: &profile,

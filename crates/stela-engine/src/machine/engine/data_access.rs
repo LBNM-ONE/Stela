@@ -65,10 +65,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .is_some()
             .then(|| self.host.profile_ticks());
         if started.is_some() {
-            self.timed_write = Some([0; 3]);
+            self.timed_write = Some([0; step_timing::WRITE_PARTS]);
         }
         let work = self.work();
-        let outcome = if self.serial_hold.is_some() {
+        // A serialized PE's write takes the canonical path only when that
+        // path must serve it: the plain path settles once, after the write,
+        // where the canonical one settles the devices first as well.
+        let outcome = if self.serial_hold.is_some()
+            && self
+                .devices
+                .requires_canonical_write(self.current, physical, bytes)
+        {
             None
         } else {
             self.observe_parallel_source(SourcePhase::DeviceAdvanceEnter);
@@ -82,6 +89,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     let ended = self.host.profile_ticks();
                     self.time_part(0, started, outcome.written_at);
                     self.time_part(1, outcome.written_at, ended);
+                    self.time_part(3, outcome.written_at, outcome.settled_at);
+                    self.time_part(4, outcome.unlocked_at, ended);
+                    if let Some(parts) = &mut self.timed_write {
+                        parts[5] += outcome.released;
+                    }
                 }
                 let settlement = outcome
                     .settled

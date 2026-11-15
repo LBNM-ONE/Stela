@@ -7,8 +7,8 @@ mod reports;
 use boundary::*;
 pub use boundary::{
     CodePartitions, CodeWindow, ConsumedPair, DeviceError, Devices, Host, LocalRegisters,
-    LockedMemory, NativeView, NoDevices, PassiveRegisters, ScalarRead, Settled, Start, UnlockedDma,
-    WriteSettled,
+    LockedMemory, NativeView, NoDevices, PassiveRegisters, PlainRead, ScalarRead, Settled, Start,
+    UnlockedDma, WriteSettled,
 };
 use compilation::{PENDING_EXITS, PendingExits};
 use mirrors::*;
@@ -738,13 +738,21 @@ pub struct Machine<H: Host, D: Devices> {
     /// and writes most and, under step timing, the costliest
     /// ([`Self::device_registers`]).
     device_registers: BTreeMap<u64, DeviceRegister>,
+    /// The board's fast-IPI table while this PE's native IPI writes use it
+    /// (`Mirrors::fast_ipi`), which keeps its words alive.
+    fast_ipi: Option<Arc<crate::machine::fast_ipi::Table>>,
+    /// The generation native device reads' keys hold
+    /// ([`mirrors::DEVICE_READ_KEY`]), and the model epochs of the reads
+    /// in `Mirrors::device_reads`, which those keep alive.
+    device_read_generation: u64,
+    device_read_epochs: Vec<Option<Arc<core::sync::atomic::AtomicU64>>>,
     /// The register the native fault being handled reached, which its
     /// exit's ticks are charged to ([`Self::timing_exit`]).
     timed_device: Option<u64>,
     /// Under step timing, the device write being handled: the ticks of its
     /// access call, its settle (the DMA after it) and its gate call
     /// ([`step_timing::DeviceWrites`]).
-    timed_write: Option<[u64; 3]>,
+    timed_write: Option<[u64; step_timing::WRITE_PARTS]>,
     /// System exits by instruction word, with their handling time under step
     /// timing ([`Self::system_words`]).
     system_words: BTreeMap<u32, DeviceRegister>,
@@ -805,6 +813,8 @@ pub struct Machine<H: Host, D: Devices> {
     /// The slots of the board's known page keys ([`known_keys`]), sized
     /// by the store.
     known_slots: usize,
+    /// WKDMC and WKDMD's page and data buffers, made at the first.
+    wkdm_buffers: Option<Box<compression::Buffers>>,
     /// Why blocks were installed ([`install_census`]); the census exists
     /// while step timing is on.
     install_causes: InstallCauses,
@@ -984,6 +994,8 @@ pub struct Machine<H: Host, D: Devices> {
     watch: Watch,
     /// The context the host last isolated predictions for.
     prediction_context: Option<PredictionContext>,
+    /// The regime the host was last given ([`Self::sync_host_regime`]).
+    synced_regime: Option<Regime>,
     /// The number of the running PE.
     current: usize,
     /// The WFI, WFE, WFIT or WFET the running PE waits in, until it wakes.
@@ -1304,6 +1316,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             entered_pending: Vec::new(),
             entered_total: 0,
             device_registers: BTreeMap::new(),
+            fast_ipi: None,
+            device_read_generation: 0,
+            device_read_epochs: alloc::vec![None; stela_compiler::x86_64::register_read::DEVICE_READS],
             timed_device: None,
             timed_write: None,
             system_words: BTreeMap::new(),
@@ -1331,6 +1346,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             successor_scratch: Vec::new(),
             successor_boxes: Default::default(),
             known_slots: known_keys::DEFAULT_SLOTS,
+            wkdm_buffers: None,
             install_causes: InstallCauses::default(),
             install_stream: board::YOUNG,
             held_places: Vec::new(),
@@ -1401,6 +1417,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             system_decode: system_access::DecodeCache::default(),
             watch: Watch::default(),
             prediction_context: None,
+            synced_regime: None,
             current: boot_processor,
             waiting: None,
             peers: Vec::new(),

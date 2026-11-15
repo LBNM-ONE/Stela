@@ -488,6 +488,9 @@ pub struct Heap {
     failures: AtomicU64,
     /// Where the first failed allocation is reported; it must not allocate.
     failure_sink: fn(core::fmt::Arguments<'_>),
+    /// The first failed allocation's bytes and alignment, for a report that
+    /// can no longer ask the heap ([`Heap::first_failure`]).
+    failed: [AtomicUsize; 2],
     state: UnsafeCell<State>,
     /// Each tagged core's cache and counts.
     cores: [Core; CPUS],
@@ -501,6 +504,8 @@ pub struct Heap {
     total: AtomicUsize,
     main: AtomicUsize,
     carved: AtomicUsize,
+    /// The heap's bytes not carved, the reserve's with the main bins'.
+    room: AtomicUsize,
     waits: AtomicU64,
 }
 // SAFETY: all list/header mutations use the real acquire/release exclusion.
@@ -523,12 +528,20 @@ impl Heap {
         }
     }
 
+    /// The bytes and alignment of the first allocation that found no
+    /// memory, once one has.
+    pub fn first_failure(&self) -> Option<(usize, usize)> {
+        let align = self.failed[1].load(Ordering::Acquire);
+        (align != 0).then(|| (self.failed[0].load(Ordering::Relaxed), align))
+    }
+
     pub const fn new() -> Self {
         Self {
             held: AtomicBool::new(false),
             failure_reported: AtomicBool::new(false),
             failures: AtomicU64::new(0),
             failure_sink: |_| {},
+            failed: [const { AtomicUsize::new(0) }; 2],
             cores: [const { Core::new() }; CPUS],
             tagged: AtomicUsize::new(0),
             any_tagged: AtomicBool::new(false),
@@ -536,6 +549,7 @@ impl Heap {
             total: AtomicUsize::new(0),
             main: AtomicUsize::new(0),
             carved: AtomicUsize::new(0),
+            room: AtomicUsize::new(0),
             waits: AtomicU64::new(0),
             state: UnsafeCell::new(State {
                 start: 0,
@@ -830,6 +844,20 @@ impl Heap {
             || self.carved.load(Ordering::Relaxed) > self.main.load(Ordering::Relaxed) / 16 * 15
     }
 
+    /// The heap's bytes, as the lock last left them.
+    pub fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// The bytes no block was carved from, the reserve's with the main
+    /// bins', as the lock last left them: what a large request can surely
+    /// still find, short of the holes between live blocks and the freed
+    /// small blocks their classes keep. A cache that may grow asks it
+    /// without taking the lock.
+    pub fn room(&self) -> usize {
+        self.room.load(Ordering::Relaxed)
+    }
+
     /// Bytes allocated and not freed: the class lists' and the caches'.
     fn live(&self) -> usize {
         self.live
@@ -1111,6 +1139,9 @@ impl Drop for Guard<'_> {
         self.heap
             .carved
             .store(state.carved - state.carved_reserve, Ordering::Relaxed);
+        self.heap
+            .room
+            .store(state.total - state.carved, Ordering::Relaxed);
         self.heap.held.store(false, Ordering::Release);
         #[cfg(target_os = "uefi")]
         // SAFETY: this CPU's saved flags; the guard cannot migrate and no

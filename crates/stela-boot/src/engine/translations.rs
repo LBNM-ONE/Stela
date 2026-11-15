@@ -1,4 +1,4 @@
-//! `stela.efi`'s persistent translation store: the pack file `stela setup`
+//! `stela.efi`'s persistent translation store: the pack file `stela`
 //! makes room for in `stela/store` on the boot USB's FAT32 data partition.
 //!
 //! The file is a journal (`stela_formats::journal`) of pack segments and of
@@ -40,10 +40,10 @@ use stela_engine::machine::Translations;
 use stela_engine::machine::engine::StoreEvent;
 use stela_engine::translations;
 use stela_engine::translations::Digest;
-use stela_engine::translations::Record;
 use stela_engine::translations::pack;
 use stela_engine::translations::pack::{DecodedRecord, Pack, StagedOffer, Store, UsedKeys};
 use stela_engine::translations::writer::{self, Entries, Event, Writer};
+use stela_engine::translations::{Record, StoredRecord};
 use stela_formats::journal::{self, Commit, DATA_START, SLOT_BYTES};
 use stela_formats::payload::pieces::Extent;
 use stela_runtime::pc::fat32::Fat32;
@@ -63,7 +63,7 @@ use uefi::{
 /// The handoff file holding the store's placement and what was read of its
 /// pack file.
 pub const FILE: &str = "translations";
-/// The store's directory on its volume, and `stela setup`'s bound there.
+/// The store's directory on its volume, and `stela`'s bound there.
 pub(super) const DIRECTORY: &str = "stela\\store";
 const CONFIG: &str = "store.cfg";
 const BYTES_KEY: &str = "bytes";
@@ -72,7 +72,7 @@ const CONFIG_LIMIT: usize = 256;
 /// name the FAT32 reader finds.
 const NAME_BYTES: usize = 4;
 const PACK_EXTENSION: &str = "pak";
-/// A blank, preallocated pack file `stela setup` keeps beside the packs: a
+/// A blank, preallocated pack file `stela` keeps beside the packs: a
 /// new translator's pack takes it by rename. The boot never grows a file,
 /// which the firmware does by writing every byte.
 const SPARE: &str = "spare.bin";
@@ -224,7 +224,7 @@ pub fn read(budget: u64) -> Option<Opened> {
         let Ok(mut root) = volume.open_volume() else {
             continue;
         };
-        // The file's size, which `stela setup` allocated.
+        // The file's size, which `stela` allocated.
         let Some(bound) = bound(&mut root) else {
             continue;
         };
@@ -245,8 +245,12 @@ pub fn read(budget: u64) -> Option<Opened> {
                 let size = file
                     .get_boxed_info::<FileInfo>()
                     .map_or(0, |info| info.file_size());
-                let loaded = read_journal(&mut file, &translator, size, limit)?;
-                (loaded, size, writable && size >= bound)
+                let allocated = writable && size >= bound;
+                // A pack the boot may write gets the rest of its limit as
+                // the arena its new segments' records move to.
+                let arena = allocated && partition.is_some() && limit >= PACK_FLOOR;
+                let loaded = read_journal(&mut file, &translator, size, limit, arena)?;
+                (loaded, size, allocated)
             }
             None => (blank()?, 0, false),
         };
@@ -363,12 +367,16 @@ fn blank() -> Option<Loaded> {
 /// records that end within what is left, its index trimmed to name only
 /// them (`translation_store::within`). Segments are not checked whole here:
 /// a pack checks its index, and each record its own bytes when first used.
-/// `None` only when no memory is left for the region.
+/// With `arena`, the region holds `limit` bytes of blobs in all: the room
+/// the pack read leaves is the writer's arena ([`pack::Arena`]), outside
+/// the heap as the pack is. `None` only when no memory is left for the
+/// region.
 fn read_journal(
     file: &mut RegularFile,
     translator: &Digest,
     size: u64,
     limit: u64,
+    arena: bool,
 ) -> Option<Loaded> {
     let mut slots = vec![0; DATA_START as usize];
     let commit = if size >= DATA_START && read_exact(file, &mut slots).is_some() {
@@ -415,7 +423,16 @@ fn read_journal(
         .map(|&length| (length as usize).next_multiple_of(8))
         .sum();
     let head = PLACEMENT_BYTES + SLOT_BYTES as usize + 8 * entries.len();
-    let bytes = head + blobs;
+    let spare = if arena {
+        usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(blobs)
+            / PAGE
+            * PAGE
+    } else {
+        0
+    };
+    let bytes = head + blobs + spare;
     let pages = bytes.div_ceil(PAGE);
     let physical = firmware::pages(pages).ok()?;
     // SAFETY: firmware returned this exclusive allocation of `bytes` or
@@ -606,12 +623,16 @@ struct Available {
     shared_bound: AtomicUsize,
     /// The fetch pages the machines keep in all ([`Translations::kept_pages`]).
     kept_pages: AtomicUsize,
+    /// The writer sheds new entries, the heap being short
+    /// ([`writer::Entries::shed`]): offers skip making their stored form.
+    shed: AtomicBool,
 }
 
 static AVAILABLE: Available = Available {
     capabilities: AtomicU8::new(0),
     shared_bound: AtomicUsize::new(0),
     kept_pages: AtomicUsize::new(0),
+    shed: AtomicBool::new(false),
 };
 const READ_PACK: u8 = 1 << 0;
 const WRITE_PACK: u8 = 1 << 1;
@@ -693,13 +714,21 @@ impl Shared {
     /// share its block.
     fn publish_writable(offer: Offer) {
         let bound = AVAILABLE.shared_bound.load(Ordering::Acquire) / PARTS;
-        let entry = offer.entry();
         let lock = part(&offer.key());
-        lock.with(|store| {
-            if let Some(store) = store {
-                store.keep(&offer, entry);
-            }
-        });
+        if AVAILABLE.shed.load(Ordering::Relaxed) {
+            lock.with(|store| {
+                if let Some(store) = store {
+                    store.count_shed(&offer);
+                }
+            });
+        } else {
+            let entry = offer.entry();
+            lock.with(|store| {
+                if let Some(store) = store {
+                    store.keep(&offer, entry);
+                }
+            });
+        }
         let Some(mut staged) = StagedOffer::new(offer, bound) else {
             return;
         };
@@ -711,7 +740,7 @@ impl Shared {
 impl Translations for Shared {
     /// The pack bytes outlive the lock, so other PEs can reach the store
     /// while a record is decoded. A writer also tracks absent keys.
-    fn record(&mut self, key: &Digest) -> Option<alloc::sync::Arc<Record>> {
+    fn record(&mut self, key: &Digest) -> Option<alloc::sync::Arc<StoredRecord>> {
         if !available(READ_PACK | WRITE_PACK) {
             return None;
         }
@@ -787,12 +816,6 @@ impl Translations for Shared {
         }
     }
 
-    fn lend(&mut self, offer: Offer) {
-        if available(SHARE_BLOCKS) {
-            Self::publish_shared(offer);
-        }
-    }
-
     fn note(&mut self, event: StoreEvent) {
         match event {
             StoreEvent::PageRead { ticks } => {
@@ -850,16 +873,36 @@ pub fn share(bound: usize) {
     });
 }
 
-/// Make the store of the handoff file `contents` the engine's: the GPT
-/// partition to open for writing it, when it can be written.
-pub fn install(contents: &'static [u8]) -> Option<Guid> {
+/// Make the store of the handoff file `region` the engine's: the GPT
+/// partition to open for writing it, when it can be written. What follows
+/// its blobs is the writer's arena.
+pub fn install(region: &'static mut [u8]) -> Option<Guid> {
     let head = PLACEMENT_BYTES + SLOT_BYTES as usize;
-    if contents.len() < head || contents[..8] != PLACEMENT_MAGIC {
+    if region.len() < head || region[..8] != PLACEMENT_MAGIC {
         return None;
     }
+    let word = |at: usize| u32::from_le_bytes(region[at..at + 4].try_into().expect("a word"));
+    let count = word(36) as usize;
+    // The blobs end where their lengths, after the head, say.
+    let lengths = head.checked_add(count.checked_mul(8)?)?;
+    let blobs = region
+        .get(head..lengths)?
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .try_fold(lengths, |at, length| {
+            at.checked_add(
+                usize::try_from(u64::from_le_bytes(*length))
+                    .ok()?
+                    .next_multiple_of(8),
+            )
+        })?
+        .min(region.len());
+    let (contents, arena) = region.split_at_mut(blobs);
+    let contents: &'static [u8] = contents;
     let field = |at: usize| u64::from_le_bytes(contents[at..at + 8].try_into().expect("a field"));
     let word = |at: usize| u32::from_le_bytes(contents[at..at + 4].try_into().expect("a word"));
-    let (limit, flags, count, size) = (field(8), word(32), word(36) as usize, field(40));
+    let (limit, flags, size) = (field(8), word(32), field(40));
     let translator = translations::translator_id();
     let slot = &contents[PLACEMENT_BYTES..head];
     let committed = (0..2).find_map(|index| Commit::decode(slot, index, DOMAIN, size));
@@ -911,6 +954,7 @@ pub fn install(contents: &'static [u8]) -> Option<Guid> {
         segments: segments.clone(),
         used,
         partial,
+        arena: pack::Arena::new(arena),
     };
     let held = PackWriter {
         writer: Writer::new(file, super::host::COUNTER_HZ),
@@ -1054,11 +1098,15 @@ fn report(counters: &pack::Counters) {
     }
     let checks = stela_engine::machine::entry_checks();
     output::arguments(format_args!(
-        "TRANSLATIONS added={} unstorable={} unkept={} checked={} differed={} loaded={} \
-         absent={} invalid={} locks acquired={acquired} contended={contended} spin_ms={}\n",
+        "TRANSLATIONS added={} unstorable={} unkept={} unkept_entries={} retaken={} shed={} \
+         checked={} differed={} loaded={} absent={} invalid={} locks acquired={acquired} \
+         contended={contended} spin_ms={}\n",
         counters.added,
         counters.unstorable,
         counters.unkept,
+        counters.unkept_entries,
+        counters.retaken,
+        counters.shed,
         checks.checked,
         checks.differed,
         counters.loaded,
@@ -1122,6 +1170,31 @@ impl Entries for Parts {
             .iter()
             .any(|lock| lock.with(|store| store.as_ref().is_some_and(Store::added_pressed)))
     }
+
+    fn heap(&mut self) -> Option<writer::Heap> {
+        Some(writer::Heap {
+            total: crate::ALLOCATOR.total() as u64,
+            room: crate::ALLOCATOR.room() as u64,
+        })
+    }
+
+    fn added_bytes(&mut self) -> u64 {
+        STORES
+            .iter()
+            .map(|lock| lock.with(|store| store.as_ref().map_or(0, |store| store.added_bytes())))
+            .sum::<usize>() as u64
+    }
+
+    fn shed(&mut self, shed: bool) {
+        AVAILABLE.shed.store(shed, Ordering::Relaxed);
+        for lock in &STORES {
+            lock.with(|store| {
+                if let Some(store) = store {
+                    store.shed(shed);
+                }
+            });
+        }
+    }
 }
 
 /// Report what a writer step did.
@@ -1154,6 +1227,34 @@ fn report_event(event: &Event) {
         )),
         Event::Lost { records } => output::arguments(format_args!(
             "TRANSLATIONS segment of {records} records left out: larger than the file holds\n"
+        )),
+        Event::Shed {
+            reason,
+            room,
+            pack,
+            resident,
+        } => output::arguments(format_args!(
+            "TRANSLATIONS shed reason={reason:?} room={}M pack={}M resident={}M: new \
+             translations are not kept {}\n",
+            room.map_or(0, |room| room >> 20),
+            pack >> 20,
+            resident >> 20,
+            match reason {
+                writer::ShedReason::Heap => "while the heap is short",
+                writer::ShedReason::Pack => "past the share of the pack a boot leaves",
+            }
+        )),
+        Event::ArenaFull { used, resident } => output::arguments(format_args!(
+            "TRANSLATIONS arena full used={}M resident={}M: written records stay in the heap, \
+             within its share\n",
+            used >> 20,
+            resident >> 20
+        )),
+        Event::Released { room, bytes, lost } => output::arguments(format_args!(
+            "TRANSLATIONS released room={}M bytes={}M lost={lost}: the heap is nearly full; \
+             the segments stay in the file and no more are added this boot\n",
+            room >> 20,
+            bytes >> 20
         )),
     }
 }
@@ -1215,15 +1316,24 @@ pub fn write() {
         let stats = held.writer.stats();
         output::arguments(format_args!(
             "TRANSLATIONS writer steps={} longest_us={} segments={} records={} bytes={} \
-             pressed={} pairs={} merges={}\n",
+             pressed={} held={} pairs={} merges={} sheds={} resident_peak={}M released={} \
+             arena={}M/{}M compacted={}/{}M\n",
             held.steps,
             held.longest * 1_000_000 / super::host::COUNTER_HZ,
             stats.deltas,
             stats.delta_records,
             stats.delta_bytes,
             stats.pressed,
+            stats.held,
             stats.pairs,
             stats.merges,
+            stats.sheds,
+            stats.resident_peak >> 20,
+            held.writer.shedding().1,
+            held.writer.arena().0 >> 20,
+            (held.writer.arena().0 + held.writer.arena().1) >> 20,
+            stats.compactions,
+            stats.compacted >> 20,
         ));
         let name = pack_name(&translations::translator_id());
         let stopped = held.writer.stop(&mut Parts, &mut |execution| {

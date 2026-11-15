@@ -16,6 +16,54 @@ fn phy_status_bit_7_is_tbi_only_on_the_8169_family() {
 }
 
 #[test]
+fn firmware_requests_name_every_admitted_chips_file_and_target() {
+    let requests: Vec<_> = firmware_requests().collect();
+    // The RTL8111H, by XID and as the RTL8168M, asks under its PCI ID.
+    for xid in ["xid-541", "xid-6c0"] {
+        assert!(requests.contains(&(0x8168, "rtl_nic/rtl8168h-2.fw", xid.into())));
+    }
+    assert!(requests.contains(&(0x8125, "rtl_nic/rtl8125b-2.fw", "xid-641".into())));
+    assert!(requests.contains(&(
+        0x3000,
+        "rtl_nic/rtl9151a-1.fw",
+        "xid-7c8-ext-80000000".into()
+    )));
+    // A chip outside a PCI ID's family never asks under it.
+    assert!(
+        !requests
+            .iter()
+            .any(|(device, name, _)| *device == 0x8168 && name.contains("8125"))
+    );
+    assert!(!requests.iter().any(|(device, _, _)| *device == 0x8169));
+    // Every request is the one load_firmware makes for its detected chip.
+    for (_, name, revision) in &requests {
+        let xid = u32::from_str_radix(&revision[4..7], 16).unwrap();
+        let detected = match revision.split_once("-ext-") {
+            Some((_, raw)) => {
+                revision::detect_extended(xid << 20, u32::from_str_radix(raw, 16).unwrap())
+            }
+            None => revision::detect(xid << 20),
+        }
+        .unwrap();
+        assert_eq!(detected.firmware, Some(*name));
+        assert_eq!(&target_revision(detected), revision);
+    }
+}
+
+#[test]
+fn an_unknown_chip_names_its_xid_and_a_silent_one_says_so() {
+    use alloc::string::ToString;
+    assert_eq!(
+        Error::UnknownMac(0x5450_0000).to_string(),
+        "unknown Realtek chip revision XID 545 (TxConfig 0x54500000)"
+    );
+    assert_eq!(
+        Error::UnknownMac(u32::MAX).to_string(),
+        "Realtek registers read all ones: the chip does not answer"
+    );
+}
+
+#[test]
 fn exact_ordered_revision_fixtures_refuse_unknown_ancient_and_wrong_pci_family() {
     // Independent source-table cases include overlapping specific/generic masks.
     for (xid, version, fw) in [
@@ -150,4 +198,70 @@ fn firmware_catalog_binding_requires_exact_pci_xid_board_and_filename() {
             ..
         }))
     ));
+
+    // Linux rtl_request_firmware: a missing or refused file is left out,
+    // said once, and the chip starts without it.
+    let mut warnings = Vec::new();
+    assert!(optional_firmware(&catalog, "10ec:8168", revision(34), &mut warnings).is_some());
+    assert!(optional_firmware(&catalog, "10ec:8168", revision(18), &mut warnings).is_none());
+    assert!(warnings.is_empty());
+    assert!(optional_firmware(&catalog, "10ec:8168", other, &mut warnings).is_none());
+    assert!(optional_firmware(&catalog, "10ec:8161", revision(34), &mut warnings).is_none());
+    assert_eq!(
+        warnings,
+        [
+            Warning::FirmwareSkipped {
+                name: "rtl_nic/rtl8168e-2.fw",
+                supplied: false
+            },
+            Warning::FirmwareSkipped {
+                name: "rtl_nic/rtl8168e-3.fw",
+                supplied: true
+            },
+        ]
+    );
+    assert_eq!(
+        alloc::string::ToString::to_string(&warnings[0]),
+        "firmware \"rtl_nic/rtl8168e-2.fw\" not supplied: started without it, on the chip's \
+         built-in parameters, as Linux does"
+    );
+}
+
+/// A supplied file that fails its checks is left out like a missing one,
+/// and said once as refused.
+#[test]
+fn a_supplied_firmware_that_fails_its_checks_is_refused_and_left_out() {
+    use resources::{Catalog, Provenance, Resource, Target};
+    use sha2::{Digest, Sha256};
+    // Six bytes: no header, and not a whole number of raw commands.
+    let bytes = vec![0x00, 0x00, 0x1f, 0x80, 0x00, 0x00];
+    assert!(Script::parse(&bytes).is_err());
+    let catalog = Catalog::from_handoff(vec![Resource {
+        name: "rtl_nic/rtl8168e-3.fw",
+        target: Target {
+            driver: "realtek",
+            hardware: "10ec:8168",
+            revision: "xid-2c8",
+            board: None,
+        },
+        provenance: Provenance {
+            source: "synthetic-test",
+            revision: "1",
+            member: "rtl_nic/rtl8168e-3.fw",
+            license: "MIT",
+        },
+        expected_length: bytes.len(),
+        expected_sha256: Sha256::digest(&bytes).into(),
+        bytes,
+    }])
+    .unwrap();
+    let mut warnings = Vec::new();
+    assert!(optional_firmware(&catalog, "10ec:8168", revision(34), &mut warnings).is_none());
+    assert_eq!(
+        warnings,
+        [Warning::FirmwareSkipped {
+            name: "rtl_nic/rtl8168e-3.fw",
+            supplied: true
+        }]
+    );
 }

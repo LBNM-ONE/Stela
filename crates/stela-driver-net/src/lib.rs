@@ -15,7 +15,7 @@ mod test_process;
 
 #[cfg(test)]
 use stela_driver_base::test_clock;
-use stela_driver_base::{Clock, Deadline, Handoff, block, bus, registers, waiting};
+use stela_driver_base::{Clock, Deadline, Handoff, block, bus, registers};
 use stela_driver_core::{bytes, firmware};
 
 use alloc::{string::String, vec::Vec};
@@ -64,6 +64,29 @@ impl Mac {
     }
 }
 
+impl Mac {
+    /// Linux `is_valid_ether_addr`: neither multicast nor all zeros.
+    pub fn is_valid(&self) -> bool {
+        !self.is_multicast() && self.0 != [0; 6]
+    }
+
+    /// Linux `eth_random_addr`, for an adapter whose programmed address is
+    /// missing or invalid (`eth_hw_addr_random`): a locally administered
+    /// unicast address, mixed from the time-stamp counter and `seed` (the
+    /// adapter's location), so two such adapters get different ones.
+    pub fn random(seed: &[u8]) -> Self {
+        let mut mixed = Clock::ticks() ^ 0x9e37_79b9_7f4a_7c15;
+        for &byte in seed {
+            mixed = (mixed ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^= mixed >> 31;
+        let [a, b, c, d, e, f, _, _] = mixed.to_le_bytes();
+        Self([(a & !1) | 2, b, c, d, e, f])
+    }
+}
+
 impl fmt::Display for Mac {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let [a, b, c, d, e, g] = self.0;
@@ -83,7 +106,16 @@ pub enum LinkError {
     /// The link is down: no frame can leave until it comes back. Frames the
     /// adapter held when it went down are discarded, as Linux does.
     NoCarrier,
+    /// The transmit ring is full: the frame was not taken. The caller keeps
+    /// it and tries again on a later poll, as Linux's stack requeues a
+    /// `NETDEV_TX_BUSY` frame; no send waits for the controller.
+    Busy,
 }
+
+/// How long a wired link may take from its start to carrier: copper
+/// autonegotiation after a PHY reset or power-up, about 3 s at 1000BASE-T
+/// and up to 5-7 s at 2.5G/5G/10GBASE-T, with margin.
+pub const WIRED_CARRIER_WAIT_US: u64 = 10_000_000;
 
 /// A raw Ethernet II link: whole frames without the FCS.
 pub trait Link {
@@ -93,9 +125,21 @@ pub trait Link {
     fn carrier(&mut self) -> bool {
         true
     }
+    /// How long after its start the link may take to report carrier before
+    /// a missing one means no cable or no network. The default is a wired
+    /// PHY's, and every link here keeps it.
+    fn carrier_wait_us(&self) -> u64 {
+        WIRED_CARRIER_WAIT_US
+    }
     /// Queues one frame (14-byte header and payload, at most 1514 bytes).
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError>;
     /// One frame the adapter received, if any, without blocking.
+    ///
+    /// A damaged frame (CRC, length, alignment or framing error, a failed
+    /// bus transfer the adapter recovers from) is dropped and counted, as
+    /// Linux counts `rx_errors`, and never returned as an error: the stack
+    /// treats an `Err` as a device that is gone or wedged beyond its own
+    /// recovery and stops using the link.
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError>;
     /// Receive one frame into caller-owned reusable storage. The buffer is
     /// unchanged if no frame is available or the adapter reports an error.
@@ -122,3 +166,20 @@ pub trait Link {
 }
 
 mod timing;
+
+#[cfg(test)]
+mod mac_tests {
+    use super::Mac;
+
+    #[test]
+    fn a_random_address_is_locally_administered_unicast_and_differs_by_adapter() {
+        let one = Mac::random(b"0000:03:00.0");
+        let other = Mac::random(b"0000:04:00.0");
+        for mac in [one, other] {
+            assert!(mac.is_valid());
+            assert_eq!(mac.0[0] & 3, 2, "{mac}");
+        }
+        assert_ne!(one, other);
+        assert!(!Mac([0; 6]).is_valid() && !Mac([1, 0, 0, 0, 0, 1]).is_valid());
+    }
+}

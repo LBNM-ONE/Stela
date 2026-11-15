@@ -36,6 +36,12 @@ fn debounce_with_delay(
     }
 }
 
+/// What is left of [`CONNECT_SETTLE_US`] once the ports have been powered
+/// for `waited_us`.
+fn settle_left(waited_us: u64) -> u64 {
+    CONNECT_SETTLE_US.saturating_sub(waited_us)
+}
+
 /// Linux `hub_port_debounce` for several ports at once, as its hub threads
 /// debounce in parallel: every unsettled port is sampled at each step, so the
 /// whole set settles in one window. A port with no connection and no connect
@@ -394,9 +400,10 @@ impl Controller {
         devices
     }
 
-    /// Power every unpowered root port and wait once for them all, then
-    /// debounce every port together.
-    fn debounce_roots(&mut self) -> Result<Vec<Debounced>, BlockError> {
+    /// Power every unpowered root port and wait once for them all. The
+    /// connect settle time runs from the first call that finds them all
+    /// powered, or from a later one that had to power one again.
+    pub(super) fn power_roots(&mut self) -> Result<(), BlockError> {
         self.check_minimum()?;
         let mut powered = false;
         for port in 1..=self.max_ports {
@@ -409,11 +416,26 @@ impl Controller {
         if powered {
             self.minimum_wait(PORT_POWER_US)?;
         }
+        if powered || self.settle_from.is_none() {
+            self.settle_from = Some(self.clock.now_us());
+        }
+        Ok(())
+    }
+
+    /// Power the root ports ([`Self::power_roots`]), then debounce every
+    /// port together. What is left of the connect settle time since the
+    /// ports were powered is waited here, once for them all.
+    fn debounce_roots(&mut self) -> Result<Vec<Debounced>, BlockError> {
+        self.power_roots()?;
+        let waited = self
+            .clock
+            .now_us()
+            .saturating_sub(self.settle_from.unwrap_or(u64::MAX));
         let minimum = self.minimum.clone();
         minimum.check()?;
         let settled = debounce_ports_with_delay(
             usize::from(self.max_ports),
-            CONNECT_SETTLE_US,
+            settle_left(waited),
             |index| Ok(self.sample_root(index as u8 + 1)),
             || minimum.wait_us(DEBOUNCE_STEP_US),
         );
@@ -426,7 +448,22 @@ impl Controller {
         if portsc & CSC != 0 {
             self.write_port(port, CSC);
         }
-        (portsc & CCS != 0, portsc & CSC != 0)
+        (
+            portsc & CCS != 0 || self.warm_reset_required(port, portsc),
+            portsc & CSC != 0,
+        )
+    }
+
+    /// Linux `hub_port_warm_reset_required`, with Cold Attach Status read as
+    /// `xhci_hub_report_usb3_link_state` reads it: a powered USB 3 root port
+    /// whose link is in SS.Inactive or Compliance Mode, or that saw a device
+    /// it could not train (CAS, xHCI 1.2 4.19.8), holds a device only a warm
+    /// reset brings up, whether or not it shows a connection.
+    pub(super) fn warm_reset_required(&self, port: u8, portsc: u32) -> bool {
+        let link = portsc >> PLS_SHIFT & PLS_FIELD;
+        self.port_major.get(usize::from(port.wrapping_sub(1))) == Some(&3)
+            && portsc & PP != 0
+            && (portsc & CAS != 0 || matches!(link, LINK_INACTIVE | LINK_COMPLIANCE))
     }
 
     /// Linux `hub_port_connect`: reset a port and enumerate its device, up
@@ -501,18 +538,17 @@ impl Controller {
         self.validate_current_graph(port)?;
         let at = self.port_offset(port);
         let clock = self.clock;
-        if self.registers.read32(at) & CCS == 0 {
+        let portsc = self.registers.read32(at);
+        let warm = self.warm_reset_required(port, portsc);
+        if portsc & CCS == 0 && !warm {
             return Ok(None);
         }
         // Clear the remaining changes, so later changes are this driver's.
-        let portsc = self.registers.read32(at);
         self.write_port(port, portsc & PORT_CHANGES);
-        let link = portsc >> PLS_SHIFT & PLS_FIELD;
-        if self.port_major[usize::from(port - 1)] == 3
-            && matches!(link, LINK_INACTIVE | LINK_COMPLIANCE)
-        {
+        let usb3 = self.port_major[usize::from(port - 1)] == 3;
+        if warm {
             // Linux `hub_port_reset` warm-resets a SuperSpeed link stuck in
-            // SS.Inactive or Compliance Mode.
+            // SS.Inactive or Compliance Mode, or one that never trained.
             self.write_port(port, WPR);
             if !wait(&mut *self.registers, clock, PORT_RESET_US, |r| {
                 r.read32(at) & (WRC | PRC) == WRC | PRC
@@ -521,7 +557,7 @@ impl Controller {
             }
             self.write_port(port, WRC | PRC);
             self.minimum_wait(RESET_RECOVERY_US)?;
-        } else if self.port_major[usize::from(port - 1)] != 3 {
+        } else if !usb3 {
             self.write_port(port, PR);
             let clock = self.clock;
             if !wait(&mut *self.registers, clock, PORT_RESET_US, |r| {
@@ -540,12 +576,17 @@ impl Controller {
             }
         }
         let portsc = self.registers.read32(at);
+        // Linux `hub_port_reset` returns -ENOTCONN for a warm reset that
+        // leaves no connection, and the port stays disabled: it is empty,
+        // not a failure. The warm reset cleared CAS, so the next look does
+        // not reset it again.
+        if warm && portsc & CCS == 0 {
+            return Ok(None);
+        }
         if portsc & PED == 0 {
             return Err(BlockError::Unsupported("root port did not enable"));
         }
-        if self.port_major[usize::from(port - 1)] != 3
-            || matches!(link, LINK_INACTIVE | LINK_COMPLIANCE)
-        {
+        if !usb3 || warm {
             self.current_port_reset(None, port)?;
         }
         Ok(Some((portsc >> PORT_SPEED_SHIFT & PORT_SPEED_FIELD) as u8))
@@ -764,15 +805,8 @@ impl Controller {
                     )),
                 );
             }
-            if configurations
-                .iter()
-                .any(|previous: &Vec<u8>| previous[5] == bytes[5])
-            {
-                return during(
-                    format!("slot {slot} configuration {index}"),
-                    Err(BlockError::Unsupported("duplicate USB configuration value")),
-                );
-            }
+            // A device may answer two indices with one configuration value.
+            // Linux keeps both and a value selects the first; so does this.
             configurations.push(bytes);
         }
         self.current_descriptions(slot, &configurations)

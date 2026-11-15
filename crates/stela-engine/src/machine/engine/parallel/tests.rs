@@ -94,7 +94,7 @@ fn a_pe_publishes_the_context_it_translates() {
         hub.inboxes[0].translating.load(Ordering::Relaxed),
         ANY_CONTEXT
     );
-    machine.sync_host_regime();
+    machine.sync_host_regime(super::super::step_timing::SyncSource::Other);
     let controls = machine.cpu.controls(machine.cpu.regime());
     assert_eq!(
         hub.inboxes[0].translating.load(Ordering::Relaxed),
@@ -2568,6 +2568,85 @@ fn passive_registers_are_read_without_the_devices_lock() {
     assert_eq!(home.with(|devices| devices.reads), 2);
 }
 
+#[test]
+fn plain_reads_are_served_again_without_the_lock_while_their_epoch_holds() {
+    /// A model at 0x40 whose 8-byte read is plain, and a bump of its epoch
+    /// on every write, as a bus moves it.
+    #[derive(Default)]
+    struct Plain {
+        epoch: Arc<AtomicU64>,
+        value: u64,
+        reads: usize,
+    }
+    impl Devices for Plain {
+        fn plain_epoch(&self, physical: u64, bytes: u8) -> Option<(Arc<AtomicU64>, u64)> {
+            (physical == 0x40 && bytes == 8)
+                .then(|| (Arc::clone(&self.epoch), self.epoch.load(Ordering::SeqCst)))
+        }
+        fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            self.reads += 1;
+            Ok(self.value)
+        }
+        fn write(
+            &mut self,
+            _: usize,
+            _: u64,
+            _: u8,
+            value: u64,
+            _: u64,
+        ) -> Result<(), DeviceError> {
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+            self.value = value;
+            Ok(())
+        }
+        fn lines(&mut self, _: usize, _: u64) -> Lines {
+            Lines::default()
+        }
+    }
+    let (hub, _) = hub(2);
+    let home = SharedDevices::new(Plain::default(), hub);
+    let mut worker = home.worker();
+    let reads = |home: &SharedDevices<Plain>| home.with(|devices| devices.reads);
+    // Each plain read it serves is native code's to serve again.
+    let plain = |worker: &mut SharedDevices<Plain>| {
+        worker.take_plain_read().map(|read| {
+            (
+                read.epoch.load(Ordering::SeqCst),
+                read.seen,
+                read.value,
+                read.until,
+            )
+        })
+    };
+    assert_eq!(worker.read_scalar(1, 0x40, 8, 0), ScalarRead::Served(Ok(0)));
+    assert_eq!(plain(&mut worker), Some((0, 0, 0, u64::MAX)));
+    assert_eq!(plain(&mut worker), None);
+    assert_eq!(reads(&home), 1);
+    // Served again while another call holds the devices' lock.
+    let held = home.board.lock(Call::Other);
+    assert_eq!(worker.read_scalar(1, 0x40, 8, 1), ScalarRead::Served(Ok(0)));
+    assert_eq!(plain(&mut worker), Some((0, 0, 0, u64::MAX)));
+    drop(held);
+    assert_eq!(reads(&home), 1);
+    // A write by another PE moves the epoch: the next read reaches the model.
+    let mut other = home.worker();
+    other.write(0, 0x40, 8, 5, 2).unwrap();
+    assert_eq!(worker.read_scalar(1, 0x40, 8, 3), ScalarRead::Served(Ok(5)));
+    assert_eq!(worker.read_scalar(1, 0x40, 8, 4), ScalarRead::Served(Ok(5)));
+    assert_eq!(reads(&home), 2);
+    // Other reads, and any read once a device deadline passed, reach it.
+    assert_eq!(worker.read_scalar(1, 0x48, 8, 5), ScalarRead::Served(Ok(5)));
+    assert_eq!(plain(&mut worker), None);
+    assert_eq!(worker.read_scalar(1, 0x40, 4, 5), ScalarRead::Served(Ok(5)));
+    assert_eq!(plain(&mut worker), None);
+    assert_eq!(reads(&home), 4);
+    home.board.time.store(6, Ordering::Release);
+    assert_eq!(worker.read_scalar(1, 0x40, 8, 6), ScalarRead::Served(Ok(5)));
+    assert_eq!(reads(&home), 5);
+    // Kept with the deadline it found.
+    assert_eq!(plain(&mut worker), Some((1, 1, 5, 6)));
+}
+
 /// The copies a transfer leaves ([`Devices::take_unlocked`]) run on the PE
 /// that settled the write, after it released the devices' lock, each once,
 /// with PEs settling at once; and what each came to is published by a
@@ -3171,13 +3250,23 @@ fn native_dsb_completes_only_without_outstanding_maintenance() {
     machine.cpu.pstate.el = 0;
     assert!(native(&mut machine), "at EL0");
     machine.cpu.pstate.el = 1;
-    // Maintenance for the other PE: the DSB must send it and wait.
+    // Maintenance while the other PE runs no block goes at once, and it
+    // will read it before it runs one: the DSB has nothing to complete.
+    hub.leave_active(1);
+    machine.post(Maintenance::Code(None));
+    assert!(machine.outgoing.is_empty() && machine.posted.is_empty());
+    assert!(hub.take(1).is_some());
+    assert!(native(&mut machine), "nobody to wait for");
+    // Maintenance while it runs a block: the DSB must send it and wait.
+    assert!(hub.enter_active(1));
     machine.post(Maintenance::Code(None));
     assert!(!native(&mut machine), "maintenance posted");
+    assert!(hub.take(1).is_none(), "kept for the DSB");
     hub.set_live(1, false);
     engine(&mut machine);
     assert!(machine.outgoing.is_empty() && machine.posted.is_empty());
     assert!(native(&mut machine));
+    hub.set_live(1, true);
     // A code page cell the DSB that ends the run of lines must close.
     machine.mirrors.open_code_page(0x4000);
     assert!(!native(&mut machine), "code page cell open");
@@ -3228,6 +3317,12 @@ fn released_host_work_goes_to_a_pe_that_sleeps_waiting_for_an_interrupt() {
     assert_eq!(work.done.load(Ordering::SeqCst), 1, "the caller did it");
     assert!(work.kicked.lock().unwrap().is_empty());
     assert!(!hub.service.load(Ordering::SeqCst));
+    let releases = |home: &SharedDevices<Pending>| {
+        let times = home.lock_times()[Call::Access as usize];
+        (times.stepped, times.handed)
+    };
+    assert_eq!(releases(&home), (1, 0), "counted as done on the caller");
+    assert_eq!(home.board.released[1].load(Ordering::SeqCst), 0, "no ticks");
     // PE 2 now sleeps waiting for an interrupt: it is woken for the work.
     hub.inboxes[2].serves.store(true, Ordering::SeqCst);
     work.due.store(true, Ordering::SeqCst);
@@ -3236,6 +3331,210 @@ fn released_host_work_goes_to_a_pe_that_sleeps_waiting_for_an_interrupt() {
     assert!(work.due.load(Ordering::SeqCst), "left for the service");
     assert_eq!(*work.kicked.lock().unwrap(), [2]);
     assert!(hub.take_service());
+    assert_eq!(releases(&home), (1, 1), "counted as handed off");
+}
+
+/// Released host work that only starts commands (a doorbell write) runs
+/// on the releasing PE at once, even with a PE asleep to take it: its wake
+/// would cost more, and the command would start only after it.
+#[test]
+fn released_work_that_only_starts_commands_runs_on_the_releasing_pe() {
+    #[derive(Default)]
+    struct Work {
+        kicked: Mutex<Vec<usize>>,
+        due: AtomicBool,
+        inline: AtomicBool,
+        done: AtomicUsize,
+    }
+    struct Released(Arc<Work>);
+    impl Kick for Released {
+        fn kick(&self, pe: usize) {
+            self.0.kicked.lock().unwrap().push(pe);
+        }
+        fn released(&self) -> bool {
+            if self.0.due.swap(false, Ordering::SeqCst) {
+                self.0.done.fetch_add(1, Ordering::SeqCst);
+            }
+            false
+        }
+        fn release_due(&self) -> bool {
+            self.0.due.load(Ordering::SeqCst)
+        }
+        fn release_inline(&self) -> bool {
+            self.0.inline.load(Ordering::SeqCst)
+        }
+    }
+    let work = Arc::new(Work::default());
+    let hub = Hub::new(3, Released(Arc::clone(&work)));
+    for pe in 0..3 {
+        hub.set_live(pe, true);
+    }
+    let home = SharedDevices::new(Pending::default(), Arc::clone(&hub));
+    let mut worker = home.worker();
+    let releases = |home: &SharedDevices<Pending>| {
+        let times = home.lock_times()[Call::Access as usize];
+        (times.stepped, times.handed)
+    };
+    // PE 1 is in a guest exit; PE 2 sleeps waiting for an interrupt.
+    hub.inboxes[1].outside.store(true, Ordering::SeqCst);
+    hub.inboxes[2].sleeping.store(true, Ordering::SeqCst);
+    hub.inboxes[2].serves.store(true, Ordering::SeqCst);
+    work.due.store(true, Ordering::SeqCst);
+    work.inline.store(true, Ordering::SeqCst);
+    assert_eq!(worker.read(1, 0x40, 8, 0), Ok(0));
+    assert_eq!(work.done.load(Ordering::SeqCst), 1, "started on the caller");
+    assert!(work.kicked.lock().unwrap().is_empty(), "no PE woken");
+    assert!(!hub.service.load(Ordering::SeqCst));
+    assert_eq!(releases(&home), (1, 0));
+    // Work that also takes completions still goes to the sleeping PE.
+    work.due.store(true, Ordering::SeqCst);
+    work.inline.store(false, Ordering::SeqCst);
+    assert_eq!(worker.read(1, 0x40, 8, 0), Ok(0));
+    assert_eq!(work.done.load(Ordering::SeqCst), 1);
+    assert_eq!(*work.kicked.lock().unwrap(), [2]);
+    assert_eq!(releases(&home), (1, 1));
+}
+
+/// A host interrupt a busy PE took at its release (a host disk's completion
+/// signal) wakes a PE that sleeps waiting for an interrupt, at that release
+/// on the model clock rather than at the busy PE's slice end; with none
+/// asleep the busy PE leaves it to the host's service, and work its own
+/// release handed on already is not handed twice.
+#[test]
+fn a_busy_pes_completion_signal_wakes_a_sleeping_pe_at_its_release() {
+    #[derive(Default)]
+    struct Signals {
+        kicked: Mutex<Vec<(usize, u64)>>,
+        signal: AtomicBool,
+        due: AtomicBool,
+        now: AtomicU64,
+    }
+    struct Signalled(Arc<Signals>);
+    impl Kick for Signalled {
+        fn kick(&self, pe: usize) {
+            let now = self.0.now.load(Ordering::SeqCst);
+            self.0.kicked.lock().unwrap().push((pe, now));
+        }
+        fn ticks(&self) -> u64 {
+            self.0.now.load(Ordering::SeqCst)
+        }
+        fn release_due(&self) -> bool {
+            self.0.due.load(Ordering::SeqCst)
+        }
+        fn signal_due(&self) -> bool {
+            self.0.signal.swap(false, Ordering::SeqCst)
+        }
+    }
+    let signals = Arc::new(Signals::default());
+    let hub = Hub::new(3, Signalled(Arc::clone(&signals)));
+    for pe in 0..3 {
+        hub.set_live(pe, true);
+    }
+    let home = SharedDevices::new(Pending::default(), Arc::clone(&hub));
+    let mut worker = home.worker();
+    let handed = |home: &SharedDevices<Pending>| {
+        let times = home.lock_times()[Call::Access as usize];
+        (times.handed, times.signals)
+    };
+    // PE 1 runs its guest; nobody sleeps: the signal waits for the service.
+    signals.now.store(1_000, Ordering::SeqCst);
+    signals.signal.store(true, Ordering::SeqCst);
+    assert_eq!(worker.read(1, 0x40, 8, 1_000), Ok(0));
+    assert!(signals.kicked.lock().unwrap().is_empty());
+    assert!(!hub.service.load(Ordering::SeqCst));
+    // PE 2 sleeps waiting for an interrupt: the next signal wakes it at the
+    // release that took it, at 2_500, not at PE 1's slice end.
+    hub.inboxes[2].sleeping.store(true, Ordering::SeqCst);
+    hub.inboxes[2].serves.store(true, Ordering::SeqCst);
+    signals.now.store(2_500, Ordering::SeqCst);
+    signals.signal.store(true, Ordering::SeqCst);
+    assert_eq!(worker.read(1, 0x40, 8, 2_500), Ok(0));
+    assert_eq!(*signals.kicked.lock().unwrap(), [(2, 2_500)]);
+    assert!(hub.take_service());
+    assert_eq!(handed(&home), (0, 1));
+    // A release that handed its own work on already wakes nobody twice.
+    hub.inboxes[1].outside.store(true, Ordering::SeqCst);
+    signals.due.store(true, Ordering::SeqCst);
+    signals.signal.store(true, Ordering::SeqCst);
+    assert_eq!(worker.read(1, 0x40, 8, 3_000), Ok(0));
+    assert_eq!(signals.kicked.lock().unwrap().len(), 2);
+    assert_eq!(handed(&home), (1, 1));
+}
+
+/// With no PE asleep, a release outside the run loop takes a completion
+/// signal's step itself, once for the signal; a stream of signals gets at
+/// most one step a release, none at a release that did its own host work
+/// already, and none from a PE inside its run loop.
+#[test]
+fn a_stream_of_signals_gets_at_most_one_step_a_release() {
+    #[derive(Default)]
+    struct Signals {
+        kicked: Mutex<Vec<usize>>,
+        due: AtomicBool,
+        released: AtomicUsize,
+        stepped: AtomicUsize,
+    }
+    struct Stream(Arc<Signals>);
+    impl Kick for Stream {
+        fn kick(&self, pe: usize) {
+            self.0.kicked.lock().unwrap().push(pe);
+        }
+        fn released(&self) -> bool {
+            self.0.due.store(false, Ordering::SeqCst);
+            self.0.released.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+        fn release_due(&self) -> bool {
+            self.0.due.load(Ordering::SeqCst)
+        }
+        // A new signal comes before every release.
+        fn signal_due(&self) -> bool {
+            true
+        }
+        fn signal_step(&self) -> bool {
+            self.0.stepped.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+    }
+    let signals = Arc::new(Signals::default());
+    let hub = Hub::new(3, Stream(Arc::clone(&signals)));
+    for pe in 0..3 {
+        hub.set_live(pe, true);
+    }
+    let home = SharedDevices::new(Pending::default(), Arc::clone(&hub));
+    let mut worker = home.worker();
+    let steps = |home: &SharedDevices<Pending>| {
+        let times = home.lock_times()[Call::Access as usize];
+        (times.stepped, times.signals, times.signal_steps)
+    };
+    let work = |signals: &Signals| {
+        (
+            signals.released.load(Ordering::SeqCst),
+            signals.stepped.load(Ordering::SeqCst),
+        )
+    };
+    // PE 1 runs in its loop: it leaves the signal to the host's service.
+    assert_eq!(worker.read(1, 0x40, 8, 0), Ok(0));
+    assert_eq!(work(&signals), (0, 0));
+    // In a guest exit with nobody asleep, each release steps once.
+    hub.inboxes[1].outside.store(true, Ordering::SeqCst);
+    for release in 1..=3 {
+        assert_eq!(worker.read(1, 0x40, 8, 0), Ok(0));
+        assert_eq!(work(&signals), (0, release));
+    }
+    assert_eq!(steps(&home), (0, 0, 3));
+    // A release that did its own host work takes no signal step too.
+    signals.due.store(true, Ordering::SeqCst);
+    assert_eq!(worker.read(1, 0x40, 8, 0), Ok(0));
+    assert_eq!(work(&signals), (1, 3));
+    assert_eq!(steps(&home), (1, 0, 3));
+    // A PE asleep to take it is woken instead.
+    hub.inboxes[2].sleeping.store(true, Ordering::SeqCst);
+    hub.inboxes[2].serves.store(true, Ordering::SeqCst);
+    assert_eq!(worker.read(1, 0x40, 8, 0), Ok(0));
+    assert_eq!(work(&signals), (1, 3));
+    assert_eq!(*signals.kicked.lock().unwrap(), [2]);
+    assert_eq!(steps(&home), (1, 1, 3));
 }
 
 /// A core whose halt waits on a doorbell never polls before it halts; any
@@ -3253,4 +3552,227 @@ fn the_halt_poll_is_none_on_a_doorbell_and_bounded_elsewhere() {
     // Long waits halve it, and below a quarter it stops.
     assert_eq!(idle_poll_after(200, 1000, most, false), 100);
     assert_eq!(idle_poll_after(50, 1000, most, false), 0);
+}
+
+/// A WFE that waits in the engine, taking no trap, opens its state's cell
+/// for native WFE to spin in, only with PEs on cores of their own; one that
+/// traps opens none, and a change of derived state closes it. What native
+/// spins counted reaches the PE's levels as native code returns.
+#[test]
+fn engine_waits_open_native_event_spins_only_where_other_pes_run() {
+    use super::super::mirrors::{EVENT_WAITS, mirror_state};
+    use super::super::tests::{BASE, machine};
+    use crate::machine::exception::Pstate;
+    use crate::machine::system::Register as SystemRegister;
+    use stela_compiler::x86_64::register_read::EventSpin;
+    const WFE: u32 = 0xd503_205f;
+    const HCR_TWE: u64 = 1 << 14;
+    let el1 = mirror_state(1, false);
+    let mut machine = machine(&[WFE]);
+    machine.cpu.pstate = Pstate::reset(1);
+    machine.derived_changed();
+    let wait = |machine: &mut Machine<_, _>| {
+        machine.waiting = None;
+        machine.cpu.pc = BASE;
+        machine.system_instruction(WFE).unwrap();
+    };
+    wait(&mut machine);
+    assert!(machine.waiting.is_some());
+    assert_eq!(
+        machine.mirrors.banks[el1][EVENT_WAITS].readable, 0,
+        "serialized"
+    );
+    let (hub, _) = hub(1);
+    machine.enter_parallel(hub).unwrap();
+    wait(&mut machine);
+    assert!(machine.waiting.is_some());
+    assert_eq!(machine.mirrors.banks[el1][EVENT_WAITS].readable, 1);
+    machine.derived_changed();
+    assert_eq!(machine.mirrors.banks[el1][EVENT_WAITS].readable, 0);
+    let hcr = machine.cpu.read(SystemRegister::HCR_EL2);
+    machine
+        .cpu
+        .registers
+        .set(SystemRegister::HCR_EL2, 0, hcr | HCR_TWE);
+    machine.derived_changed();
+    wait(&mut machine);
+    assert!(machine.waiting.is_none());
+    assert_eq!(machine.cpu.pstate.el, 2, "trapped");
+    assert_eq!(machine.mirrors.banks[el1][EVENT_WAITS].readable, 0);
+
+    machine.set_step_timing(true);
+    machine.mirrors.spin = EventSpin {
+        completed: 2,
+        missed: 3,
+        held: 1,
+        counts: 96,
+        start: 7,
+        turns: 9,
+    };
+    machine.take_event_spins();
+    let levels = machine.step_timing().unwrap().levels;
+    assert_eq!(
+        [
+            levels.wfe_spun,
+            levels.wfe_spin_missed,
+            levels.wfe_held,
+            levels.wfe_spin_counts
+        ],
+        [2, 3, 1, 96]
+    );
+    assert_eq!(machine.mirrors.spin, EventSpin::default());
+}
+
+/// With the board's fast-IPI table named to native code, a plain fast-IPI
+/// write the engine completes opens its state's cell for native writes,
+/// which a change of derived state closes; the PEs native requests found
+/// halted are woken through the board when native code returns.
+#[test]
+fn plain_fast_ipi_writes_open_native_ones_and_native_wakes_reach_the_board() {
+    use super::super::mirrors::{FAST_IPI_WRITES, mirror_state};
+    use super::super::tests::board;
+    use stela_contracts::identity::Identity;
+    const MSR: u32 = 0xd51d_f029; // msr s3_5_c15_c0_1, x9
+    let (hub, kicks) = hub(2);
+    let worker = SharedDevices::new(Signalling::default(), Arc::clone(&hub)).worker();
+    let identities = vec![Identity {
+        midr: 0x611f_0320,
+        mpidr: 0x8000_0000,
+        clock: None,
+        caches: None,
+    }];
+    let mut machine = board(&[MSR], worker, identities);
+    let state = mirror_state(machine.cpu.pstate.el, machine.cpu.pstate.guarded);
+    let write = |machine: &mut Machine<_, _>| {
+        let pc = machine.cpu.pc;
+        machine.cpu.state.x[9] = 1;
+        machine.system_instruction(MSR).unwrap();
+        assert_eq!(machine.cpu.pc, pc + 4);
+        machine.cpu.pc = pc;
+    };
+    write(&mut machine);
+    assert_eq!(
+        machine.mirrors.banks[state][FAST_IPI_WRITES].readable, 0,
+        "no table named"
+    );
+    assert_eq!(machine.enter_fast_ipi(), Some(()));
+    let ipi = machine.mirrors.fast_ipi;
+    let table = machine.devices.fast_ipi_table().unwrap();
+    assert_eq!((ipi.base, ipi.pe), (table.base(), 0));
+    assert_eq!(ipi.status, table.target(0, 0).unwrap().status);
+    write(&mut machine);
+    assert_eq!(machine.mirrors.banks[state][FAST_IPI_WRITES].readable, 1);
+    machine.derived_changed();
+    assert_eq!(machine.mirrors.banks[state][FAST_IPI_WRITES].readable, 0);
+    hub.inboxes[1].sleeping.store(true, Ordering::SeqCst);
+    machine.mirrors.fast_ipi.wakes = 1 << 1;
+    machine.take_fast_ipi_wakes();
+    assert_eq!(kicks.load(Ordering::Relaxed), 1);
+    assert_eq!(machine.mirrors.fast_ipi.wakes, 0);
+}
+
+/// A register a read leaves plain, as an event register whose last event the
+/// read took: the device that raises events at 0x50 moves its epoch, as a
+/// bus does, before the event is there to read at 0x40.
+#[derive(Default)]
+struct Events {
+    epoch: Arc<AtomicU64>,
+    pending: u64,
+    raised: u64,
+    reads: usize,
+}
+impl Devices for Events {
+    fn plain_epoch(&self, physical: u64, bytes: u8) -> Option<(Arc<AtomicU64>, u64)> {
+        (physical == 0x40 && bytes == 4 && self.pending == 0)
+            .then(|| (Arc::clone(&self.epoch), self.epoch.load(Ordering::SeqCst)))
+    }
+    fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+        self.reads += 1;
+        if self.pending == 0 {
+            return Ok(0);
+        }
+        // Taking an event changes the model: the epoch moves first.
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.pending -= 1;
+        Ok(self.raised - self.pending)
+    }
+    fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        self.pending += 1;
+        self.raised += 1;
+        Ok(())
+    }
+    fn lines(&mut self, _: usize, _: u64) -> Lines {
+        Lines::default()
+    }
+}
+
+/// The read that takes the last event leaves the next read served without
+/// the lock; an event raised since reaches the next read.
+#[test]
+fn a_read_that_leaves_its_register_plain_serves_the_next_read_without_the_lock() {
+    let (hub, _) = hub(2);
+    let home = SharedDevices::new(Events::default(), hub);
+    let mut worker = home.worker();
+    let mut other = home.worker();
+    let reads = |home: &SharedDevices<Events>| home.with(|devices| devices.reads);
+    other.write(0, 0x50, 4, 0, 0).unwrap();
+    assert_eq!(worker.read_scalar(1, 0x40, 4, 1), ScalarRead::Served(Ok(1)));
+    // The claim and the read after it under the same lock.
+    assert_eq!(reads(&home), 2);
+    assert_eq!(worker.read_scalar(1, 0x40, 4, 2), ScalarRead::Served(Ok(0)));
+    assert_eq!(reads(&home), 2, "served without the devices");
+    // An event raised since moved the epoch: the next read takes it.
+    other.write(0, 0x50, 4, 0, 3).unwrap();
+    assert_eq!(worker.read_scalar(1, 0x40, 4, 4), ScalarRead::Served(Ok(2)));
+    // Two pending: the first claim leaves the register not plain.
+    other.write(0, 0x50, 4, 0, 5).unwrap();
+    other.write(0, 0x50, 4, 0, 5).unwrap();
+    let before = reads(&home);
+    assert_eq!(worker.read_scalar(1, 0x40, 4, 6), ScalarRead::Served(Ok(3)));
+    assert_eq!(reads(&home), before + 1);
+    assert_eq!(worker.read_scalar(1, 0x40, 4, 7), ScalarRead::Served(Ok(4)));
+    assert_eq!(worker.read_scalar(1, 0x40, 4, 8), ScalarRead::Served(Ok(0)));
+    assert_eq!(reads(&home), before + 3);
+}
+
+/// Events raised on one core while another reads: no event is lost or
+/// taken twice, and a read that began after a raise returned never finds
+/// none while that event is untaken.
+#[test]
+fn events_raised_while_their_register_is_served_plain_are_never_lost_or_late() {
+    const EVENTS: u64 = 20_000;
+    let (hub, _) = hub(2);
+    let home = SharedDevices::new(Events::default(), hub);
+    let raised = Arc::new(AtomicU64::new(0));
+    let mut raiser = home.worker();
+    let mut reader = home.worker();
+    let raising = {
+        let raised = Arc::clone(&raised);
+        std::thread::spawn(move || {
+            for _ in 0..EVENTS {
+                raiser.write(0, 0x50, 4, 0, 0).unwrap();
+                raised.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+    };
+    let mut taken = 0u64;
+    while taken < EVENTS {
+        let before = raised.load(Ordering::SeqCst);
+        match reader.read_scalar(1, 0x40, 4, 0) {
+            ScalarRead::Served(Ok(0)) => assert!(
+                taken >= before,
+                "a read found none with {} raised before it untaken",
+                before - taken
+            ),
+            ScalarRead::Served(Ok(event)) => {
+                taken += 1;
+                assert_eq!(event, taken, "events are taken once, in order");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    raising.join().unwrap();
+    assert_eq!(reader.read_scalar(1, 0x40, 4, 0), ScalarRead::Served(Ok(0)));
+    assert_eq!(home.with(|devices| devices.pending), 0);
 }

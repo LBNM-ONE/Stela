@@ -3,6 +3,7 @@ use super::super::{
 };
 use super::*;
 use crate::translations;
+use crate::translations::Record;
 use alloc::collections::BTreeMap;
 
 /// A store in memory: records by key, the blocks offered to it, and
@@ -17,9 +18,11 @@ pub(crate) struct MemoryStore {
 }
 
 impl Translations for MemoryStore {
-    fn record(&mut self, key: &Digest) -> Option<Arc<Record>> {
+    fn record(&mut self, key: &Digest) -> Option<Arc<StoredRecord>> {
         self.lookups += 1;
-        self.records.get(key).cloned()
+        self.records
+            .get(key)
+            .map(|record| Arc::new(StoredRecord::of(record)))
     }
     fn prepared(
         &mut self,
@@ -291,6 +294,8 @@ fn a_stored_block_of_the_same_page_bytes_is_installed_without_compiling() {
         Ok(Fetched::Block(_))
     ));
     assert_eq!(second.statistics.compiled, 1);
+    // The page's record held no entry there.
+    assert_eq!(second.statistics.record_misses, [1, 0]);
     let mut changed = machine(&[0x1000_0040, 0x9100_0800, 0xd400_0001]);
     changed.host.store = second.host.store.take();
     assert!(matches!(
@@ -550,7 +555,7 @@ fn a_stored_install_relocates_into_the_machines_own_buffers() {
 }
 
 #[test]
-fn with_memory_low_pages_stay_and_nothing_is_offered() {
+fn with_memory_low_pages_stay_and_offers_still_reach_the_store() {
     // A block in each of two pages: add x0, x0, #1; svc #0.
     const PAGE_WORDS: usize = FETCH_PAGE as usize / INSTRUCTION as usize;
     let mut words = vec![0; PAGE_WORDS + 2];
@@ -570,8 +575,9 @@ fn with_memory_low_pages_stay_and_nothing_is_offered() {
         machine.pages.keys().copied().collect::<Vec<_>>(),
         [BASE, BASE + FETCH_PAGE]
     );
-    assert_eq!(machine.statistics.offered, 1);
-    assert_eq!(machine.host.store.as_ref().unwrap().offers.len(), 1);
+    assert_eq!(machine.statistics.offered, 2);
+    assert_eq!(machine.statistics.offered_low, 1);
+    assert_eq!(machine.host.store.as_ref().unwrap().offers.len(), 2);
 }
 
 /// `PES STORE`: every install counts once, at its level, by where its

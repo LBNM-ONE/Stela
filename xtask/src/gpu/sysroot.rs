@@ -14,12 +14,32 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const TARGET: &str = "--target=x86_64-unknown-linux-gnu";
+pub(super) const TARGET: &str = "--target=x86_64-unknown-linux-gnu";
 /// The Rust of the machine: nothing builds with it, and Meson checks that it
 /// links programs. This target carries the C library that takes.
 const RUST_TARGET: &str = "x86_64-unknown-linux-musl";
 /// Some of Mesa's probes link shared libraries.
-const POSITION_INDEPENDENT: &str = "-fPIC";
+pub(super) const POSITION_INDEPENDENT: &str = "-fPIC";
+/// What the machine's C library is, said to every compile and probe against
+/// it rather than left to the build host's Clang: distributions change its
+/// defaults (Arch and Nix turn on the stack protector, whose
+/// `__stack_chk_fail` Stela's C library lacks, so every link probe fails and
+/// Mesa decides the library has no `qsort_r`; others add stack clash
+/// probes, CET branch markers, `_FORTIFY_SOURCE` or libstdc++ assertions),
+/// and configuration files can add anything, which `--no-default-config`
+/// drops.
+pub(super) const FREESTANDING: [&str; 6] = [
+    "--no-default-config",
+    "-fno-stack-protector",
+    "-fno-stack-clash-protection",
+    "-fcf-protection=none",
+    "-U_FORTIFY_SOURCE",
+    "-U_GLIBCXX_ASSERTIONS",
+];
+/// Mesa's probes link programs and shared libraries: position-independent
+/// code ([`POSITION_INDEPENDENT`]) linked as a position-independent
+/// executable, whichever the host's Clang makes by default.
+pub(super) const PROBE_LINK: [&str; 2] = ["--no-default-config", "-pie"];
 
 pub(super) struct Sysroot {
     directory: PathBuf,
@@ -73,7 +93,9 @@ impl Sysroot {
         // from `-isystem`.
         let installed = format!("-idirafter{}", resource.replace('\\', "/"));
         let system = |include: &Path| format!("-isystem{}", slashed(include));
-        let shared = [TARGET.to_owned(), "-nostdinc".to_owned()];
+        let mut shared = vec![TARGET.to_owned(), "-nostdinc".to_owned()];
+        shared.extend(FREESTANDING.map(str::to_owned));
+        shared.push(POSITION_INDEPENDENT.to_owned());
         let mut compile = shared.to_vec();
         compile.extend([system(&libc), installed.clone(), "-DSTELA_LIBC".to_owned()]);
         let compat = gpu().join("compat/llvm");
@@ -113,6 +135,7 @@ impl Sysroot {
             format!("--sysroot={}", slashed(&self.directory)),
             "-nostdlib".to_owned(),
         ];
+        link.extend(PROBE_LINK.map(str::to_owned));
         let mut link_cxx = link.clone();
         link.push("-lc".to_owned());
         link_cxx.extend(["-lc++".to_owned(), "-lc".to_owned()]);
@@ -141,11 +164,7 @@ impl Sysroot {
             clang = slashed(&toolchain.clang),
             clangxx = slashed(&toolchain.clangxx),
             archiver = slashed(&toolchain.archiver),
-            symbols = slashed(
-                &toolchain
-                    .archiver
-                    .with_file_name(format!("llvm-nm{}", std::env::consts::EXE_SUFFIX))
-            ),
+            symbols = slashed(&toolchain.symbols),
             linker = slashed(&toolchain.linker),
             pkg_config = super::toolchain::pkg_config()?,
             compile = list(&self.compile),

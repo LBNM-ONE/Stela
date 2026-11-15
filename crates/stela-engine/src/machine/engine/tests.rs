@@ -170,6 +170,9 @@ pub(super) struct FakeHost {
     pub(super) ring: Option<usize>,
     code_partitions: Option<CodePartitions>,
     parts: Vec<core::ops::Range<usize>>,
+    /// The count at which a host interrupt brings host work
+    /// ([`Host::host_work_due`]): it ends a wait it falls in.
+    pub(super) host_work_at: Option<u64>,
 }
 
 impl Host for FakeHost {
@@ -391,6 +394,16 @@ impl Host for FakeHost {
     }
     fn wait_for_interrupt(&mut self) {
         self.now += 1000;
+        if let Some(at) = self.host_work_at {
+            self.now = self.now.min(at.max(self.now - 1000));
+        }
+    }
+    fn host_work_due(&mut self) -> bool {
+        let due = self.host_work_at.is_some_and(|at| self.now >= at);
+        if due {
+            self.host_work_at = None;
+        }
+        due
     }
     fn report(&mut self, event: &Event) {
         self.events.push(*event);
@@ -581,6 +594,7 @@ pub(super) fn board_on<D: Devices>(
         ring: None,
         code_partitions: None,
         parts: Vec::new(),
+        host_work_at: None,
     };
     let profile = CpuProfile {
         name: "test",
@@ -1602,6 +1616,23 @@ fn unavailable_extended_fault_state_cannot_partially_recover_or_retire() {
     );
     assert_eq!(machine.cpu.state, before);
     assert_eq!(machine.cpu.retired, retired);
+}
+
+/// A fetch counts the ticks it spent walking the PC's translation, and
+/// refills only when pages wait to be walked again.
+#[test]
+fn a_fetch_times_its_translation_walk_apart_from_refills() {
+    let mut machine = machine(&[0x9100_0400, 0xd400_0001]);
+    machine.host.counter_step = 1;
+    assert!(matches!(
+        machine.fetch_block(BASE, false),
+        Ok(Fetched::Block(_))
+    ));
+    assert!(
+        machine.statistics.walk_ticks >= 1,
+        "the counter moved across it"
+    );
+    assert_eq!(machine.statistics.refill_ticks, 0, "nothing to refill");
 }
 
 #[test]
@@ -7425,7 +7456,7 @@ fn event_instructions_complete_natively_on_the_event_register() {
     let send = register_read::send_event_thunk(GuestAddress(base + 4), EVENTS);
     assert_eq!(machine.host.installed.last(), Some(&send.code));
     machine.step().unwrap();
-    let wait = register_read::event_wait_thunk(GuestAddress(base + 12), EVENTS);
+    let wait = register_read::event_wait_thunk(GuestAddress(base + 12), EVENT_WAIT);
     // Then the thunk of the link the exit into its block took at its fetch.
     let installed = &machine.host.installed;
     assert_eq!(installed[installed.len() - 2], wait.code);
@@ -9442,6 +9473,7 @@ mod arena;
 mod context_id;
 mod cycles_native;
 mod exits;
+mod fast_ipi_native;
 mod floating_point_traps;
 mod instructions_native;
 mod native_exceptions;

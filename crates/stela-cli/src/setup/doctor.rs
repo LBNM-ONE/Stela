@@ -15,13 +15,13 @@
 //! command.
 //!
 //! Repair puts back what the record says: `stela.cfg` and the startup
-//! choices, and, from the active build's restore image (`--ipsw` or
-//! `--fetch`), every damaged or missing restore bundle and a damaged install
+//! choices, and, from the active build's restore image (`--ipsw` or a
+//! download), every damaged or missing restore bundle and a damaged install
 //! medium; with an image it prepares every restore bundle of the active
 //! build again, with each machine's own ECID, and gives an install without
 //! one its ECID (`machines::machine_ecid`). It removes the bundles and media
 //! of other builds and generations that an interrupted update left. A
-//! missing or foreign `stela.efi` is `update stela`'s to replace: no copy of
+//! missing or foreign `stela.efi` is `update`'s to replace: no copy of
 //! it is kept. With `--initialize-nor` it replaces machine state `stela.efi`
 //! would refuse (`installed::reinitialize`), blanking a foreign SEP area
 //! only for a machine that never booted. It adds the pinned firmware the
@@ -197,7 +197,7 @@ fn efi_status(environment: &Environment<'_>, record: &Record, report: &mut Repor
                         .unwrap_or_default()
                 ),
             );
-            let fix = report.fix("update stela");
+            let fix = report.fix("update");
             if record.stela_version.as_deref() != Some(id.as_str()) {
                 report.problem(format!(
                     "{} is not the version setup installed ({}): {fix}",
@@ -213,7 +213,7 @@ fn efi_status(environment: &Environment<'_>, record: &Record, report: &mut Repor
             }
         }
         Err(_) => {
-            let fix = report.fix("update stela");
+            let fix = report.fix("update");
             report.problem(format!("{} is missing: {fix}", tool.display()))
         }
     }
@@ -291,12 +291,12 @@ fn firmware_status(record: &Record, report: &mut Report) {
 /// revision than this stela prepares, which repair refuses to mix.
 fn image_fix(environment: &Environment<'_>, record: &Record, report: &Report) -> String {
     match revision_mismatch(environment, record) {
-        Some(_) => report.fix("update stela"),
+        Some(_) => report.fix("update"),
         None => report.fix("repair"),
     }
 }
 
-fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Report) {
+fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Report, full: bool) {
     let repair = report.fix("repair");
     let image = image_fix(environment, record, report);
     for kept in &record.bundles {
@@ -359,7 +359,7 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
         report.problem(format!(
             "the update to macOS {next} stopped before its copy was complete, so this USB cannot \
              install macOS until it is: {} finishes it",
-            report.fix(&format!("update os --build {next}"))
+            report.fix("repair")
         ));
     } else if record.installs_media() && record.active_medium().is_none() {
         report.problem(format!(
@@ -369,7 +369,33 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
         ));
     }
     for medium in &record.media {
-        let problems = medium.problems();
+        let mut problems = medium.problems();
+        // A piece an install found damaged since the medium was last
+        // written or checked whole: installs read the active build's
+        // medium alone, so the log's piece is one of its own.
+        if medium.build == record.build && !medium.remote && problems.is_empty() {
+            for piece in
+                super::medium::reported_damage(&record.esp, record.medium_checked.unwrap_or(0))
+            {
+                problems.push(format!(
+                    "{} failed its block check when an install read it (the USB's boot log \
+                     says so)",
+                    medium.directory().join(&piece).display()
+                ));
+            }
+            // `--full`: every piece read back and checked now.
+            if full && problems.is_empty() {
+                match medium.damaged_pieces() {
+                    Ok(damaged) => problems.extend(damaged.into_iter().map(|piece| {
+                        format!(
+                            "{} differs from what was written (read back now)",
+                            medium.directory().join(piece).display()
+                        )
+                    })),
+                    Err(error) => problems.push(format!("its pieces cannot be read: {error:#}")),
+                }
+            }
+        }
         if medium.build != record.build {
             report.line(
                 "leftover",
@@ -393,10 +419,12 @@ fn bundle_status(environment: &Environment<'_>, record: &Record, report: &mut Re
                     true => "Online, downloads during installation".into(),
                     false => format!("Offline, on partition {}", medium.partition_guid),
                 },
-                if problems.is_empty() {
-                    "intact"
-                } else {
-                    "DAMAGED"
+                match (problems.is_empty(), medium.remote) {
+                    (false, _) => "DAMAGED",
+                    (true, true) => "intact",
+                    // Its bytes are read only by an install, or by
+                    // `repair --full`.
+                    (true, false) => "complete; every block is checked as the install reads it",
                 }
             ),
         );
@@ -496,7 +524,7 @@ fn install_status(
     match install.ecid {
         Some(ecid) => report.line("ECID", ecid),
         None => {
-            let fix = report.fix("repair --fetch");
+            let fix = report.fix("repair");
             report.problem(format!(
                 "install \"{}\" has no ECID (an older setup made it): {fix}, with --ecid or \
                  --new-ecid when its SEP state is provisioned",
@@ -642,7 +670,7 @@ fn foreign_problem(install: &str, region: &str) -> String {
 }
 
 /// `status`.
-pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String> {
+pub(super) fn status(environment: &Environment<'_>, usb: &Path, full: bool) -> Result<String> {
     let record = read_record(environment, usb)?;
     let mut report = Report {
         text: String::new(),
@@ -659,10 +687,22 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String
         report.problem(interrupted_text(&record, usb));
     }
     report.line("model", &record.model);
+    report.line("Stela", super::release::describe(&record));
     report.line("macOS build", &record.build);
+    report.line(
+        "Wi-Fi",
+        match &record.wifi {
+            Some(network) => format!(
+                "\"{}\"{}",
+                network.ssid,
+                super::wifi::rules(network.country.as_deref())
+            ),
+            None => "none: an Online install needs Ethernet".into(),
+        },
+    );
     efi_status(environment, &record, &mut report);
     firmware_status(&record, &mut report);
-    bundle_status(environment, &record, &mut report);
+    bundle_status(environment, &record, &mut report, full);
     if record.installs_media() {
         let restore_bundles: Vec<PathBuf> = record
             .bundles
@@ -714,46 +754,118 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String
     .into())
 }
 
+/// The report line for the device skips `by` ends
+/// (`boot_log::clear_device_skips`): empty when the USB's log names none.
+pub(super) fn device_skips(esp: &Path, by: &str, dry_run: bool) -> Result<String> {
+    let log = esp.join(crate::efi::BOOT_LOG);
+    let named = crate::boot_log::clear_device_skips(&log, by, dry_run)?;
+    Ok(match (named.is_empty(), dry_run) {
+        (true, _) => String::new(),
+        (false, true) => format!(
+            "  device skips   {} would be started again\n",
+            named.join(", ")
+        ),
+        (false, false) => format!(
+            "  device skips   {} will be started again at the next boot\n",
+            named.join(", ")
+        ),
+    })
+}
+
 /// `repair`.
 pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result<String> {
     let usb = &command.usb;
     let mut record = read_record(environment, usb)?;
     update::ready(&record, usb)?;
-    // Its copy of the active build is gone for the new one's room: the
-    // update finishes it, and repair would download the old one again.
-    if let Some(next) = &record.replacing {
-        bail!(
-            "the update to macOS {next} stopped before its copy was complete: {} finishes it",
-            fix(usb, &format!("update os --build {next}"))
-        );
+    if !command.dry_run {
+        super::release::allow_older(
+            environment,
+            &record,
+            command.yes,
+            "repair it with this older stela",
+        )?;
     }
+    // A macOS switch that stopped part way never comes here: `repair`
+    // finishes it as an update (`Request::dispatch`).
+    debug_assert!(record.replacing.is_none());
     let esp = record.esp.clone();
     let mut text = format!("Stela repair on {}:\n", esp.display());
+    text.push_str(&device_skips(&esp, "stela repair", command.dry_run)?);
     let Ok(tool) = fs::read(esp.join(LOADER_PATH)) else {
-        bail!(
-            "{} has no stela.efi: {}",
-            esp.display(),
-            fix(usb, "update stela")
-        );
+        bail!("{} has no stela.efi: {}", esp.display(), fix(usb, "update"));
     };
     if let Some(reason) =
         mount_interface::mismatch(environment.interface, mount_interface::find(&tool))
     {
         bail!(
             "the setup's stela.efi does not read what this stela writes ({reason}): run {} first",
-            fix(usb, "update stela")
+            fix(usb, "update")
         );
     }
     update::check_firmware_support(&esp, &tool)?;
     // The firmware the last boot asked for and the USB lacks.
     let requested = super::firmware::requested(&esp, &tool)?;
     record.install_image = command.install_image.or(record.install_image);
-    // With --ipsw or --fetch every restore bundle is prepared again and
+    // With --ipsw, or when a machine has no ECID yet (a setup older than
+    // per-machine identities), every restore bundle is prepared again and
     // machines without an ECID get one; else the damaged and missing
     // bundles and medium are put back. What that needs of the restore image,
     // and where it comes from, is decided before anything is downloaded.
-    let rebuild = command.ipsw.is_some() || command.fetch;
+    let rebuild = command.ipsw.is_some()
+        || (record.installs_media() && record.installs.iter().any(|i| i.ecid.is_none()));
     let has_media = record.installs_media();
+    // The full medium's bytes, read whole when asked or when an install
+    // found a piece damaged since it was last checked: a damaged piece is
+    // written again like a missing one, and removed only after everything
+    // that can refuse the repair.
+    let mut checked = None;
+    if let Some(medium) = record
+        .active_medium()
+        .filter(|m| !m.remote && m.problems().is_empty())
+        .cloned()
+    {
+        let reported =
+            super::medium::reported_damage(&record.esp, record.medium_checked.unwrap_or(0));
+        if command.full || !reported.is_empty() {
+            let damaged = medium.damaged_pieces()?;
+            match damaged.is_empty() {
+                true => writeln!(
+                    text,
+                    "  install medium every piece read and checked: intact{}",
+                    match reported.is_empty() {
+                        true => String::new(),
+                        false => format!(
+                            " (the boot log named {}, which reads back correctly now)",
+                            reported.join(", ")
+                        ),
+                    }
+                )?,
+                false => writeln!(
+                    text,
+                    "  install medium {} damaged: {}",
+                    damaged.join(", "),
+                    match command.dry_run {
+                        true => "would be removed and written again",
+                        false => "removed and written again",
+                    }
+                )?,
+            }
+            if let Some(active) = record.media.iter_mut().find(|m| m.build == medium.build) {
+                active.damaged = damaged;
+            }
+            checked = Some(super::medium::log_head(&record.esp));
+        }
+    } else if command.full {
+        writeln!(
+            text,
+            "  install medium {}",
+            match record.active_medium() {
+                Some(m) if m.remote => "streams from Apple: no piece is on the USB to check",
+                Some(_) => "incomplete: the missing or short pieces are written again",
+                None => "none",
+            }
+        )?;
+    }
     let damaged_bundles = has_media
         && super::restore_bundles(&record.install_machines())
             .into_iter()
@@ -784,8 +896,17 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
             let source = sources::locate(environment, &lookup).map_err(|error| {
                 anyhow::anyhow!("repair needs the macOS {build} restore image; but {error:#}")
             })?;
-            if need == sources::Need::WholeImage {
+            if need.whole() {
                 sources::check_room(environment, &record, &build, &source)?;
+            }
+            if !command.dry_run {
+                super::consent_download(
+                    environment,
+                    command.yes,
+                    false,
+                    sources::download_bytes(&source),
+                    &format!("what this stick lacks of macOS {build}"),
+                )?;
             }
             Some(source)
         }
@@ -1048,6 +1169,14 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
         text.push_str("Dry run: nothing was changed.\n");
         return Ok(text);
     }
+    // Nothing refuses the repair from here: the damaged pieces go, and the
+    // install below writes them again as missing ones.
+    if let Some(medium) = record.media.iter_mut().find(|m| !m.damaged.is_empty()) {
+        for piece in std::mem::take(&mut medium.damaged) {
+            let path = medium.directory().join(&piece);
+            fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+        }
+    }
     if let Some(store) = &record.translations
         && !store_repairs.is_empty()
     {
@@ -1070,6 +1199,11 @@ pub(super) fn repair(environment: &Environment<'_>, command: &Request) -> Result
             ..*environment
         };
         apply_install(&environment, &mut record, &obtained.path, plan)?;
+    }
+    // A check that found the medium intact; one that removed pieces had
+    // them written again above, which records its own.
+    if checked.is_some() && record.medium_checked < checked {
+        record.medium_checked = checked;
     }
     publish(&mut record)?;
     write_record(&esp, &record)?;

@@ -11,8 +11,9 @@ use super::numerical::{
     single_vector_arithmetic, test_control, vector_exponent_range, vector_normal_or_zero_range,
 };
 use super::numerical::{
-    commit_flush_status, commit_rounded_status, exceptional_lane_mask, flush_subnormal_lanes,
-    reject_exceptional_lanes, reject_invalid, scalar_ordered_range,
+    commit_flush_status, commit_invalid_status, commit_rounded_status, exceptional_lane_mask,
+    flush_subnormal_lanes, minimum_normal_lanes, reject_exceptional_lanes, reject_invalid,
+    scalar_ordered_range,
 };
 use super::{Host, commit, encode::guest, packed, read_vector, vector_offset};
 use crate::x86_64::asm::FloatLanes;
@@ -24,7 +25,7 @@ use crate::{
     aarch64::{
         FloatingPointOperation, Instruction, Operation,
         floating::{
-            FPCR_AH, FPCR_AHP, FPCR_EXCEPTION_ENABLE_MASK, FPCR_FIZ, FPCR_FZ, FPCR_NEP,
+            FPCR_AH, FPCR_AHP, FPCR_DN, FPCR_EXCEPTION_ENABLE_MASK, FPCR_FIZ, FPCR_FZ, FPCR_NEP,
             FPCR_ROUNDING_MASK, FPCR_ROUNDING_SHIFT, Format, UNDERFLOW,
             precision::PrecisionRounding,
         },
@@ -340,6 +341,58 @@ fn rounded_narrow(code: &mut Code, helper: &mut Vec<usize>) -> usize {
     done
 }
 
+/// Vector D to S (FCVTN) with FPCR.FZ, FIZ and AH clear, as
+/// [`rounded_narrow`]: subnormal inputs and tiny, overflowing, zero and
+/// infinite results are exact on the host with FPSR's status. A NaN
+/// narrows as Arm's does too (quieted, its payload's top bits kept), the
+/// host's invalid status, from a signalling NaN alone, being IOC; DN then
+/// replaces it ([`default_nan_lanes`]). A result exactly the minimum normal
+/// takes `helper`. Returns the jump to the commit, past the other checks.
+fn rounded_vector_narrow(code: &mut Code, helper: &mut Vec<usize>) -> usize {
+    test_control(code, FPCR_FZ | FPCR_FIZ | FPCR_AH);
+    let strict = branch(code, Condition::NotZero);
+    environment_round(code, Rounding::Fpcr);
+    code.asm().cvtpd2ps(RESULT_VECTOR, Rm::Xmm(SOURCE_VECTOR));
+    let [minimum, scratch, _] = EXCEPTIONAL_SCRATCH;
+    minimum_normal_lanes(code, Format::Single, RESULT_VECTOR, [minimum, scratch]);
+    Host::DwordSignMask.register(code, Rax as u8, minimum, TargetCpu::Baseline);
+    restore_environment(code);
+    helper.push(reject_exceptional_lanes(
+        code,
+        Format::Single,
+        Shape::Vector64,
+    ));
+    commit_invalid_status(code);
+    default_nan_lanes(code);
+    commit_rounded_status(code);
+    let done = jump(code);
+    let strict_start = code.len();
+    resolve(code, strict, strict_start);
+    done
+}
+
+/// Under FPCR.DN, the default NaN in each NaN S lane of RESULT_VECTOR.
+/// Clobbers XMM2, XMM3 and EAX.
+fn default_nan_lanes(code: &mut Code) {
+    const SINGLE_INFINITY: u32 = 0x7f80_0000;
+    const SINGLE_DEFAULT_NAN: u32 = 0x7fc0_0000;
+    let [nan, kept, _] = EXCEPTIONAL_SCRATCH;
+    test_control(code, FPCR_DN);
+    let propagated = branch(code, Condition::Zero);
+    packed(code, Host::EqualDword, nan, nan);
+    ShiftOpcode::RightDword.emit(code, nan, 1);
+    packed(code, Host::And, nan, RESULT_VECTOR);
+    dword_constant(code, kept, SINGLE_INFINITY);
+    packed(code, Host::GreaterDword, nan, kept);
+    packed(code, Host::MoveAligned, kept, nan);
+    packed(code, Host::AndNot, kept, RESULT_VECTOR);
+    dword_constant(code, RESULT_VECTOR, SINGLE_DEFAULT_NAN);
+    packed(code, Host::And, RESULT_VECTOR, nan);
+    packed(code, Host::Or, RESULT_VECTOR, kept);
+    let end = code.len();
+    resolve(code, propagated, end);
+}
+
 /// Branch if any exponent is outside the normal IEEE half range. Keep the
 /// normal and finite lane masks for the zero and subnormal path.
 fn half_normal_widening_guard(code: &mut Code) -> usize {
@@ -532,12 +585,103 @@ fn emit_widen(code: &mut Code, operand: &PrecisionOperand, upper: bool, pc: Gues
     if upper {
         ShiftOpcode::RightBytes.emit(code, SOURCE_VECTOR, UPPER_QWORD_BYTES);
     }
+    let widened = vector_widen_with_ah_clear(code);
     prepare_vector_input_range(code, Format::Single);
     vector_exponent_range(code, Format::Single, Shape::Vector64, SOURCE_VECTOR);
     helper.push(branch(code, Condition::NotZero));
     code.asm().cvtps2pd(RESULT_VECTOR, Rm::Xmm(SOURCE_VECTOR));
     helper_section(code, &helper, pc);
+    let commit_start = code.len();
+    resolve(code, widened, commit_start);
     commit(code, operand.destination, RESULT_VECTOR);
+}
+
+/// Vector S to D (FCVTL) with FPCR.AH clear, for every input: FZ or FIZ
+/// flush a subnormal lane first (FZ raising IDC); zeros, infinities,
+/// normals and subnormals convert exactly with no status, a subnormal
+/// inside the private environment so that the host's denormal status stays
+/// out of the caller's MXCSR. A NaN widens there as Arm's does (quieted,
+/// its payload kept), the host's invalid status, from a signalling NaN
+/// alone, being IOC; DN then replaces it. Returns the jump to the commit;
+/// AH continues past it.
+fn vector_widen_with_ah_clear(code: &mut Code) -> usize {
+    /// PSHUFD selector widening the low two dwords to qwords.
+    const LOW_DWORDS_TO_QWORDS: u8 = 0x50;
+    /// The set top bits that, shifted right once, are the Double default NaN.
+    const DOUBLE_DEFAULT_NAN_ONES: u8 = 52;
+    const ACTIVE_LANES: i32 = 0b11;
+    const SINGLE_INFINITY: u32 = 0x7f80_0000;
+    const SINGLE_MINIMUM_NORMAL: u32 = 0x0080_0000;
+    test_control(code, FPCR_AH);
+    let alternative = branch(code, Condition::NotZero);
+    code.asm().alu(Alu::Xor, Size::Dword, Gpr::R11, Gpr::R11);
+    test_control(code, FPCR_FZ | FPCR_FIZ);
+    let unflushed = branch(code, Condition::Zero);
+    flush_subnormal_lanes(
+        code,
+        Format::Single,
+        Shape::Vector64,
+        SOURCE_VECTOR,
+        FLUSH_SCRATCH,
+    );
+    let flushed = code.len();
+    resolve(code, unflushed, flushed);
+    let [magnitude, limit, lanes, zero] = FLUSH_SCRATCH;
+    packed(code, Host::EqualDword, magnitude, magnitude);
+    ShiftOpcode::RightDword.emit(code, magnitude, 1);
+    packed(code, Host::And, magnitude, SOURCE_VECTOR);
+    // NaN lanes: a magnitude above the infinity's.
+    dword_constant(code, limit, SINGLE_INFINITY);
+    packed(code, Host::MoveAligned, lanes, magnitude);
+    packed(code, Host::GreaterDword, lanes, limit);
+    Host::DwordSignMask.register(code, Rax as u8, lanes, TargetCpu::Baseline);
+    code.asm().test_imm(Size::Dword, Rax, ACTIVE_LANES);
+    let nan = branch(code, Condition::NotZero);
+    // Subnormal lanes: a nonzero magnitude below the minimum normal's.
+    dword_constant(code, lanes, SINGLE_MINIMUM_NORMAL);
+    packed(code, Host::GreaterDword, lanes, magnitude);
+    packed(code, Host::Xor, zero, zero);
+    packed(code, Host::GreaterDword, magnitude, zero);
+    packed(code, Host::And, lanes, magnitude);
+    Host::DwordSignMask.register(code, Rax as u8, lanes, TargetCpu::Baseline);
+    code.asm().test_imm(Size::Dword, Rax, ACTIVE_LANES);
+    let ordinary = branch(code, Condition::Zero);
+    let special = code.len();
+    resolve(code, nan, special);
+    environment_round(code, Rounding::NearestEven);
+    code.asm().cvtps2pd(RESULT_VECTOR, Rm::Xmm(SOURCE_VECTOR));
+    restore_environment(code);
+    commit_invalid_status(code);
+    test_control(code, FPCR_DN);
+    let propagated = branch(code, Condition::Zero);
+    // The NaN lanes, from the S magnitudes, as qwords.
+    packed(code, Host::EqualDword, magnitude, magnitude);
+    ShiftOpcode::RightDword.emit(code, magnitude, 1);
+    packed(code, Host::And, magnitude, SOURCE_VECTOR);
+    dword_constant(code, limit, SINGLE_INFINITY);
+    packed(code, Host::GreaterDword, magnitude, limit);
+    super::shuffle(code, lanes, magnitude, LOW_DWORDS_TO_QWORDS);
+    // The Double default NaN, 0x7ff8000000000000.
+    packed(code, Host::EqualDword, limit, limit);
+    ShiftOpcode::LeftQword.emit(code, limit, DOUBLE_DEFAULT_NAN_ONES);
+    ShiftOpcode::RightQword.emit(code, limit, 1);
+    packed(code, Host::And, limit, lanes);
+    packed(code, Host::AndNot, lanes, RESULT_VECTOR);
+    packed(code, Host::Or, lanes, limit);
+    packed(code, Host::MoveAligned, RESULT_VECTOR, lanes);
+    let converted = [propagated, jump(code)];
+    let ordinary_start = code.len();
+    resolve(code, ordinary, ordinary_start);
+    code.asm().cvtps2pd(RESULT_VECTOR, Rm::Xmm(SOURCE_VECTOR));
+    let converted_start = code.len();
+    for patch in converted {
+        resolve(code, patch, converted_start);
+    }
+    commit_flush_status(code);
+    let done = jump(code);
+    let alternative_start = code.len();
+    resolve(code, alternative, alternative_start);
+    done
 }
 
 fn emit_narrow(
@@ -550,6 +694,8 @@ fn emit_narrow(
     let mut helper = Vec::new();
     exception_guard(code, &mut helper);
     read_numerical_vector(code, Shape::Vector128, operand.source, SOURCE_VECTOR);
+    let rounded =
+        (rounding == PrecisionRounding::Fpcr).then(|| rounded_vector_narrow(code, &mut helper));
     prepare_vector_input_range(code, Format::Double);
     vector_exponent_range(code, Format::Double, Shape::Vector128, SOURCE_VECTOR);
     helper.push(branch(code, Condition::NotZero));
@@ -575,6 +721,10 @@ fn emit_narrow(
     }
     helper_section(code, &helper, pc);
     commit_inexact(code);
+    if let Some(rounded) = rounded {
+        let tail = code.len();
+        resolve(code, rounded, tail);
+    }
     if upper {
         read_vector(code, operand.destination, SOURCE_VECTOR);
         code.asm().movlhps(SOURCE_VECTOR, Rm::Xmm(RESULT_VECTOR));
