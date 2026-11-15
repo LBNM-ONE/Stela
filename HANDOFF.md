@@ -274,7 +274,8 @@ Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
 1. **RADV nell'immagine**: build e link in `stela.efi`.
 2. **amdgpu senza display**: bind della 9070, firmware caricato, ioctl
    `AMDGPU_INFO` che rispondono. Monitor sulla iGPU, console del firmware
-   viva per i log.
+   viva per i log. Bind e firmware: fatti il 2026-11-15 (settima prova in
+   «Prova sul PC: risultati»); gli ioctl `AMDGPU_INFO` restano da provare.
 3. **Primo triangolo**: RADV su amdgpu, device Metal ammesso, suite Metal
    (`cargo xtask gpu metal-suite`).
 4. **Display**: DC e DMUB per pilotare le uscite della 9070. Metà del codice
@@ -950,6 +951,28 @@ volta** sulla 9070 (62,85 s). Dal log:
   monitor HDMI alla 9070 e Stela è ripartita fino al messaggio d'errore.
   Il nesso con il cavo non è provato; aperto.
 
+**Settima prova (2026-11-15, immagine `40207e04126c0171`): amdgpu prende la
+9070.** `GPU START claim_ms=130 linux_ms=51 probe_ms=328 total_ms=510`,
+poi `GPU 0000:03:00.0: amdgpu bound it` e `GPU CHECK started=true`. Dal log,
+dopo le righe già viste nella sesta prova:
+- VCN: firmware ENC 1.13, DEC 9; MES: maschere vmid e hqd programmate.
+- PSP: caricati i firmware; mancano solo i TA opzionali RAP e
+  SECUREDISPLAY, come su Linux.
+- SMU: `smu driver if version = 0x0000002e, smu fw if version =
+  0x00000033, … smu fw version = 0x00685000 (104.80.0)` e `SMU is
+  initialized successfully!`. Le versioni dell'interfaccia differiscono
+  (driver 0x2e, firmware 0x33 del VBIOS della scheda); amdgpu prosegue.
+- GFX 12: `SE 4, SH per SE 2, CU per SH 8, active_cu_number 56` (una RX
+  9070 non XT); anelli `gfx_0.0.0`, quattro `comp_1.*`, `sdma0`, `sdma1`,
+  `vcn_unified_0` e `jpeg_dec` con i loro motori d'invalidazione VM.
+- `Using BACO for runtime pm` e `[drm] Initialized amdgpu 3.64.0 for
+  0000:03:00.0 on minor 0`.
+- Nessun errore. Restano i due avvisi della sesta prova (spazio di
+  configurazione esteso, `dma_parms`).
+- L'avviso in cima allo schermo («The last start of Stela on this PC
+  stopped…») è il crash della sesta prova, che upstream conserva e
+  riporta all'avvio dopo.
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1097,10 +1120,13 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   poi unione di upstream 0.4.1 in `f880bfc9d`, poi quinta prova, fermata
   dal controllo dei registri dopo il reset del bus della 9070, e la sua
   correzione; sesta prova, con amdgpu che parte e si ferma sulle quirks
-  I2C dell'SMU, corrette in `741c1bd17` (vedi «Prova sul PC: risultati»).
-  Non pushato quando è stata scritta questa nota.
+  I2C dell'SMU, corrette in `741c1bd17`; settima prova, con amdgpu che
+  prende la 9070 in 510 ms (vedi «Prova sul PC: risultati»). Non pushato
+  quando è stata scritta questa nota.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
-  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la settima prova del
-  GPU check, con le quirks I2C dell'SMU accettate (vedi «Prova sul PC:
-  risultati»). Sentire l'upstream resta consigliato prima degli strati che
+  passi 1, 2 e 3. Il passo 4 è fatto, e il 2026-11-15 amdgpu ha preso la
+  9070 sul PC (settima prova in «Prova sul PC: risultati»): della tappa 2
+  del piano mancano gli ioctl `AMDGPU_INFO`. Restano aperti, nel cuore di
+  Stela, il blocco dell'installazione di macOS a circa 110 s (da riprovare
+  sull'unione) e lo stop di `free_irq` dopo un init fallito. Sentire l'upstream resta consigliato prima degli strati che
   costano mesi (RADV, Metal, display).
