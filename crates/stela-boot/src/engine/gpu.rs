@@ -122,6 +122,11 @@ struct Driver {
     /// it. A mapping past it is refused (`function::Mappings`), not
     /// truncated.
     dma_limit: u64,
+    /// Whether the register BAR's first word identifies the chip, and so
+    /// reads the same after a reset: NVIDIA's PMC_BOOT_0 does. AMD's is
+    /// MM_INDEX, an index register a reset clears, of which the views'
+    /// check asks only that it answer.
+    first_identifies: bool,
 }
 
 /// Every DMA mask nouveau sets on the GPUs Stela drives holds 47 bits: the
@@ -132,6 +137,7 @@ const NOUVEAU: Driver = Driver {
     vendor: 0x10de,
     registers: 0,
     dma_limit: (1 << 47) - 1,
+    first_identifies: true,
 };
 
 /// amdgpu maps its registers from BAR 5 on every GPU from Bonaire on
@@ -142,6 +148,7 @@ const AMDGPU: Driver = Driver {
     vendor: 0x1002,
     registers: 5,
     dma_limit: (1 << 44) - 1,
+    first_identifies: false,
 };
 /// How long the GPUs may take to boot their firmware before the guest starts.
 const START_SECONDS: u64 = 60;
@@ -815,6 +822,8 @@ struct GpuViews {
     registers: Mapping,
     /// The register BAR's first word: NVIDIA's PMC_BOOT_0, AMD's MM_INDEX.
     first: u32,
+    /// [`Driver::first_identifies`].
+    first_identifies: bool,
 }
 
 fn gpu_pci_words(function: &mut Function<OwnedConfig>) -> Result<[u32; 8], ConfigError> {
@@ -850,15 +859,22 @@ impl GpuViews {
         {
             return Err(ViewError::ForeignSource);
         }
-        if function
+        let command = function
             .config()
             .read16(4)
-            .map_err(|_| ViewError::RegisterReadback)?
-            & 2
-            == 0
-            || gpu_pci_words(function).map_err(|_| ViewError::RegisterReadback)? != self.pci_words
-            || self.registers.read32(0) != Ok(self.first)
-        {
+            .map_err(|_| ViewError::RegisterReadback)?;
+        let words = gpu_pci_words(function).map_err(|_| ViewError::RegisterReadback)?;
+        let register = self.registers.read32(0);
+        let answers = register.is_ok_and(|word| match self.first_identifies {
+            true => word == self.first,
+            false => word != u32::MAX,
+        });
+        if command & 2 == 0 || words != self.pci_words || !answers {
+            output::arguments(format_args!(
+                "GPU {} views changed: command {command:#06x}, PCI words {words:08x?} where \
+                 {:08x?}, register word {register:x?} where {:#x}\n",
+                function.address, self.pci_words, self.first
+            ));
             return Err(ViewError::RegisterReadback);
         }
         Ok(())
@@ -1148,6 +1164,7 @@ fn claim(
             pci_words,
             registers,
             first,
+            first_identifies: driver.first_identifies,
         },
         timer,
     });
