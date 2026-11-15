@@ -891,6 +891,33 @@ invariati); test superati su `stela-driver-base` (1074), `stela-boot-core`
 sull'immagine UEFI con amdgpu e diagnostica, con diagnostica e di default;
 l'immagine release diagnostica con amdgpu (31,7 MB) e la CLI linkano.
 
+**Quinta prova (2026-11-15, immagine `eabd178b518ba2b9`, sull'unione).**
+La prima che arriva in fondo: dischi e USB partono («2 partitions, 7 s»), il
+GPU check si ferma come previsto e il log completo è sulla chiavetta.
+L'aggiornamento della chiavetta ha portato 22 firmware Realtek nuovi, tra
+cui `rtl_nic/rtl8125d-1.fw` e `rtl8125d-2.fw` dell'Ethernet di questo PC
+(la LAN era comunque disattivata). Dal log:
+- `HOST PCI contained: 48 functions`; lo schermo del firmware è la iGPU
+  (`HOST GOP PCI source 0000:11:00.0 BAR0`).
+- `HOST IOMMU AMD-Vi unit 0xf7700000 left untranslated: Display(768)`: il
+  requester `0x0300`, cioè la 9070, è un controller video nel raggio
+  dell'unità, e la regola di upstream (`remapping::decide`, con
+  `CLAIMED_DISPLAYS` vuoto) lascia spenta un'unità che ne copre uno. Poi
+  «every unit left untranslated and off: device DMA and interrupts are
+  untranslated», e ogni bridge riapre il forwarding: per questo dischi e
+  USB ora vanno. Su questo PC, quindi, il DMA non è tradotto.
+- `GPU 0000:03:00.0: no function-local reset; reset through its bridge's
+  secondary bus`: senza traduzione `cold.rs` resetta il bus della 9070.
+  Poi `cold preparation: Views(RegisterReadback)` e il rifiuto: il
+  controllo dopo il reset confrontava la prima parola del BAR dei registri
+  con quella di prima, e sulla 9070 (BAR 5) è `MM_INDEX`, che il reset
+  azzera. Corretto nel commit dopo l'unione: per AMD il controllo chiede
+  solo che quella parola risponda (non `0xffffffff`), per NVIDIA resta
+  `PMC_BOOT_0` uguale, e un controllo fallito scrive nel log cosa è
+  cambiato.
+- Il driver GOP del firmware sulla 9070 impiega 8 s
+  (`FIRMWARE slow driver start on 0000:03:00.0`).
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1035,10 +1062,12 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   `stela-driver-base` (1021) e clippy puliti, immagine release diagnostica
   con amdgpu ricostruita. Non pushato quando è stata scritta questa nota.
 - 2026-11-15, stessa sessione: quarta prova (nessuna unità AMD-Vi presa),
-  poi unione di upstream 0.4.1 in `f880bfc9d` (vedi «Prova sul PC:
-  risultati»). Non pushata quando è stata scritta questa nota.
+  poi unione di upstream 0.4.1 in `f880bfc9d`, poi quinta prova, fermata
+  dal controllo dei registri dopo il reset del bus della 9070, e la sua
+  correzione (vedi «Prova sul PC: risultati»). Non pushato quando è stata
+  scritta questa nota.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
-  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la quinta prova del
-  GPU check, sull'unione con upstream 0.4.1 (vedi «Prova sul PC:
-  risultati»). Sentire l'upstream resta consigliato prima degli strati che
+  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la sesta prova del
+  GPU check, sull'unione con upstream 0.4.1 e con il controllo dei
+  registri corretto per AMD (vedi «Prova sul PC: risultati»). Sentire l'upstream resta consigliato prima degli strati che
   costano mesi (RADV, Metal, display).
