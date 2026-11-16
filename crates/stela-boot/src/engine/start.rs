@@ -785,7 +785,6 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         x0,
         read_only_region,
         core_locks,
-        #[cfg_attr(not(feature = "nvk"), allow(unused_mut))]
         mut hidden_devices,
         live_tree: mut loaded_tree,
         source: loaded_source,
@@ -867,8 +866,15 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         ..
     } = storage;
     let mut bare = host_owner.host();
-    #[cfg_attr(not(feature = "nvk"), allow(unused_mut))]
     let mut assigned = assign(boot, &roster, topology_source.as_ref(), &full_profile);
+    // Without NVK no Metal device stands in for the AGX model, so macOS runs
+    // only single-user (`gpu::no_metal_device`). The model must not reach it
+    // either: AGXk matches it and panics when the model's GFX firmware does
+    // not stop for its recovery inspection.
+    #[cfg(not(feature = "nvk"))]
+    if let Some(assigned) = assigned.as_mut() {
+        hidden_devices.extend(stela_loader::devices::hide_agx(&mut assigned.tree));
+    }
     #[cfg(feature = "nvk")]
     let gpu_gates = assigned
         .as_mut()

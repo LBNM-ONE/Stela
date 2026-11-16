@@ -428,9 +428,10 @@ fn retire_hidden_capabilities(tree: &mut DeviceTree, hidden: &mut Vec<String>) {
 
 /// Hides the AGX model (`sgx`, its `gfx-asc` coprocessor and firmware mapper)
 /// from a boot whose guest has a real GPU, so that StelaGPU is its only Metal
-/// device: the model refuses all GPU work, and macOS could choose it. Returns
-/// their paths for the admission ledger. The properties stay, as they do on
-/// every hidden node.
+/// device: the model refuses all GPU work, and macOS could choose it. An image
+/// built without NVK hides it from every boot, whose AGXk would panic on it.
+/// Returns their paths for the admission ledger. The properties stay, as they
+/// do on every hidden node.
 pub fn hide_agx(tree: &mut DeviceTree) -> Vec<String> {
     let mut paths = Vec::new();
     visible_paths(
