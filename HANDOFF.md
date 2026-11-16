@@ -1236,6 +1236,9 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   upstream (vedi «Piano a tappe proposto»). Fase A fatta: Mesa con NVK e
   LLVM compilano sul PC, e l'immagine con NVK e Metal linka (vedi
   «Ambiente di build sul PC»). Il prossimo passo è la fase B, la lane RADV.
+- 2026-11-16: le fasi B, C e D passano a un altro agente di codice, con le
+  istruzioni in `BRIEF-AGENTE.md`; lavora sul branch `radv-fase-b`, e
+  Claude rivede i suoi commit prima di unirli a questo branch.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
   passi 1, 2 e 3. Il passo 4 è fatto, e il 2026-11-15 amdgpu ha preso la
   9070 sul PC (settima prova in «Prova sul PC: risultati»): della tappa 2
