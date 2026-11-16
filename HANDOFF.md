@@ -973,6 +973,49 @@ dopo le righe già viste nella sesta prova:
   stopped…») è il crash della sesta prova, che upstream conserva e
   riporta all'avvio dopo.
 
+**Install macOS, prima prova sull'unione (2026-11-15, immagine
+`40207e04126c0171`).** Per la prima volta l'installer di macOS parte (logo
+Apple e barra), ma l'utente spegne a 32 minuti con la barra in fondo, mentre
+l'installazione lavorava ancora: a 1923 s il log è in
+`populate_paired_recovery_volume`. Dal log:
+- Il Mac emulato usa 8 core (`NATIVE ASSIGNMENT … physical_cores=8 PEs=8`),
+  ma durante la copia 3-4 lavorano e gli altri restano quasi fermi
+  (`PES TIME`). Ogni core esegue 30-140 milioni di istruzioni ARM al
+  secondo (`PES RETIRED`), circa l'1% di un M2 vero.
+- La copia dell'immagine di sistema (10,7 GB) va a circa 11 MB/s, da 160 a
+  1115 s. Il limite è il Mac emulato, non i dischi: `polls_guest_full`
+  cresce sempre, la chiavetta è occupata il 25% del tempo e l'NVMe l'8%. Un
+  disco più veloce al posto della chiavetta non aiuterebbe.
+- Le fasi lunghe: `update_iBoot` 169-1207 s (17 min, in parallelo alla
+  copia) e `install_splat` 1285-1911 s (10,5 min, la barra resta in fondo).
+- La cache delle traduzioni non si salvava: `TRANSLATIONS stela\store\
+  cfdd949a.pak … file=0 … allocated=false` in ogni avvio dopo l'unione,
+  perché sulla chiavetta mancava `spare.bin`. `stela repair` lo prepara, ma
+  si ferma su `cannot inspect /run/stela/sdb2`: cerca la partizione dati
+  solo tra quelle montate, poi al percorso registrato quando la chiavetta
+  era `sdb`, mentre `update` la monta da sé. Aggirato montandola a mano
+  (`sudo mkdir -p /run/stela/sdb2`, `sudo mount /dev/sda2 /run/stela/sdb2`,
+  `stela repair`, `sudo umount /run/stela/sdb2`); anche `-n` fallisce allo
+  stesso modo. `repair` non tocca `stela.efi` e riscrive `choices.cfg` come
+  registrato (la voce GPU check sparisce).
+
+**Install macOS, seconda prova (2026-11-15): riuscita.** Con la cache
+preparata, l'installazione arriva a `restore-outcome = success` a 1987 s e
+riavvia a 2017 s (34 minuti dall'accensione). Poi:
+- Avvio 20, «BOOT macOS, single-user to repair the Metal plugin»: il primo
+  avvio dopo l'installazione è single-user, e a 109 s macOS va in panic in
+  AGXk (`agxk_fwc_arm.cpp:4642 … Failed to stop GFX FW for GPU recovery`).
+  Upstream nasconde il modello AGX a macOS (`devices::hide_agx`) solo nelle
+  immagini NVK con un device Metal; nella nostra immagine il modello
+  restava visibile, AGXk lo prendeva e andava in panic. Corretto in
+  `2eb5cf7cd`: un'immagine senza NVK nasconde il modello AGX in ogni
+  avvio.
+- Avvio 21: avvio normale, rifiutato come previsto («macOS cannot run
+  without a GPU: this stela.efi was built without GPU drivers (the `nvk`
+  feature)»). Un avvio single-user salta quel rifiuto (`start.rs`: «A
+  single-user boot is a console, which draws through no GPU»).
+- La cache ora si salva: «Opening the translation cache (443 MB, 10 s)».
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1121,12 +1164,18 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   dal controllo dei registri dopo il reset del bus della 9070, e la sua
   correzione; sesta prova, con amdgpu che parte e si ferma sulle quirks
   I2C dell'SMU, corrette in `741c1bd17`; settima prova, con amdgpu che
-  prende la 9070 in 510 ms (vedi «Prova sul PC: risultati»). Non pushato
-  quando è stata scritta questa nota.
+  prende la 9070 in 510 ms (vedi «Prova sul PC: risultati»). Pushato fino
+  a `fc9b92510`.
+- 2026-11-15 e 16, stessa sessione: due installazioni di macOS
+  sull'unione. La prima interrotta dall'utente a 32 minuti, la seconda
+  riuscita dopo la cache preparata con `stela repair`; il primo avvio
+  single-user va in panic in AGXk, corretto in `2eb5cf7cd` (vedi «Prova
+  sul PC: risultati»). Non pushato quando è stata scritta questa nota.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
   passi 1, 2 e 3. Il passo 4 è fatto, e il 2026-11-15 amdgpu ha preso la
   9070 sul PC (settima prova in «Prova sul PC: risultati»): della tappa 2
-  del piano mancano gli ioctl `AMDGPU_INFO`. Restano aperti, nel cuore di
-  Stela, il blocco dell'installazione di macOS a circa 110 s (da riprovare
-  sull'unione) e lo stop di `free_irq` dopo un init fallito. Sentire l'upstream resta consigliato prima degli strati che
+  del piano mancano gli ioctl `AMDGPU_INFO`. Sull'unione macOS si installa
+  (34 minuti); il prossimo passo è l'avvio single-user con l'AGX nascosto.
+  Restano aperti lo stop di `free_irq` dopo un init fallito e `stela
+  repair`, che non monta da sé la partizione dati. Sentire l'upstream resta consigliato prima degli strati che
   costano mesi (RADV, Metal, display).
