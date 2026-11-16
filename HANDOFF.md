@@ -281,6 +281,22 @@ Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
 4. **Display**: DC e DMUB per pilotare le uscite della 9070. Metà del codice
    kernel, rimandabile finché il monitor sta sulla iGPU.
 
+Il 2026-11-16 l'utente ha deciso di proseguire da solo con Claude, senza
+chiedere a upstream. Il lavoro da qui segue quattro fasi:
+- **A. Mesa e LLVM sul PC** (fatta il 2026-11-16): la lane NVK esistente
+  (`cargo xtask gpu nvk`) compila qui, e l'immagine con NVK e il device
+  Metal linka. È la catena che RADV seguirà.
+- **B. Lane RADV** (tappa 1): Mesa con `-Dvulkan-drivers=amd`, ACO in C++
+  sulla libc++ di LLVM, il compat `libdrm_amdgpu` (le 17 funzioni in «Fatti
+  su RADV nel Mesa pinnato») e una patch perché RADV accetti
+  `VkPipelineShaderStageNirCreateInfoMESA`.
+- **C. Primo segnale di vita** (chiude la tappa 2): nel GPU check RADV apre
+  la 9070, alloca memoria, esegue un comando e ne rilegge il risultato.
+- **D. Device Metal su RADV** (tappa 3): `metal/amd.rs` accanto a
+  `metal/nvidia.rs`. Il backend (`metal/native.rs`) prende già un driver
+  Mesa qualsiasi tramite `vkGetInstanceProcAddr`; `submit_thread` e
+  `refusals`, propri di NVK, sono opzionali. Poi la suite Metal sul PC.
+
 ## Primo passo: censimento amdgpu
 
 Scopo: misurare il lavoro kernel prima di impegnarsi.
@@ -1113,6 +1129,25 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   bindgen-cli e cbindgen in `.tools/gpu/rust`.
 - Prima del fetch i submodule `third_party/{linux,mesa,llvm,libdrm,xnu}`
   erano vuoti.
+- Clang 21 viene da swiftly, e `~/.local/share/swiftly/bin/{clang,ld.lld}`
+  sono proxy: quando clang chiama ld.lld attraverso di loro swiftly rifiuta
+  («Circular swiftly proxy invocation»), e il controllo del linker di Meson
+  in `cargo xtask gpu nvk` fallisce. Le build GPU vogliono anche
+
+  ```sh
+  export CLANG="$HOME/.local/share/swiftly/toolchains/6.4.1/usr/bin/clang"
+  ```
+
+  la cui cartella ha clang, ld.lld, llvm-ar e llvm-nm veri (2026-11-16).
+  Con quello `cargo xtask gpu nvk --jobs 16` compila LLVM, libc++ e Mesa in
+  circa 2 minuti (`target/gpu/nvk/libstela-nvk.a`, 585 oggetti, più il kext
+  `StelaGPU` in `target/guest`), e `cargo build --manifest-path
+  crates/stela-boot/Cargo.toml --features nvk --target x86_64-unknown-uefi
+  --target-dir target/boot` linka l'immagine con NVK e Metal in 4 min 40 s.
+- Il 2026-11-16 sono state cancellate le cache incrementali
+  (`target/debug/incremental`, `target/boot/x86_64-unknown-uefi/debug/
+  incremental`) e la cartella vecchia `target/uefi-check`: `target/` è
+  sceso da 65 a 27 GB.
 
 ## Stato
 
@@ -1197,13 +1232,18 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   single-user va in panic in AGXk, corretto in `2eb5cf7cd`; poi l'avvio
   single-user arriva in macOS con amdgpu sulla 9070 (vedi «Prova sul PC:
   risultati»). Non pushato quando è stata scritta questa nota.
+- 2026-11-16, stessa sessione: l'utente decide di proseguire senza
+  upstream (vedi «Piano a tappe proposto»). Fase A fatta: Mesa con NVK e
+  LLVM compilano sul PC, e l'immagine con NVK e Metal linka (vedi
+  «Ambiente di build sul PC»). Il prossimo passo è la fase B, la lane RADV.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
   passi 1, 2 e 3. Il passo 4 è fatto, e il 2026-11-15 amdgpu ha preso la
   9070 sul PC (settima prova in «Prova sul PC: risultati»): della tappa 2
   del piano mancano gli ioctl `AMDGPU_INFO`. Sull'unione macOS si installa
   (34 minuti) e il 2026-11-16 si avvia con amdgpu che tiene la 9070, fino
   al single-user e oltre, senza device Metal. Il prossimo passo è la tappa
-  3 (RADV e il device Metal), da concordare prima con upstream. Restano
+  3 (RADV e il device Metal), con le fasi B, C e D di «Piano a tappe
+  proposto». Restano
   aperti lo stop di `free_irq` dopo un init fallito, `stela repair` che non
   monta da sé la partizione dati e la shell single-user interrotta. Sentire l'upstream resta consigliato prima degli strati che
   costano mesi (RADV, Metal, display).
