@@ -1016,6 +1016,31 @@ riavvia a 2017 s (34 minuti dall'accensione). Poi:
   single-user boot is a console, which draws through no GPU»).
 - La cache ora si salva: «Opening the translation cache (443 MB, 10 s)».
 
+**Avvio di macOS single-user (2026-11-16, immagine `44fa2b6dece8c51d`, con
+l'AGX nascosto).** La voce «macOS single-user» (le opzioni di «macOS» più
+`--single-user`; con macOS installato il menu ha di nuovo 5 s di attesa
+prima della voce 1, che viene rifiutata). Dal log:
+- `GPU 0000:03:00.0: amdgpu bound it`, `GPU START … total_ms=522`: amdgpu
+  prende la 9070 anche in un avvio di macOS.
+- Il kernel di macOS parte, e a 69,8 s launchd scrive «Entering
+  single-user mode» e la shell stampa «*** Single-user boot ***» con le sue
+  istruzioni. 0,15 s dopo: «Single-user shell was signaled: Interrupt: 2»,
+  poi «Re-opening serial log (error: 5)», e launchd prosegue con l'avvio
+  normale. Il prompt `localhost:/ root#` non compare mai. La console della
+  shell è la seriale del modello (`serial=3 serial-device-name=uart0`);
+  che l'interruzione venga dal modello della UART (un break o un ^C) è
+  un'ipotesi, non verificata. Upstream usa il single-user solo per la
+  riparazione automatica del plugin Metal.
+- Nell'avvio normale che segue, WindowServer va in crash due volte (121 e
+  153 s: niente device Metal), e bluetoothd viene rilanciato di continuo
+  («AppleSEPKeyStore … unexpected session uid: -1 requested by:
+  bluetoothd»): è il ciclo che l'utente vede sullo schermo.
+- Con la cache delle traduzioni piena il codice gira molto più veloce:
+  `BEAT … ticks/block=91 native=53%`, contro `ticks/block=2955 native=3%`
+  durante l'installazione a cache vuota.
+- Il log sulla chiavetta si ferma a 182,8 s; l'ambiente Linux di amdgpu
+  riceve gli interrupt della GPU (`gpu_interrupts=11 linux_irqs=11`).
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1169,13 +1194,16 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
 - 2026-11-15 e 16, stessa sessione: due installazioni di macOS
   sull'unione. La prima interrotta dall'utente a 32 minuti, la seconda
   riuscita dopo la cache preparata con `stela repair`; il primo avvio
-  single-user va in panic in AGXk, corretto in `2eb5cf7cd` (vedi «Prova
-  sul PC: risultati»). Non pushato quando è stata scritta questa nota.
+  single-user va in panic in AGXk, corretto in `2eb5cf7cd`; poi l'avvio
+  single-user arriva in macOS con amdgpu sulla 9070 (vedi «Prova sul PC:
+  risultati»). Non pushato quando è stata scritta questa nota.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
   passi 1, 2 e 3. Il passo 4 è fatto, e il 2026-11-15 amdgpu ha preso la
   9070 sul PC (settima prova in «Prova sul PC: risultati»): della tappa 2
   del piano mancano gli ioctl `AMDGPU_INFO`. Sull'unione macOS si installa
-  (34 minuti); il prossimo passo è l'avvio single-user con l'AGX nascosto.
-  Restano aperti lo stop di `free_irq` dopo un init fallito e `stela
-  repair`, che non monta da sé la partizione dati. Sentire l'upstream resta consigliato prima degli strati che
+  (34 minuti) e il 2026-11-16 si avvia con amdgpu che tiene la 9070, fino
+  al single-user e oltre, senza device Metal. Il prossimo passo è la tappa
+  3 (RADV e il device Metal), da concordare prima con upstream. Restano
+  aperti lo stop di `free_irq` dopo un init fallito, `stela repair` che non
+  monta da sé la partizione dati e la shell single-user interrotta. Sentire l'upstream resta consigliato prima degli strati che
   costano mesi (RADV, Metal, display).
