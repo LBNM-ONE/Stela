@@ -5,9 +5,16 @@
 use super::nvk::{self, Lane};
 use anyhow::Result;
 
-/// NVK's options, for AMD's driver: NVK's are part of the GPU builds'
-/// identity, which then covers these as well.
-pub(super) const OPTIONS: [&str; 21] = [
+/// RADV's build ID, which its pipeline cache UUID hashes: Mesa reads one
+/// through `dladdr` or the ELF build-ID note, neither in the image, and RADV
+/// fails to start without (`cannot generate UUID`). Fixed, as NVK's is
+/// (`compat/mesa/build_id.c`): with no cache on disk nothing outlives a boot.
+/// "Stela statically", in hex.
+const BUILD_ID: &str = "-Dradv-build-id=5374656c6120737461746963616c6c79";
+
+/// NVK's options, for AMD's driver, then RADV's build ID: NVK's are part of
+/// the GPU builds' identity, which then covers these as well.
+pub(super) const OPTIONS: [&str; 22] = [
     "-Dcpp_rtti=false",
     "-Dvulkan-drivers=amd",
     "-Dgallium-drivers=",
@@ -29,6 +36,7 @@ pub(super) const OPTIONS: [&str; 21] = [
     "-Dvideo-codecs=",
     "-Dexpat=disabled",
     "-Dbuildtype=release",
+    BUILD_ID,
 ];
 
 /// RADV links whole what NVK does, Vulkan's runtime, and its own units in
@@ -97,8 +105,10 @@ mod tests {
 
     #[test]
     fn the_options_are_nvks_but_for_the_driver() {
-        assert_eq!(OPTIONS.len(), nvk::OPTIONS.len());
-        for (radv, nvk) in OPTIONS.iter().zip(nvk::OPTIONS) {
+        let (build_id, nvks) = OPTIONS.split_last().unwrap();
+        assert_eq!(*build_id, BUILD_ID);
+        assert_eq!(nvks.len(), nvk::OPTIONS.len());
+        for (radv, nvk) in nvks.iter().zip(nvk::OPTIONS) {
             if nvk.starts_with("-Dvulkan-drivers=") {
                 assert_eq!(*radv, "-Dvulkan-drivers=amd");
             } else {

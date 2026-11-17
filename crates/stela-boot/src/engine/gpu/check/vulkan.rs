@@ -10,7 +10,7 @@ use super::super::{
     stack::{self, Stack},
 };
 use crate::output;
-use ash::vk;
+use ash::{ext::debug_utils, vk};
 use core::{
     ffi::{c_char, c_void},
     fmt,
@@ -78,6 +78,22 @@ unsafe extern "system" fn entry(
     }
 }
 
+/// RADV's own messages, which its errors carry and Mesa prints only to a
+/// messenger (`vk_log.c`), as `GPU CHECK radv: driver` lines.
+unsafe extern "system" fn driver_message(
+    severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    _kinds: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
+    _context: *mut c_void,
+) -> vk::Bool32 {
+    // SAFETY: the driver's callback data, live for the call.
+    let message = unsafe { data.as_ref().and_then(|data| data.message_as_c_str()) }
+        .and_then(|message| message.to_str().ok())
+        .unwrap_or("?");
+    say(format_args!("driver {:#x}: {message}", severity.as_raw()));
+    vk::FALSE
+}
+
 fn check() -> Result<(), &'static str> {
     let static_fn = ash::StaticFn {
         get_instance_proc_addr: entry,
@@ -88,14 +104,39 @@ fn check() -> Result<(), &'static str> {
         .application_name(c"Stela GPU check")
         .engine_name(c"Stela")
         .api_version(vk::API_VERSION_1_3);
-    let info = vk::InstanceCreateInfo::default().application_info(&application);
+    let names = [debug_utils::NAME.as_ptr()];
+    let mut messages = vk::DebugUtilsMessengerCreateInfoEXT::default()
+        .message_severity(
+            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                | vk::DebugUtilsMessageSeverityFlagsEXT::INFO,
+        )
+        .message_type(
+            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+        )
+        .pfn_user_callback(Some(driver_message));
+    // The messenger in the chain hears the instance's creation; the one made
+    // after it, everything until its destruction.
+    let info = vk::InstanceCreateInfo::default()
+        .application_info(&application)
+        .enabled_extension_names(&names)
+        .push_next(&mut messages);
     say(format_args!("instance"));
-    // SAFETY: the create info and its application info outlive the call.
+    // SAFETY: the create info and what it points to outlive the call.
     let instance = unsafe { entry.create_instance(&info, None) }.map_err(refused("instance"))?;
+    let utils = debug_utils::Instance::new(&entry, &instance);
+    // SAFETY: the instance enables the extension; `messages` chains nothing.
+    let messenger = unsafe { utils.create_debug_utils_messenger(&messages, None) }
+        .map_err(refused("messenger"))?;
     on_instance(&instance)?;
     say(format_args!("instance destroy"));
     // SAFETY: its one device is destroyed, and nothing else uses it.
-    unsafe { instance.destroy_instance(None) };
+    unsafe {
+        utils.destroy_debug_utils_messenger(messenger, None);
+        instance.destroy_instance(None);
+    }
     say(format_args!("done"));
     Ok(())
 }
