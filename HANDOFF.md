@@ -1100,6 +1100,29 @@ non lo mostra. Correzione nella decima prova: l'opzione Meson
 `-Dradv-build-id` con un ID fisso, e un messenger `VK_EXT_debug_utils` nel
 GPU check che scrive i messaggi di RADV nel log.
 
+**Decima prova (2026-11-17, immagine `8c53539a050ab0ea`, commit
+`cf3b4e096`): RADV crea il device sulla 9070, la prima sottomissione
+fallisce.** Con l'ID di build, `vkEnumeratePhysicalDevices` trova `AMD
+Radeon Graphics (RADV GFX1201): vendor=0x1002 device=0x7550
+vulkan=1.4.354 driver=0x6802005`, con cinque famiglie di code: 0 universale
+(`flags=0xf`, 1 coda), 1 compute (`0xe`, 4), 2 decodifica video (`0x20`),
+3 codifica video (`0x40`), 4 sparse (`0x8`). Il device sulla famiglia 0
+nasce in 16 ms; buffer, memoria di tipo 5 (la cache-abile in GTT),
+mappatura e registrazione riescono. Al primo `vkQueueSubmit` RADV dice
+`VK_ERROR_OUT_OF_DEVICE_MEMORY` e poi `vkQueueSubmit() failed
+(VK_ERROR_DEVICE_LOST)`; nessuna riga di amdgpu. Dal sorgente il primo
+candidato è il preambolo della prima sottomissione sulla coda universale:
+da GFX11 RADV vi crea sempre gli anelli di attributi, posizioni e
+primitive (`ge_rings_bo`, qualche MB di VRAM allineati a 2 MiB
+nell'intervallo di indirizzi a 32 bit) e un BO di descrittori che mappa
+per la CPU; un errore in uno di questi passi dà proprio quei due
+messaggi. Per l'undicesima prova: nelle immagini diagnostiche il client
+scrive ogni chiamata DRM rifiutata (con dimensione, allineamento, domini e
+flag di `GEM_CREATE` e gli argomenti di `GEM_VA`) e ogni mappatura
+rifiutata di Mesa, che prima non lasciava traccia; e il GPU check prova i
+due riempimenti prima su un device con una coda compute, che non ha
+bisogno di quegli anelli, poi su uno con la coda universale.
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1453,3 +1476,9 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   un messenger che scrive ogni messaggio di RADV come `GPU CHECK radv:
   driver …`. Immagine `--release --radv --diagnostics` di 50 MB; la prova si
   fa come l'ottava.
+- 2026-11-17, decima prova sul PC (vedi «Prova sul PC: risultati»): RADV
+  crea il device fisico e il device sulla 9070 (Vulkan 1.4.354), e si
+  ferma alla prima sottomissione con `VK_ERROR_OUT_OF_DEVICE_MEMORY`. Per
+  l'undicesima, immagine `--release --radv --diagnostics` (50 MB): il log
+  delle chiamate DRM e delle mappature rifiutate, e i riempimenti prima su
+  una coda compute, poi sulla universale.
