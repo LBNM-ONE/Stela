@@ -287,11 +287,12 @@ chiedere a upstream. Il lavoro da qui segue quattro fasi:
 - **A. Mesa e LLVM sul PC** (fatta il 2026-11-16): la lane NVK esistente
   (`cargo xtask gpu nvk`) compila qui, e l'immagine con NVK e il device
   Metal linka. È la catena che RADV seguirà.
-- **B. Lane RADV** (tappa 1): Mesa con `-Dvulkan-drivers=amd`, ACO in C++
+- **B. Lane RADV** (tappa 1, fatta il 2026-11-17): Mesa con `-Dvulkan-drivers=amd`, ACO in C++
   sulla libc++ di LLVM, il compat `libdrm_amdgpu` (le 17 funzioni in «Fatti
   su RADV nel Mesa pinnato») e una patch perché RADV accetti
   `VkPipelineShaderStageNirCreateInfoMESA`.
-- **C. Primo segnale di vita** (chiude la tappa 2): nel GPU check RADV apre
+- **C. Primo segnale di vita** (fatta il 2026-11-17, tredicesima prova in
+  «Prova sul PC: risultati»): nel GPU check RADV apre
   la 9070, alloca memoria, esegue un comando e ne rilegge il risultato.
 - **D. Device Metal su RADV** (tappa 3): `metal/amd.rs` accanto a
   `metal/nvidia.rs`. Il backend (`metal/native.rs`) prende già un driver
@@ -1200,6 +1201,35 @@ collegamento PCIe almeno da 3.0 x8 (`radv_amdgpu_cs_domain`); e la riga di
 `dev_info` scrive `pcie=gen…x…`, per sapere quale dei due percorsi prende
 RADV.
 
+**Tredicesima prova (2026-11-17, immagine `233f0add5bd3dd67`, commit
+`30832b296`): RADV esegue i suoi comandi sulla 9070 e i riempimenti
+tornano giusti. Fase C chiusa.**
+- I comandi di Stela scrivono «STEL» in tutte e cinque le sottomissioni:
+  `compute cached` in 1575 us, `compute write-combined` in 1573 us (il
+  flag USWC ora è tolto: la patch 0202 funziona), `compute write-combined
+  past l2` in 1693 us, `compute vram past l2` in 1662 us (anche i comandi
+  in VRAM, dove RADV li mette quando conta il collegamento veloce), `gfx
+  cached` in 1638 us.
+- RADV, device sulla famiglia compute: `cp dma: done in 7744 us, 0 of 64
+  words wrong` e `shader: done in 1737 us, 0 of 262144 words wrong`; sulla
+  universale `cp dma` in 13909 us e `shader` in 1761 us, entrambi `0 of …
+  words wrong`; poi `device destroy`, `instance destroy` e `done`. Il
+  riempimento `shader` è uno shader di compute che ACO ha compilato e la
+  GPU ha eseguito: 1 MiB in meno di 2 ms.
+- Nessun errore di amdgpu, nessun messaggio di RADV oltre all'avviso di non
+  conformità; i quattro `HW_IP_COUNT` rifiutati come nella dodicesima.
+- `dev_info` dice `pcie=gen2x1`: amdgpu non legge il collegamento della
+  9070. Il compat PCI di Stela non dà un genitore ai bus, quindi
+  `pci_is_root_bus` è vero e `amdgpu_device_get_pcie_info` prende i valori
+  predefiniti delle APU (piattaforma Gen1 e Gen2, nessuna larghezza
+  dell'ASIC). RADV, che vede meno di PCIe 3.0 x8, mette i buffer dei
+  comandi in GTT; e `smu_update_pcie_parameters` passa allo SMU Gen2 x16
+  come tetto di ogni livello del collegamento
+  (`smu_v14_0_2_update_pcie_parameters`), su una scheda PCIe 5.0 x16.
+  Funziona, ma con circa un ottavo della banda verso la CPU: da sistemare
+  presentando a Linux i bridge a monte della 9070, così amdgpu legge
+  `pcie_get_speed_cap` e `pcie_get_width_cap`, che il compat ha già.
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1572,3 +1602,10 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   0202 tiene la GTT di amdgpu cache-abile e con snoop, e il GPU check prova
   anche i comandi in VRAM e scrive il collegamento PCIe. Immagine
   `--release --radv --diagnostics`; la prova si fa come l'ottava.
+- 2026-11-17, tredicesima prova sul PC (vedi «Prova sul PC: risultati»):
+  con la GTT cache-abile RADV riempie i buffer sulla 9070, con CP DMA e con
+  uno shader compilato da ACO, sulle code compute e universale, e i
+  comandi di Stela funzionano anche dalla VRAM. La fase C è chiusa. Il
+  prossimo passo è la fase D, il device Metal su RADV (`metal/amd.rs`). A
+  parte resta il collegamento PCIe, che amdgpu legge come Gen2 x1 e che lo
+  SMU limita a Gen2.
