@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: LBNM-ONE <leonardo.bonomo009@gmail.com>
+Date: Tue, 17 Nov 2026 16:50:05 +0000
+Subject: [PATCH] fix(drm): count Stela's system memory as unable to be
+ write-combined, as nothing flushes a page's CPU caches when TTM makes it so,
+ and have amdgpu keep its GTT snooped
+
+---
+ include/drm/drm_cache.h | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/include/drm/drm_cache.h b/include/drm/drm_cache.h
+index 08e0e3ffad1319d8a32a21b37e1b070ae0a9acaa..05de33b6263b94d6d7ef652c6faa4a82a4d95f83 100644
+--- a/include/drm/drm_cache.h
++++ b/include/drm/drm_cache.h
+@@ -75,6 +75,14 @@ static inline bool drm_arch_can_wc_memory(void)
+ 	 * memory regions.
+ 	 */
+ 	return false;
++#elif defined(CONFIG_STELA)
++	/*
++	 * Stela builds Linux without CONFIG_X86, so TTM never calls
++	 * set_pages_array_wc(): nothing flushes the CPU's caches of a page TTM
++	 * makes write-combined, or changes the memory type the kernel maps it
++	 * with, and a device's no-snoop reads of it miss what the caches hold.
++	 */
++	return false;
+ #else
+ 	return true;
+ #endif

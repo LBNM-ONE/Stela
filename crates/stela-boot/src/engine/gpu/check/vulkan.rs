@@ -145,8 +145,8 @@ fn check() -> Result<(), &'static str> {
 fn on_instance(instance: &ash::Instance) -> Result<(), &'static str> {
     say(format_args!("physical devices"));
     // SAFETY: a live instance.
-    let physicals = unsafe { instance.enumerate_physical_devices() }
-        .map_err(refused("physical devices"))?;
+    let physicals =
+        unsafe { instance.enumerate_physical_devices() }.map_err(refused("physical devices"))?;
     say(format_args!("{} physical devices", physicals.len()));
     let &physical = physicals.first().ok_or("physical devices")?;
     // SAFETY: a physical device of this instance.
@@ -355,9 +355,5 @@ fn fill(
         device.free_memory(backing, None);
         device.destroy_buffer(buffer, None);
     }
-    if wrong == 0 {
-        Ok(())
-    } else {
-        Err("read back")
-    }
+    if wrong == 0 { Ok(()) } else { Err("read back") }
 }

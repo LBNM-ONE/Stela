@@ -1495,7 +1495,8 @@ fn refused_call(fd: c_int, request: u32, argument: *mut c_void, result: i64) {
         GEM_CREATE => {
             // SAFETY: the caller's `union drm_amdgpu_gem_create`, whose
             // request is four words.
-            let [size, alignment, domains, flags] = unsafe { argument.cast::<[u64; 4]>().read_unaligned() };
+            let [size, alignment, domains, flags] =
+                unsafe { argument.cast::<[u64; 4]>().read_unaligned() };
             alloc::format!(
                 " size={size:#x} alignment={alignment:#x} domains={domains:#x} flags={flags:#x}"
             )
@@ -1503,7 +1504,8 @@ fn refused_call(fd: c_int, request: u32, argument: *mut c_void, result: i64) {
         GEM_VA => {
             // SAFETY: the caller's `struct drm_amdgpu_gem_va`, whose first
             // five words every version shares.
-            let [ids, kinds, address, offset, size] = unsafe { argument.cast::<[u64; 5]>().read_unaligned() };
+            let [ids, kinds, address, offset, size] =
+                unsafe { argument.cast::<[u64; 5]>().read_unaligned() };
             alloc::format!(
                 " handle={} operation={} flags={:#x} va={address:#x} offset={offset:#x} size={size:#x}",
                 ids as u32,

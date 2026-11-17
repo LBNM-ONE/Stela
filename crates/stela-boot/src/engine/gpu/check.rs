@@ -109,7 +109,10 @@ struct VramGtt {
 /// device opening reads: the kernel writes no more than is asked.
 #[repr(C)]
 #[derive(Default)]
-#[allow(dead_code, reason = "the kernel's layout, of which the check logs a few fields")]
+#[allow(
+    dead_code,
+    reason = "the kernel's layout, of which the check logs a few fields"
+)]
 struct DeviceInfo {
     device_id: u32,
     chip_rev: u32,
@@ -228,7 +231,11 @@ fn check(fd: c_int, minor: u32) -> Result<(), &'static str> {
         description: ptr::null_mut(),
     };
     say(minor, format_args!("version"));
-    refused(minor, client::control(fd, VERSION, (&raw mut version).cast()), "version")?;
+    refused(
+        minor,
+        client::control(fd, VERSION, (&raw mut version).cast()),
+        "version",
+    )?;
     let named = &name[..version.name_length.min(name.len())];
     say(
         minor,
@@ -243,7 +250,11 @@ fn check(fd: c_int, minor: u32) -> Result<(), &'static str> {
 
     let mut working = 0u32;
     say(minor, format_args!("query accel_working"));
-    refused(minor, query(fd, ACCEL_WORKING, [0; 4], &mut working), "accel_working")?;
+    refused(
+        minor,
+        query(fd, ACCEL_WORKING, [0; 4], &mut working),
+        "accel_working",
+    )?;
     say(minor, format_args!("accel_working={working}"));
 
     let mut device = DeviceInfo::default();
@@ -254,7 +265,7 @@ fn check(fd: c_int, minor: u32) -> Result<(), &'static str> {
         format_args!(
             "device={:#06x} rev={:#04x} external_rev={:#04x} family={} shader_engines={} \
              active_cus={} wave={} vram_type={} vram_bits={} va={:#x}..{:#x} \
-             high_va={:#x}..{:#x} va_alignment={:#x} gart_page={:#x}",
+             high_va={:#x}..{:#x} va_alignment={:#x} gart_page={:#x} pcie=gen{}x{}",
             device.device_id,
             device.pci_rev,
             device.external_rev,
@@ -269,7 +280,9 @@ fn check(fd: c_int, minor: u32) -> Result<(), &'static str> {
             device.high_va_offset,
             device.high_va_max,
             device.virtual_address_alignment,
-            device.gart_page_size
+            device.gart_page_size,
+            device.pcie_gen,
+            device.pcie_num_lanes
         ),
     );
 
@@ -289,10 +302,18 @@ fn check(fd: c_int, minor: u32) -> Result<(), &'static str> {
     for (engine, kind) in ENGINES {
         let mut count = 0u32;
         say(minor, format_args!("query {engine} count"));
-        refused(minor, query(fd, HW_IP_COUNT, [kind, 0, 0, 0], &mut count), "hw_ip_count")?;
+        refused(
+            minor,
+            query(fd, HW_IP_COUNT, [kind, 0, 0, 0], &mut count),
+            "hw_ip_count",
+        )?;
         let mut ip = HwIp::default();
         if count != 0 {
-            refused(minor, query(fd, HW_IP_INFO, [kind, 0, 0, 0], &mut ip), "hw_ip_info")?;
+            refused(
+                minor,
+                query(fd, HW_IP_INFO, [kind, 0, 0, 0], &mut ip),
+                "hw_ip_info",
+            )?;
         }
         say(
             minor,
@@ -349,37 +370,57 @@ fn buffer(fd: c_int, minor: u32, name: &str, domains: u64, flags: u64) -> Result
         },
     };
     say(minor, format_args!("{name} buffer create"));
-    refused(minor, client::control(fd, GEM_CREATE, (&raw mut create).cast()), "buffer creation")?;
+    refused(
+        minor,
+        client::control(fd, GEM_CREATE, (&raw mut create).cast()),
+        "buffer creation",
+    )?;
     // SAFETY: on success the kernel wrote the handle over the request.
     let handle = unsafe { create.handle };
     let mut mapped = u64::from(handle);
     say(minor, format_args!("{name} buffer {handle} offset"));
-    let result = refused(minor, client::control(fd, GEM_MMAP, (&raw mut mapped).cast()), "buffer offset")
-        .and_then(|()| {
-            say(minor, format_args!("{name} buffer {handle} map at {mapped:#x}"));
-            client::map(fd, mapped, BUFFER_BYTES).ok_or("buffer mapping")
-        })
-        .map(|address| {
-            let words = address.as_ptr().cast::<u32>();
-            let count = BUFFER_BYTES / size_of::<u32>();
-            say(minor, format_args!("{name} buffer {handle} write at {address:p}"));
-            for at in 0..count {
-                // SAFETY: the mapping holds `BUFFER_BYTES` until it is unmapped below.
-                unsafe { words.add(at).write_volatile(pattern(at)) };
-            }
-            say(minor, format_args!("{name} buffer {handle} read back"));
-            let wrong = (0..count)
-                // SAFETY: as above.
-                .filter(|&at| unsafe { words.add(at).read_volatile() } != pattern(at))
-                .count();
-            client::unmap(address);
-            say(minor, format_args!("{name} buffer {handle}: {wrong} of {count} words wrong"));
-            wrong
-        });
+    let result = refused(
+        minor,
+        client::control(fd, GEM_MMAP, (&raw mut mapped).cast()),
+        "buffer offset",
+    )
+    .and_then(|()| {
+        say(
+            minor,
+            format_args!("{name} buffer {handle} map at {mapped:#x}"),
+        );
+        client::map(fd, mapped, BUFFER_BYTES).ok_or("buffer mapping")
+    })
+    .map(|address| {
+        let words = address.as_ptr().cast::<u32>();
+        let count = BUFFER_BYTES / size_of::<u32>();
+        say(
+            minor,
+            format_args!("{name} buffer {handle} write at {address:p}"),
+        );
+        for at in 0..count {
+            // SAFETY: the mapping holds `BUFFER_BYTES` until it is unmapped below.
+            unsafe { words.add(at).write_volatile(pattern(at)) };
+        }
+        say(minor, format_args!("{name} buffer {handle} read back"));
+        let wrong = (0..count)
+            // SAFETY: as above.
+            .filter(|&at| unsafe { words.add(at).read_volatile() } != pattern(at))
+            .count();
+        client::unmap(address);
+        say(
+            minor,
+            format_args!("{name} buffer {handle}: {wrong} of {count} words wrong"),
+        );
+        wrong
+    });
     let mut close = [handle, 0];
     let closed = client::control(fd, GEM_CLOSE, (&raw mut close).cast());
     if closed != 0 {
-        say(minor, format_args!("{name} buffer {handle} close refused: {closed}"));
+        say(
+            minor,
+            format_args!("{name} buffer {handle} close refused: {closed}"),
+        );
     }
     match result {
         Ok(0) => Ok(()),

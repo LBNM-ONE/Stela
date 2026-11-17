@@ -3,20 +3,17 @@
 //! into a second buffer, padded with a `NOP`), both mapped into the file's GPU
 //! address space, submitted with `AMDGPU_CS`, waited for with
 //! `AMDGPU_WAIT_CS`, and the word read back. It runs on the compute ring with
-//! the commands in cached GTT, in write-combined GTT, and in write-combined
-//! GTT after a fence, then on the graphics ring, to tell a command buffer the
-//! GPU reads wrong from one RADV writes wrong. A refusal ends only its own
-//! submission, whose buffers and context are then left as they are.
+//! the commands in cached GTT, in GTT asked write-combined (which Stela's
+//! Linux turns down, as it cannot keep such pages coherent), in the same
+//! mapped past the GPU's L2 as RADV maps its command buffers, and in
+//! CPU-visible VRAM, where RADV puts them when it counts the PCIe link fast
+//! enough; then on the graphics ring. A refusal ends only its own submission,
+//! whose buffers and context are then left as they are.
 use super::{
-    COMMAND, GEM_CLOSE, GEM_CREATE, GEM_MMAP, GTT, GemCreate, GemRequest, READ_WRITE, WRITE,
-    client, ioctl, refused, say,
+    COMMAND, CPU_ACCESS_REQUIRED, GEM_CLOSE, GEM_CREATE, GEM_MMAP, GTT, GemCreate, GemRequest,
+    READ_WRITE, VRAM, WRITE, client, ioctl, refused, say,
 };
-use core::{
-    ffi::c_int,
-    mem::size_of,
-    ptr,
-    sync::atomic::{Ordering, fence},
-};
+use core::{ffi::c_int, mem::size_of, ptr};
 
 /// `DRM_IOCTL_AMDGPU_CTX`, of `union drm_amdgpu_ctx`: four words.
 const CTX: u32 = ioctl(READ_WRITE, COMMAND + 0x02, size_of::<[u32; 4]>());
@@ -40,8 +37,11 @@ const CHUNK_BO_HANDLES: u32 = 6;
 const VA_MAP: u32 = 1;
 const VA_ACCESS: u32 = 0x2 | 0x4 | 0x8;
 /// `AMDGPU_GEM_CREATE_CPU_GTT_USWC`: GTT the CPU writes combined and the GPU
-/// reads unsnooped, as RADV's command buffers are.
+/// reads unsnooped, as RADV asks for its command buffers.
 const USWC: u64 = 0x4;
+/// `AMDGPU_VM_MTYPE_UC`: the GPU's L2 bypassed, as RADV maps its command
+/// buffers (`RADEON_FLAG_GL2_BYPASS`).
+const UNCACHED: u32 = 4 << 5;
 /// `AMDGPU_HW_IP_GFX` and `AMDGPU_HW_IP_COMPUTE`.
 const GFX: u32 = 0;
 const COMPUTE: u32 = 1;
@@ -54,13 +54,37 @@ const FIRST_ADDRESS: u64 = 1 << 32;
 /// How long a submission may take before the check calls it lost.
 const WAIT_NS: u64 = 2_000_000_000;
 
-/// The submissions, by ring, by where their commands lie, and by whether
-/// the CPU fences its writes to them before submitting.
-const SUBMISSIONS: [(&str, u32, u64, bool); 4] = [
-    ("compute cached", COMPUTE, 0, false),
-    ("compute write-combined", COMPUTE, USWC, false),
-    ("compute write-combined fenced", COMPUTE, USWC, true),
-    ("gfx cached", GFX, 0, false),
+/// The submissions, by ring and by where their commands lie.
+const SUBMISSIONS: [(&str, u32, Placement); 5] = [
+    ("compute cached", COMPUTE, CACHED),
+    (
+        "compute write-combined",
+        COMPUTE,
+        Placement {
+            domains: GTT,
+            flags: USWC,
+            mapping: 0,
+        },
+    ),
+    (
+        "compute write-combined past l2",
+        COMPUTE,
+        Placement {
+            domains: GTT,
+            flags: USWC,
+            mapping: UNCACHED,
+        },
+    ),
+    (
+        "compute vram past l2",
+        COMPUTE,
+        Placement {
+            domains: VRAM,
+            flags: CPU_ACCESS_REQUIRED,
+            mapping: UNCACHED,
+        },
+    ),
+    ("gfx cached", GFX, CACHED),
 ];
 
 /// `struct drm_amdgpu_gem_va`, with the timeline fields this uapi added.
@@ -145,9 +169,9 @@ const _: () = assert!(size_of::<Cs>() == 0x18 && size_of::<WaitCs>() == 0x20);
 
 /// Each submission in turn, each logged.
 pub(super) fn submissions(fd: c_int, minor: u32) {
-    for (index, (name, ring, flags, fenced)) in SUBMISSIONS.into_iter().enumerate() {
+    for (index, (name, ring, placement)) in SUBMISSIONS.into_iter().enumerate() {
         let address = FIRST_ADDRESS + index as u64 * (2 << 20);
-        if let Err(step) = submission(fd, minor, name, ring, flags, fenced, address) {
+        if let Err(step) = submission(fd, minor, name, ring, placement, address) {
             say(minor, format_args!("{name}: stopped at {step}"));
         }
     }
@@ -174,41 +198,64 @@ fn commands(target: u64) -> [u32; 8] {
     ]
 }
 
-/// A page of GTT with `flags`, mapped at `address` in the file's GPU address
-/// space: its handle.
-fn buffer(
-    fd: c_int,
-    minor: u32,
+/// Where a buffer lies, and how the GPU maps it.
+#[derive(Clone, Copy)]
+struct Placement {
+    domains: u64,
     flags: u64,
-    address: u64,
-) -> Result<u32, &'static str> {
+    /// `AMDGPU_VM_MTYPE_*`, or 0 for the kernel's default.
+    mapping: u32,
+}
+
+/// Cached GTT, as the kernel maps it by default.
+const CACHED: Placement = Placement {
+    domains: GTT,
+    flags: 0,
+    mapping: 0,
+};
+
+/// A page placed as `placement` says, mapped at `address` in the file's GPU
+/// address space: its handle.
+fn buffer(fd: c_int, minor: u32, placement: Placement, address: u64) -> Result<u32, &'static str> {
     let mut create = GemCreate {
         request: GemRequest {
             size: PAGE as u64,
             alignment: PAGE as u64,
-            domains: GTT,
-            flags,
+            domains: placement.domains,
+            flags: placement.flags,
         },
     };
-    refused(minor, client::control(fd, GEM_CREATE, (&raw mut create).cast()), "buffer")?;
+    refused(
+        minor,
+        client::control(fd, GEM_CREATE, (&raw mut create).cast()),
+        "buffer",
+    )?;
     // SAFETY: on success the kernel wrote the handle over the request.
     let handle = unsafe { create.handle };
     let mut map = GemVa {
         handle,
         operation: VA_MAP,
-        flags: VA_ACCESS,
+        flags: VA_ACCESS | placement.mapping,
         va_address: address,
         map_size: PAGE as u64,
         ..GemVa::default()
     };
-    refused(minor, client::control(fd, GEM_VA, (&raw mut map).cast()), "gpu address")?;
+    refused(
+        minor,
+        client::control(fd, GEM_VA, (&raw mut map).cast()),
+        "gpu address",
+    )?;
     Ok(handle)
 }
 
 /// The CPU's mapping of `handle`.
 fn cpu_map(fd: c_int, minor: u32, handle: u32) -> Result<*mut u32, &'static str> {
     let mut offset = u64::from(handle);
-    refused(minor, client::control(fd, GEM_MMAP, (&raw mut offset).cast()), "offset")?;
+    refused(
+        minor,
+        client::control(fd, GEM_MMAP, (&raw mut offset).cast()),
+        "offset",
+    )?;
     let address = client::map(fd, offset, PAGE).ok_or("cpu mapping")?;
     Ok(address.as_ptr().cast())
 }
@@ -218,26 +265,26 @@ fn submission(
     minor: u32,
     name: &str,
     ring: u32,
-    flags: u64,
-    fenced: bool,
+    commands_placement: Placement,
     address: u64,
 ) -> Result<(), &'static str> {
     let target_address = address + (1 << 20);
     say(minor, format_args!("{name}: context"));
     let mut context = [ALLOC_CTX, 0, 0, 0];
-    refused(minor, client::control(fd, CTX, (&raw mut context).cast()), "context")?;
+    refused(
+        minor,
+        client::control(fd, CTX, (&raw mut context).cast()),
+        "context",
+    )?;
     // `out.alloc.ctx_id`, over the request's first word.
     let context_id = context[0];
     say(minor, format_args!("{name}: buffers"));
-    let commands_handle = buffer(fd, minor, flags, address)?;
-    let target_handle = buffer(fd, minor, 0, target_address)?;
+    let commands_handle = buffer(fd, minor, commands_placement, address)?;
+    let target_handle = buffer(fd, minor, CACHED, target_address)?;
     let written = cpu_map(fd, minor, commands_handle)?;
     for (at, word) in commands(target_address).into_iter().enumerate() {
         // SAFETY: the mapping holds a page until it is unmapped below.
         unsafe { written.add(at).write_volatile(word) };
-    }
-    if fenced {
-        fence(Ordering::SeqCst);
     }
     // SAFETY: the mapping `cpu_map` made.
     client::unmap(unsafe { ptr::NonNull::new_unchecked(written.cast()) });
@@ -273,7 +320,10 @@ fn submission(
             data: ptr::from_ref(&list) as u64,
         },
     ];
-    let pointers = [ptr::from_ref(&chunks[0]) as u64, ptr::from_ref(&chunks[1]) as u64];
+    let pointers = [
+        ptr::from_ref(&chunks[0]) as u64,
+        ptr::from_ref(&chunks[1]) as u64,
+    ];
     let mut submit = Cs {
         ctx_id: context_id,
         bo_list_handle: 0,
@@ -283,7 +333,11 @@ fn submission(
     };
     say(minor, format_args!("{name}: submit"));
     let started = client::now_ns();
-    refused(minor, client::control(fd, CS, (&raw mut submit).cast()), "submission")?;
+    refused(
+        minor,
+        client::control(fd, CS, (&raw mut submit).cast()),
+        "submission",
+    )?;
     // SAFETY: on success the kernel wrote the sequence number over the
     // request's first two words.
     let sequence = unsafe { (&raw const submit).cast::<u64>().read() };
@@ -296,7 +350,11 @@ fn submission(
         ctx_id: context_id,
     };
     say(minor, format_args!("{name}: wait for {sequence}"));
-    refused(minor, client::control(fd, WAIT_CS, (&raw mut wait).cast()), "wait")?;
+    refused(
+        minor,
+        client::control(fd, WAIT_CS, (&raw mut wait).cast()),
+        "wait",
+    )?;
     let took = client::now_ns().saturating_sub(started);
     // SAFETY: the kernel wrote `out.status` over the request's first words.
     let timed_out = unsafe { (&raw const wait).cast::<u64>().read() };
@@ -318,5 +376,9 @@ fn submission(
     }
     let mut free = [FREE_CTX, 0, context_id, 0];
     client::control(fd, CTX, (&raw mut free).cast());
-    if word == WORD { Ok(()) } else { Err("read back") }
+    if word == WORD {
+        Ok(())
+    } else {
+        Err("read back")
+    }
 }
