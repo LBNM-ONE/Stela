@@ -4,7 +4,10 @@
 //! CPU-visible VRAM created, mapped, written and read back, as
 //! `amdgpu_bo_alloc` and `amdgpu_bo_cpu_map` do. Each step logs a line before
 //! it runs, so a stall shows where it stopped, and a refusal ends that GPU's
-//! check, as the steps after it need it.
+//! check, as the steps after it need it. When every GPU answered, RADV's own
+//! commands follow ([`vulkan`]).
+mod vulkan;
+
 use super::{client, installed};
 use crate::output;
 use core::{
@@ -178,9 +181,11 @@ struct GemRequest {
     flags: u64,
 }
 
-/// Checks each GPU amdgpu bound, through its render node.
+/// Checks each GPU amdgpu bound, through its render node, then RADV on them
+/// when all answered.
 pub(in crate::engine) fn amdgpu() {
     let count = installed().map_or(0, |gpu| gpu.start.bound.len());
+    let mut answered = count != 0;
     for index in 0..count as u32 {
         let minor = client::RENDER_MINOR + index;
         say(minor, format_args!("opening"));
@@ -188,11 +193,18 @@ pub(in crate::engine) fn amdgpu() {
             Ok(fd) => {
                 if let Err(step) = check(fd, minor) {
                     say(minor, format_args!("stopped at {step}"));
+                    answered = false;
                 }
                 client::close_descriptor(fd);
             }
-            Err(error) => say(minor, format_args!("open refused: {error}")),
+            Err(error) => {
+                say(minor, format_args!("open refused: {error}"));
+                answered = false;
+            }
         }
+    }
+    if answered {
+        vulkan::radv();
     }
 }
 

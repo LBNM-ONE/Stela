@@ -40,7 +40,7 @@ nvk = ["mesa", "stela-mesa/nvk", "stela-drivers/metal-linked"]
 amdgpu = ["stela-drivers/amdgpu-port"]
 # RADV, ACO and NIR in the image, from `cargo xtask gpu radv`, over amdgpu:
 # linked with the GPU client, not yet started.
-radv = ["mesa", "amdgpu", "stela-mesa/radv"]
+radv = ["mesa", "amdgpu", "stela-mesa/radv", "dep:ash"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }
@@ -55,6 +55,8 @@ stela-boot-core = { path = "../stela-boot-core", features = ["native-acpi"] }
 stela-drivers = { path = "../stela-drivers", features = ["native-acpi", "nouveau-port"] }
 stela-soc = { path = "../stela-soc", default-features = false }
 stela-mesa = { path = "../stela-mesa", optional = true }
+# Vulkan's types and calls, for the GPU check's commands to RADV.
+ash = { version = "0.38", default-features = false, optional = true }
 stela-runtime = { path = "../stela-runtime", default-features = false }
 stela-loader = { path = "../stela-loader", default-features = false }
 stela-compiler = { path = "../stela-compiler", default-features = false }
