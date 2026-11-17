@@ -1123,6 +1123,35 @@ rifiutata di Mesa, che prima non lasciava traccia; e il GPU check prova i
 due riempimenti prima su un device con una coda compute, che non ha
 bisogno di quegli anelli, poi su uno con la coda universale.
 
+**Undicesima prova (2026-11-17, immagine `62394f6b92359524`, commit
+`f682b8cc9`): due problemi distinti.** Il log nuovo li mostra:
+- `GPU map of 1312 bytes … refused: -12` alla creazione di ogni device e
+  `GPU map of 304 bytes … refused: -12` alla prima sottomissione sulla coda
+  universale: RADV mappa un buffer con la sua dimensione esatta, e il
+  client contava le pagine come `size / PAGE`, zero per meno di una
+  pagina (e `stela_linux_mmap` vuole comunque una dimensione allineata). Il
+  primo è `gfx_init` (lo stato iniziale, che RADV scarta e rifà in ogni
+  preambolo), il secondo il BO dei descrittori degli anelli: è il
+  `VK_ERROR_OUT_OF_DEVICE_MEMORY` della decima prova.
+- Sulla coda compute il riempimento CP DMA viene sottomesso, ma la GPU
+  risponde `*ERROR* Illegal opcode in command stream`: amdgpu fa scattare
+  subito il timeout di `comp_1.1.0` (`signaled seq=2, emitted seq=3`),
+  resetta l'anello (`reset succeeded`) e il buffer resta vuoto (`64 of 64
+  words wrong`). Quindi la GPU legge ed esegue il buffer dei comandi, ma
+  ci trova altro dai comandi di RADV.
+- Quattro `AMDGPU_INFO` rifiutati con -22 durante l'enumerazione (query non
+  ancora decodificata).
+
+Per la dodicesima: il client arrotonda la mappatura alla pagina, come
+`mmap`; il log dei rifiuti decodifica la query di `AMDGPU_INFO`; e il GPU
+check, prima di RADV, sottomette comandi scritti da Stela stessa
+(`check/submit.rs`: contesto, `WRITE_DATA` di «STEL» in un secondo buffer,
+`AMDGPU_CS`, `AMDGPU_WAIT_CS`, rilettura) sulla coda compute con il buffer
+dei comandi in GTT cache-abile, in GTT write-combined, e in GTT
+write-combined dopo una barriera, poi sulla coda grafica. Così si distingue
+una GPU che legge male i comandi (mappature, cache, indirizzi GPU) da
+pacchetti di RADV che questo firmware non accetta.
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1482,3 +1511,8 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   l'undicesima, immagine `--release --radv --diagnostics` (50 MB): il log
   delle chiamate DRM e delle mappature rifiutate, e i riempimenti prima su
   una coda compute, poi sulla universale.
+- 2026-11-17, undicesima prova sul PC (vedi «Prova sul PC: risultati»):
+  le mappature di meno di una pagina falliscono (corretto), e sulla coda
+  compute la GPU trova un opcode illegale nel buffer dei comandi di RADV.
+  La dodicesima prova sottomette anche comandi scritti da Stela, in GTT
+  cache-abile e write-combined, su compute e grafica.
