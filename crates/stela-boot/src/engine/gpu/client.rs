@@ -1,4 +1,4 @@
-//! NVK's process services (`compat/libc/stela/host.h`), from whichever PE runs
+//! Mesa's process services (`compat/libc/stela/host.h`), from whichever PE runs
 //! it.
 //!
 //! Linux's files belong to the environment on the boot CPU, so a PE posts its
@@ -13,6 +13,14 @@
 //! that waits in the C library comes through `stela_libc_wait`: a PE services
 //! shootdowns and spins, the boot CPU also runs the environment, and a task
 //! thread sleeps.
+#![cfg_attr(
+    not(feature = "nvk"),
+    allow(
+        dead_code,
+        reason = "RADV's image links the client for the hooks Mesa's C calls; the rest \
+                  serves the Metal service, which only NVK's starts so far"
+    )
+)]
 use super::{
     BOOT_CPU, Installed, PAGE, installed,
     stack::{self, Stack},
@@ -99,6 +107,7 @@ pub(super) struct DrmDevice {
 }
 
 /// `struct drm_nouveau_getparam`.
+#[cfg(feature = "nvk")]
 #[repr(C)]
 struct GetParam {
     parameter: u64,
@@ -106,7 +115,9 @@ struct GetParam {
 }
 
 /// `DRM_IOCTL_NOUVEAU_GETPARAM`.
+#[cfg(feature = "nvk")]
 const GET_PARAM: u32 = 0xc010_6440;
+#[cfg(feature = "nvk")]
 const CHIPSET_ID: u64 = 11;
 /// The first render node's minor.
 pub(super) const RENDER_MINOR: u32 = 128;
@@ -409,6 +420,7 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 let gpu = installed().expect("requests are posted to a running environment");
                 // A completion waiter's file is a nouveau client: freed after
                 // the stop began, its RM objects outlive GSP's unload.
+                #[cfg(feature = "nvk")]
                 if !super::waiter::wait_gone() {
                     output::arguments(format_args!(
                         "GPU completion waiter still open at the stop\n"
@@ -1202,6 +1214,7 @@ pub(super) fn unmap(address: NonNull<u8>) {
 }
 
 /// `NOUVEAU_GETPARAM_CHIPSET_ID` of the bound GPU at `index`.
+#[cfg(feature = "nvk")]
 pub(super) fn chipset(index: u32) -> Option<u16> {
     let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
     if fd < 0 {
@@ -1221,9 +1234,11 @@ pub(super) fn chipset(index: u32) -> Option<u16> {
 }
 
 /// `NOUVEAU_GETPARAM_FB_SIZE`: the VRAM nouveau makes available.
+#[cfg(feature = "nvk")]
 const FB_SIZE: u64 = 8;
 
 /// The VRAM bytes of the bound GPU at `index`, for the guest's `StelaHost`.
+#[cfg(feature = "nvk")]
 pub(in crate::engine) fn vram_bytes(index: u32) -> Option<u64> {
     let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
     if fd < 0 {
@@ -1360,7 +1375,7 @@ unsafe extern "C" fn stela_libc_wait(word: *const c_uint, value: c_uint, deadlin
         return hint::spin_loop();
     };
     let Some(thread) = current_thread(gpu) else {
-        return super::gate::relax();
+        return super::relax();
     };
     let sleeping = &SLEEPING[thread.core as usize - PROCESSORS];
     sleeping.store(word.cast_mut(), Ordering::SeqCst);

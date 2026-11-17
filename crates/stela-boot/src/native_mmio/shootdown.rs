@@ -321,7 +321,7 @@ pub(crate) fn take_waits() -> (u64, u64, u64) {
 
 /// The shootdowns since [`take_waits`] last cleared them, left counting: a
 /// caller takes the difference across its own work.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "mesa")]
 pub(crate) fn count() -> u64 {
     WAITS[0].load(Ordering::Relaxed)
 }

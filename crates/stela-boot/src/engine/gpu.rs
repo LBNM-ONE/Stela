@@ -12,11 +12,11 @@
 //! ([`pump_due`]), so other PEs do not spin on a lock while Linux runs and
 //! GPU completions are not starved. Nothing reserves a core, and a Linux
 //! environment with nothing to do costs the boot PE one comparison a slice.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "mesa")]
 pub(super) mod client;
 #[cfg(feature = "nvk")]
 pub(super) mod display;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "mesa")]
 mod file;
 #[cfg(feature = "nvk")]
 pub(super) mod gate;
@@ -28,10 +28,15 @@ mod kext {
         "/../../target/guest/StelaGPU.kext.rs"
     ));
 }
-#[cfg(feature = "nvk")]
+#[cfg(feature = "mesa")]
 mod stack;
 #[cfg(feature = "nvk")]
 mod waiter;
+
+/// Mesa's archives, linked for the client's hooks their C calls: RADV's
+/// before anything of the image starts it.
+#[cfg(feature = "mesa")]
+use stela_mesa as _;
 
 use super::{
     host,
@@ -104,9 +109,9 @@ const PCIE_CAPABILITY: u8 = 0x10;
 /// `PCI_EXP_LNKSTA`, in the PCIe capability.
 #[cfg(feature = "nvk")]
 const LINK_STATUS: u16 = 0x12;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "mesa")]
 const REVISION: u16 = 0x08;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "mesa")]
 const SUBSYSTEM_ID: u16 = 0x2c;
 /// Linux's `IORESOURCE_*` bits of a memory BAR.
 const RESOURCE_MEMORY: u64 = 0x200;
@@ -150,6 +155,11 @@ const AMDGPU: Driver = Driver {
     dma_limit: (1 << 44) - 1,
     first_identifies: false,
 };
+/// The Linux driver whose GPUs the linked Mesa driver drives.
+#[cfg(feature = "nvk")]
+const MESA_DRIVER: &Driver = &NOUVEAU;
+#[cfg(feature = "radv")]
+const MESA_DRIVER: &Driver = &AMDGPU;
 /// How long the GPUs may take to boot their firmware before the guest starts.
 const START_SECONDS: u64 = 60;
 /// The longest idle wait while they do, which the timeout above is checked at.
@@ -165,7 +175,7 @@ const PUMP_NS: u64 = 2_000_000;
 static HUB: AtomicPtr<Hub> = AtomicPtr::new(ptr::null_mut());
 static BOOT_PE: AtomicUsize = AtomicUsize::new(0);
 /// The processor the environment runs on.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "mesa")]
 static BOOT_CPU: AtomicU32 = AtomicU32::new(0);
 
 /// End the boot PE's slices for Linux, through `hub`.
@@ -982,7 +992,7 @@ pub(super) struct Claimed {
     name: String,
     /// The driver that binds it.
     driver: &'static str,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     drm: client::DrmDevice,
     #[cfg(feature = "nvk")]
     link: Option<PcieLink>,
@@ -1209,7 +1219,7 @@ fn claim(
         .iter()
         .find(|(_, id)| *id == MSI_CAPABILITY)
         .map(|(offset, _)| Msi::at(u16::from(*offset)));
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     let drm = {
         let config = function.config();
         let subsystem = config.read32(SUBSYSTEM_ID).map_err(ServiceError::Config)?;
@@ -1251,7 +1261,7 @@ fn claim(
         bars,
         name: format!("{address}"),
         driver: driver.name,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         drm,
         #[cfg(feature = "nvk")]
         link,
@@ -1486,11 +1496,16 @@ pub(super) fn claim_all(
     (claimed, refused)
 }
 
-/// A GPU nouveau bound.
-#[cfg(feature = "nvk")]
+/// A GPU the Linux driver under the linked Mesa driver bound.
+#[cfg(feature = "mesa")]
 struct Bound {
+    #[cfg_attr(
+        not(feature = "nvk"),
+        allow(dead_code, reason = "named in the Metal service's reports")
+    )]
     name: String,
     drm: client::DrmDevice,
+    #[cfg(feature = "nvk")]
     link: Option<PcieLink>,
 }
 
@@ -1503,7 +1518,7 @@ struct Start {
 
 struct Started {
     _attached: Vec<Attached<Device>>,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     bound: Vec<Bound>,
     result: Result<(), Errno>,
 }
@@ -1524,7 +1539,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
     stela_boot_core::heap::set_peak_hook(gate::peak_passed);
     let mut job = Started {
         _attached: Vec::new(),
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         bound: Vec::new(),
         result: Ok(()),
     };
@@ -1577,12 +1592,14 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
                         "GPU {}: {} bound it\n",
                         claimed.name, claimed.driver
                     ));
-                    // Only nouveau's GPUs back the Metal device.
-                    #[cfg(feature = "nvk")]
-                    if claimed.driver == NOUVEAU.name {
+                    // Only the GPUs of the Linux driver under the linked
+                    // Mesa driver are Mesa's: nouveau's back the Metal device.
+                    #[cfg(feature = "mesa")]
+                    if claimed.driver == MESA_DRIVER.name {
                         job.bound.push(Bound {
                             name: claimed.name,
                             drm: claimed.drm,
+                            #[cfg(feature = "nvk")]
                             link: claimed.link,
                         });
                     }
@@ -1605,7 +1622,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
 
 /// The running environment.
 #[cfg_attr(
-    not(feature = "nvk"),
+    not(feature = "mesa"),
     allow(
         dead_code,
         reason = "held for the boot; only Mesa's client reads these"
@@ -1619,20 +1636,20 @@ struct Installed {
     /// When the service is next due, as a TSC value: the clock reads only
     /// in the Linux environment's root, and the boot loop asks outside it.
     next: AtomicU64,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     window: &'static Window,
     tsc_hz: u64,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     libc_clock: client::LibcClock,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     heap_bytes: u64,
     /// Clients' mappings with their sizes in pages, by address. For tasks.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     mappings: RefCell<BTreeMap<u64, (stela_linux::client::Mapping, usize)>>,
     /// Mesa's running threads, by the bottom of their stacks. On the boot CPU.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     mesa_threads: RefCell<BTreeMap<u64, client::Running>>,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     service: client::Service,
     owner: &'static Arc<LinuxKernel>,
     threads: &'static LinuxThreads,
@@ -1666,7 +1683,7 @@ pub(super) struct Machine {
     pub tsc_hz: u64,
     pub wall: Option<RtcReading>,
     /// The host heap capacity reported to the linked graphics runtime.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     pub heap_bytes: u64,
 }
 
@@ -1683,7 +1700,7 @@ pub(super) fn no_metal_device() -> Option<&'static str> {
         .is_empty()
         .then_some("no GPU started; the lines above say why");
     #[cfg(not(feature = "nvk"))]
-    Some("this stela.efi was built without GPU drivers (the `nvk` feature)")
+    Some("this stela.efi has no Metal device: only `nvk` builds one")
 }
 
 /// The kexts a boot that gives the GPUs to nouveau links into its system.
@@ -1731,7 +1748,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         random,
         tsc_hz,
         wall,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         heap_bytes,
     } = machine;
     let image = work.image()?;
@@ -1755,7 +1772,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         .collect();
     let clock = work.service_clock().map_err(environment_error)?;
     let epoch = clock.epoch().map_err(environment_error)?;
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     let libc_clock = client::LibcClock::anchor(|| epoch.now_ns()).map_err(environment_error)?;
     let time = clock.clock();
     let events = Arc::new(Events {
@@ -1812,7 +1829,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         stela_linux::image::register(image).map_err(|_| kernel_work::Error::Inventory)?;
         stela_linux::heap::register(allocate_zeroed).map_err(|_| kernel_work::Error::Inventory)?;
     }
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     BOOT_CPU.store(host::processor(), Ordering::Relaxed);
     let (owner, threads, job) = work.dispatch_linux(|runtime| {
         Ok(mount_and_start(
@@ -1840,18 +1857,18 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         domain,
         // Due at once: the first pump finds Linux's own deadline.
         next: AtomicU64::new(0),
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         window,
         tsc_hz,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         libc_clock,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         heap_bytes,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         mappings: RefCell::new(BTreeMap::new()),
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         mesa_threads: RefCell::new(BTreeMap::new()),
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         service: client::Service::default(),
         owner,
         threads,
@@ -2168,9 +2185,9 @@ static UNMAPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub(super) enum Unmapped {
     Device,
     Pages,
-    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    #[cfg_attr(not(feature = "mesa"), allow(dead_code))]
     Files,
-    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    #[cfg_attr(not(feature = "mesa"), allow(dead_code))]
     Stacks,
 }
 
@@ -2202,13 +2219,13 @@ static PUMPS: PumpCounts = PumpCounts {
 };
 
 /// Ticks the boot CPU spent in posted pumps ([`pump_posted`]).
-#[cfg(feature = "nvk")]
+#[cfg(feature = "mesa")]
 static POSTED_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// The ticks this processor spent in posted pumps so far: the boot CPU's
 /// total, and nothing on another processor, which runs none.
 pub(super) fn posted_ticks_here() -> u64 {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     if host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
         return POSTED_TICKS.load(Ordering::Relaxed);
     }
@@ -2217,9 +2234,9 @@ pub(super) fn posted_ticks_here() -> u64 {
 
 /// The shootdowns counted so far, for a difference across a step.
 fn shootdowns() -> u64 {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     return crate::native_mmio::shootdown::count();
-    #[cfg(not(feature = "nvk"))]
+    #[cfg(not(feature = "mesa"))]
     0
 }
 
@@ -2339,18 +2356,18 @@ pub(super) fn pump() {
             }
             // Tasks retire and calls arrive only through steps and posts:
             // a pump's first pass looks only if something may have.
-            #[cfg(feature = "nvk")]
+            #[cfg(feature = "mesa")]
             if !first || client::start_due() {
                 gpu.advance_children();
                 client::start(gpu)?;
             }
-            #[cfg(not(feature = "nvk"))]
+            #[cfg(not(feature = "mesa"))]
             gpu.advance_children();
             first = false;
             lap(PumpPart::Children);
-            #[cfg(feature = "nvk")]
+            #[cfg(feature = "mesa")]
             let serving = client::serving();
-            #[cfg(not(feature = "nvk"))]
+            #[cfg(not(feature = "mesa"))]
             let serving = [0; 4];
             let (step_started, shot) = (host::rdtsc(), shootdowns());
             let stepped = runtime.step()?;
@@ -2420,7 +2437,7 @@ pub(super) fn pump() {
 /// polls): an AP waiting for a DRM call waits for the boot CPU, not for that
 /// work. Nothing runs elsewhere, or with no call posted.
 pub(super) fn pump_posted() {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     if client::posted_waiting() && host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
         PUMPS.posted.fetch_add(1, Ordering::Relaxed);
         let started = host::rdtsc();
@@ -2431,12 +2448,25 @@ pub(super) fn pump_posted() {
 
 /// A pump from a wait for the service's turn on the boot CPU, which runs no
 /// guest code meanwhile.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "mesa")]
 fn pump_waiting() {
     if installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some()) {
         PUMPS.relaxed.fetch_add(1, Ordering::Relaxed);
     }
     pump();
+}
+
+/// A moment of a wait with no bound: on the boot processor it pumps, as the
+/// holder may wait for Linux, which only runs there; one Linux step can take
+/// tens of milliseconds.
+#[cfg(feature = "mesa")]
+pub(super) fn relax() {
+    // What this waits for may be retiring a mapping, which waits for this.
+    crate::native_mmio::shootdown::service();
+    if host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
+        pump_waiting();
+    }
+    core::hint::spin_loop();
 }
 
 /// `GPU PUMP runs=… quiet=… unmasked=… forced=… relaxed=… posted=… by_event=…

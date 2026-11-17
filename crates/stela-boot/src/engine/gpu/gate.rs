@@ -10,7 +10,7 @@
 //! compiler's own lock ([`run_job`]): a call that needs one is answered
 //! not ready, and its guest thread sleeps and calls again.
 use super::{
-    BOOT_CPU, Bound, Installed, PAGE, client, installed, look_again, pump_waiting,
+    BOOT_CPU, Bound, Installed, PAGE, client, installed, look_again, pump_waiting, relax,
     stack::{self, Stack},
 };
 use crate::{engine::host, output};
@@ -90,18 +90,6 @@ fn run(stack: u64, body: &mut dyn FnMut()) {
     } else {
         on_stack()
     }
-}
-
-/// A moment of a wait with no bound: on the boot processor it pumps, as the
-/// holder may wait for Linux, which only runs there; one Linux step can take
-/// tens of milliseconds.
-pub(super) fn relax() {
-    // What this waits for may be retiring a mapping, which waits for this.
-    crate::native_mmio::shootdown::service();
-    if host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
-        pump_waiting();
-    }
-    hint::spin_loop();
 }
 
 /// A moment of a frontend call's bounded wait for the turn

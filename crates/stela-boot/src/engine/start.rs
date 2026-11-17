@@ -1357,7 +1357,7 @@ fn open_gpus(
         return false;
     }
     let tsc_hz = handoff.tsc_hz;
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     let heap_bytes = heap.end - heap.start;
     crate::status::begin("Starting the GPU");
     let gop = if handoff.screen.is_some() {
@@ -1430,7 +1430,7 @@ fn open_gpus(
         random,
         tsc_hz,
         wall: handoff.wall,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "mesa")]
         heap_bytes,
     };
     // Store the claim's lines before Linux starts, so the USB keeps them

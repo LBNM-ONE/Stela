@@ -127,6 +127,10 @@ pub enum Command {
         /// goes on past the GPU.
         #[arg(long)]
         amdgpu: bool,
+        /// Carry amdgpu and RADV, from `cargo xtask gpu radv`, with the GPU
+        /// client Mesa's C calls: linked, not yet started.
+        #[arg(long, conflicts_with = "amdgpu")]
+        radv: bool,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -499,9 +503,13 @@ pub fn run(command: Command) -> Result<ExitCode> {
             release,
             diagnostics,
             amdgpu,
+            radv,
         } => {
             crate::gpu::fetch::fetch(false)?;
-            let gpu = if amdgpu {
+            let gpu = if radv {
+                crate::gpu::build_radv(crate::gpu::default_jobs())?;
+                Gpu::Radv
+            } else if amdgpu {
                 Gpu::Amdgpu
             } else {
                 crate::gpu::build_nvk(crate::gpu::default_jobs())?;
@@ -528,6 +536,8 @@ enum Gpu {
     Nvk,
     /// amdgpu, without NVK.
     Amdgpu,
+    /// RADV, ACO and NIR over amdgpu, from `cargo xtask gpu radv`.
+    Radv,
 }
 
 fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
@@ -573,6 +583,9 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
         }
         Gpu::Amdgpu => {
             command.args(["--features", "amdgpu"]);
+        }
+        Gpu::Radv => {
+            command.args(["--features", "radv"]);
         }
     }
     if release {

@@ -2215,9 +2215,9 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
 /// at most, and the rest of the live heap (engine, devices, tables).
 fn owner_report(live: usize) {
     let (linux, linux_peak) = stela_linux::heap::usage();
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "mesa")]
     let (libc, libc_peak) = super::gpu::client::LIBC_HEAP.usage();
-    #[cfg(not(feature = "nvk"))]
+    #[cfg(not(feature = "mesa"))]
     let (libc, libc_peak) = (0, 0);
     output::arguments(format_args!(
         "HEAP OWNERS linux={}/{}M libc={}/{}M rest={}M\n",

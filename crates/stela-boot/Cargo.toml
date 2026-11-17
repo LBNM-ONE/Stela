@@ -31,10 +31,16 @@ test = false
 default = []
 diagnostics = ["stela-drivers/irq-diagnostics"]
 native-profile = ["stela-soc/native-profile", "stela-engine/native-profile"]
+# Mesa in the image, with the GPU client its C library calls: what NVK and
+# RADV share. Taken through `nvk` or `radv`.
+mesa = ["dep:stela-mesa"]
 # NVK, NIR and NAK in the image, from `cargo xtask gpu nvk`.
-nvk = ["dep:stela-mesa", "stela-drivers/metal-linked"]
+nvk = ["mesa", "stela-mesa/nvk", "stela-drivers/metal-linked"]
 # amdgpu in the image's Linux environment, which registers its PCI driver.
 amdgpu = ["stela-drivers/amdgpu-port"]
+# RADV, ACO and NIR in the image, from `cargo xtask gpu radv`, over amdgpu:
+# linked with the GPU client, not yet started.
+radv = ["mesa", "amdgpu", "stela-mesa/radv"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }

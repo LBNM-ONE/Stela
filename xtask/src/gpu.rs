@@ -166,3 +166,9 @@ pub fn build_nvk(jobs: u16) -> Result<()> {
     nvk::build(jobs)?;
     crate::guest::run()
 }
+
+/// Prepare RADV's archives; with no Metal device yet, it has no guest
+/// components.
+pub fn build_radv(jobs: u16) -> Result<()> {
+    radv::build(jobs)
+}
