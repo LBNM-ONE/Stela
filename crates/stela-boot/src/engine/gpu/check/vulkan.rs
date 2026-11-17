@@ -1,7 +1,8 @@
-//! `--gpu-check`'s first RADV commands: an instance and a device through
-//! RADV's loader entry, then a buffer in host-visible memory filled twice, a
-//! small fill RADV writes with CP DMA and a large one it writes with a compute
-//! shader ACO compiles, each submitted with a fence and read back. Mesa and
+//! `--gpu-check`'s first RADV commands: an instance through RADV's loader
+//! entry, then a device on a compute queue and one on the universal queue,
+//! each filling a buffer in host-visible memory twice, a small fill RADV
+//! writes with CP DMA and a large one it writes with a compute shader ACO
+//! compiles, each submitted with a fence and read back. Mesa and
 //! ACO want a process's stack, so it runs on one of its own, after the image's
 //! C and C++ constructors. Each step logs a line before it runs; after a
 //! refusal nothing is torn down, as the boot stops once the check is done.
@@ -173,28 +174,58 @@ fn on_instance(instance: &ash::Instance) -> Result<(), &'static str> {
             family.queue_count
         ));
     }
-    let universal = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
-    let family = families
-        .iter()
-        .position(|family| family.queue_flags.contains(universal))
-        .ok_or("a graphics queue family")? as u32;
+    // A compute queue first: on GFX11 and later only the universal one needs
+    // the attribute rings RADV makes at its first submission, so the two
+    // tell a submission's failure from those rings'.
+    let compute = families.iter().position(|family| {
+        family.queue_flags.contains(vk::QueueFlags::COMPUTE)
+            && !family.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+    });
+    let universal = families.iter().position(|family| {
+        family
+            .queue_flags
+            .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+    });
+    // SAFETY: as above.
+    let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+    let mut stopped = None;
+    for (kind, family) in [("compute", compute), ("universal", universal)] {
+        let Some(family) = family else {
+            say(format_args!("no {kind} family"));
+            continue;
+        };
+        if let Err(step) = on_family(instance, physical, &memory, kind, family as u32) {
+            say(format_args!("{kind} stopped at {step}"));
+            stopped = Some(step);
+        }
+    }
+    stopped.map_or(Ok(()), Err)
+}
+
+/// A device with one queue of `family`, the fills on it, and its destruction;
+/// a failed device is left as it is.
+fn on_family(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    memory: &vk::PhysicalDeviceMemoryProperties,
+    kind: &str,
+    family: u32,
+) -> Result<(), &'static str> {
     let priority = [1.0];
     let queues = [vk::DeviceQueueCreateInfo::default()
         .queue_family_index(family)
         .queue_priorities(&priority)];
     let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
-    say(format_args!("device on family {family}"));
+    say(format_args!("{kind}: device on family {family}"));
     // SAFETY: every create info outlives the call.
     let device =
         unsafe { instance.create_device(physical, &info, None) }.map_err(refused("device"))?;
     // SAFETY: the device's one queue of `family`.
     let queue = unsafe { device.get_device_queue(family, 0) };
-    // SAFETY: as above.
-    let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
     for (name, bytes) in FILLS {
-        fill(&device, queue, family, &memory, name, bytes)?;
+        fill(&device, queue, family, memory, name, bytes)?;
     }
-    say(format_args!("device destroy"));
+    say(format_args!("{kind}: device destroy"));
     // SAFETY: its objects are destroyed, and its queue is idle.
     unsafe { device.destroy_device(None) };
     Ok(())

@@ -1452,16 +1452,63 @@ extern "C" fn stela_libc_drm_rdev(fd: c_int) -> c_long {
 
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_drm_ioctl(fd: c_int, request: c_ulong, argument: *mut c_void) -> c_int {
-    submit(Operation::Control {
+    let result = submit(Operation::Control {
         fd,
         request: request as u32,
         argument,
-    }) as c_int
+    });
+    #[cfg(feature = "diagnostics")]
+    if result < 0 {
+        refused_call(fd, request as u32, argument, result);
+    }
+    result as c_int
+}
+
+/// A DRM call Linux refused, in diagnostics images: the request and errno,
+/// with the arguments of amdgpu's buffer creation and GPU address calls.
+#[cfg(feature = "diagnostics")]
+fn refused_call(fd: c_int, request: u32, argument: *mut c_void, result: i64) {
+    /// `DRM_AMDGPU_GEM_CREATE` and `DRM_AMDGPU_GEM_VA`, by type and number:
+    /// their sizes, and so their requests, change across uapi versions.
+    const GEM_CREATE: u32 = 0x6440;
+    const GEM_VA: u32 = 0x6448;
+    let detail = match request & 0xffff {
+        GEM_CREATE => {
+            // SAFETY: the caller's `union drm_amdgpu_gem_create`, whose
+            // request is four words.
+            let [size, alignment, domains, flags] = unsafe { argument.cast::<[u64; 4]>().read_unaligned() };
+            alloc::format!(
+                " size={size:#x} alignment={alignment:#x} domains={domains:#x} flags={flags:#x}"
+            )
+        }
+        GEM_VA => {
+            // SAFETY: the caller's `struct drm_amdgpu_gem_va`, whose first
+            // five words every version shares.
+            let [ids, kinds, address, offset, size] = unsafe { argument.cast::<[u64; 5]>().read_unaligned() };
+            alloc::format!(
+                " handle={} operation={} flags={:#x} va={address:#x} offset={offset:#x} size={size:#x}",
+                ids as u32,
+                kinds as u32,
+                kinds >> 32
+            )
+        }
+        _ => alloc::string::String::new(),
+    };
+    output::arguments(format_args!(
+        "GPU call {request:#x} on {fd} refused: {result}{detail}\n"
+    ));
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_drm_mmap(fd: c_int, offset: u64, size: usize) -> *mut c_void {
-    submit(Operation::Map { fd, offset, size }) as *mut c_void
+    let result = submit(Operation::Map { fd, offset, size });
+    #[cfg(feature = "diagnostics")]
+    if let Err(error) = stela_boot_core::page_window::mapped_address(result) {
+        output::arguments(format_args!(
+            "GPU map of {size} bytes at offset {offset:#x} on {fd} refused: {error}\n"
+        ));
+    }
+    result as *mut c_void
 }
 
 #[unsafe(no_mangle)]
