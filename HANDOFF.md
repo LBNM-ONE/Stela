@@ -1318,10 +1318,28 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   `radv` e nelle tre configurazioni standard (con `nvk` clippy si ferma sui
   nomi in stile Mesa di NIL, codice Rust di Mesa che queste modifiche non
   toccano); clippy di xtask.
-- Resto della fase B, in ordine:
-  1. libdrm_amdgpu vero per le 15 funzioni di `amdgpu.c`, sopra gli ioctl
-     `DRM_AMDGPU_*` (riferimento: i sorgenti MIT di libdrm,
-     `amdgpu_device.c`, `amdgpu_bo.c`, `amdgpu_vamgr.c`).
-  2. Gli ioctl e le mappature dei buffer verso l'amdgpu dell'ambiente Linux
-     (`control()` e `map()` di `client.rs` lo fanno per nouveau), con le
-     domande `AMDGPU_INFO` nel GPU check.
+- 2026-11-17, fase B: libdrm_amdgpu è quello vero di libdrm (MIT), non più
+  i segnaposto di `compat/mesa/amdgpu.c`, che è tolto. La lane RADV compila
+  `amdgpu_device.c`, `amdgpu_bo.c`, `amdgpu_cs.c`, `amdgpu_vamgr.c`,
+  `amdgpu_gpu_info.c`, `amdgpu_asic_id.c` e `handle_table.c` dal checkout
+  sparso di `third_party/libdrm` (i file sono in `third_party/libdrm.sparse`;
+  `cargo xtask gpu fetch` li ha presi dal repository locale, senza scaricare
+  niente), con `HAVE_LIBDRM_ATOMIC_PRIMITIVES` e il percorso di `amdgpu.ids`.
+  Così vengono anche i dettagli di libdrm, come il gestore degli indirizzi GPU
+  che su GFX12 riserva metà dello spazio alle PRT. Per loro `drm.c` ha
+  `drmGetNodeTypeFromFd`, `drmGetPrimaryDeviceNameFromFd`, `drmMsg` e
+  `drmSyncobjQuery`, e la libc `getline`, `getdelim` e `isblank`, provati
+  nel test della libc. L'amdgpu del kernel nell'immagine definisce anche
+  `amdgpu_bo_list_create` e `amdgpu_bo_set_metadata`, che Mesa non chiama:
+  nei sorgenti di libdrm si chiamano `libdrm_*`, se no il link si ferma sui
+  doppi. Senza `amdgpu.ids` nell'immagine libdrm non dà un nome alla GPU.
+  Verificato: lane RADV (696 oggetti, e ancora nessun simbolo scoperto oltre
+  a quelli che chiede NVK); lane NVK (585 oggetti, test della libc passato);
+  immagini debug `--radv` e NVK, release `--radv --diagnostics` e
+  `--amdgpu --diagnostics`; clippy e test delle lane di xtask.
+- Resto della fase B: gli ioctl e le mappature dei buffer verso l'amdgpu
+  dell'ambiente Linux (`control()` e `map()` di `client.rs` lo fanno per
+  nouveau), con le domande `AMDGPU_INFO` nel GPU check. È il primo passo
+  che chiede prove sul PC: `amdgpu_device_initialize` apre il device con
+  `drmGetVersion`, un `dup` del fd e le domande `AMDGPU_INFO`, e
+  `amdgpu_bo_cpu_map` mappa i buffer con `GEM_MMAP` e `mmap` sul fd.
