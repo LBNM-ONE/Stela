@@ -1402,3 +1402,26 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   client) e la strada dei comandi (`AMDGPU_CS`, fence, syncobj, interrupt),
   che questa prova non tocca. Da tenere d'occhio: amdgpu usa BACO per il
   runtime PM, e il BAR della VRAM è di 256 MB.
+- 2026-11-17, fase C, primo passo pronto per il PC: dopo le chiamate DRM,
+  se tutte le GPU hanno risposto, il GPU check delle immagini `radv`
+  (`engine/gpu/check/vulkan.rs`) fa partire il C di Mesa su uno stack suo da
+  16 MiB (`stela_constructors`, come il servizio Metal di NVK) e chiede a
+  RADV, con `ash` sulla sua entrata `vk_icdGetInstanceProcAddr`: istanza,
+  device fisici, proprietà e famiglie di code, device sulla famiglia
+  universale; poi due riempimenti con `vkCmdFillBuffer` di un buffer in
+  memoria visibile alla CPU, 256 byte (che RADV scrive con CP DMA) e 1 MiB
+  (con uno shader compute di ACO), ciascuno con fence, attesa di 5 s al
+  massimo e rilettura. Ogni passo scrive prima una riga `GPU CHECK radv:
+  …`; dopo un rifiuto non si smonta niente, perché l'avvio si ferma comunque.
+  Il codice di RADV ora resta nell'immagine: `stela-deploy.efi` di
+  `--release --radv --diagnostics` passa da 32 a 50 MB.
+
+  Prova sul PC: come l'ottava (aggiornare la chiavetta con `stela update
+  --efi`, rimettere «GPU check» in `choices.cfg`, riavviare e scegliere la
+  voce). Le righe da leggere, in ordine: `constructors`, `instance`, `1
+  physical devices`, il nome con `vendor=0x1002 device=0x7550`, le famiglie,
+  `device on family 0`, poi per `cp dma` e `shader`: `submit`, `wait` e `done
+  in … us, 0 of … words wrong`; infine `device destroy`, `instance destroy` e
+  `done`. Uno stallo dopo `wait` vuol dire fence o interrupt; un rifiuto
+  dice il passo e il `VkResult`. Anche le righe di RADV stesso (Mesa scrive
+  su stderr, che va nel log) possono spiegare un rifiuto.
