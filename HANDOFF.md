@@ -1144,6 +1144,10 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   `StelaGPU` in `target/guest`), e `cargo build --manifest-path
   crates/stela-boot/Cargo.toml --features nvk --target x86_64-unknown-uefi
   --target-dir target/boot` linka l'immagine con NVK e Metal in 4 min 40 s.
+- La lane RADV (`cargo xtask gpu radv --jobs 16`, 2026-11-17) usa il
+  `glslangValidator` del PC, pacchetto `glslang-tools` (qui 16.2.0): il
+  device di RADV abilita le acceleration structure, i cui shader devono
+  essere veri. Se manca, la lane si ferma e lo dice.
 - Il 2026-11-16 sono state cancellate le cache incrementali
   (`target/debug/incremental`, `target/boot/x86_64-unknown-uefi/debug/
   incremental`) e la cartella vecchia `target/uefi-check`: `target/` è
@@ -1246,7 +1250,64 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   (34 minuti) e il 2026-11-16 si avvia con amdgpu che tiene la 9070, fino
   al single-user e oltre, senza device Metal. Il prossimo passo è la tappa
   3 (RADV e il device Metal), con le fasi B, C e D di «Piano a tappe
-  proposto». Restano
-  aperti lo stop di `free_irq` dopo un init fallito, `stela repair` che non
-  monta da sé la partizione dati e la shell single-user interrotta. Sentire l'upstream resta consigliato prima degli strati che
-  costano mesi (RADV, Metal, display).
+  proposto». Restano aperti lo stop di `free_irq` dopo un init fallito,
+  `stela repair` che non monta da sé la partizione dati e la shell
+  single-user interrotta.
+- 2026-11-16 e 17, fase B sul branch `radv-fase-b`. L'altro agente aveva
+  aggiunto una prima lane RADV (i suoi commit sono sul branch di riserva
+  `radv-fase-b-copilot`), con cui `stela.efi` linkava RADV solo grazie a
+  versioni weak dei ganci `stela_libc_*` in `compat/mesa/amdgpu.c`
+  (allocazione che dava NULL, fatal che tornava, ioctl che fallivano): i
+  ganci veri, in `engine/gpu/client.rs`, si compilano solo con `nvk`. Dopo
+  la revisione l'utente ha lasciato l'agente e Claude ha rifatto la lane:
+  - `nvk.rs` descrive ogni driver con una `Lane` (opzioni, librerie linkate
+    intere, unità saltate, sostituti, define tolti, glslang) e `radv.rs` dà
+    quella di RADV, che così riprende tutto della lane NVK: la sola copia
+    linkata intera di `vk_instance.c`, `ralloc.c` con `-UNDEBUG` (il vero
+    `ralloc_total_size`), il controllo delle sonde e i due archivi
+    `libstela-vulkan.a` (intero) e `libstela-radv.a`. Ora si compila anche
+    `vk_physical_device_properties`, senza il quale
+    `vkGetPhysicalDeviceProperties2` restava NULL nella tabella di RADV.
+  - Meson trova una libelf (il `.pc` finto, o quella del PC in `/usr/lib`),
+    ma l'immagine non ne ha: per RADV si toglie `-DUSE_LIBELF` e si saltano
+    `ac_rtld` e `ac_rgp_elf_object_pack`. RADV prende i suoi percorsi senza
+    ELF, che perdono solo i binari di LLVM, e gli stub `ac_rtld_*` spariscono.
+  - Per RADV il `glslangValidator` del PC: il suo device abilita le
+    acceleration structure, e gli shader BVH ora sono veri. NVK resta con
+    quello finto di upstream.
+  - Nella libc di Stela: `system()`, `uname()` con `sys/utsname.h`, inotify
+    con `sys/inotify.h`, `ENODATA` (61) e `NAME_MAX` (255), provati in
+    `libc_test.c`. Così `aco_print_asm.cpp`, `radv_debug_hang.c`,
+    `radv_video_enc.c` e `radv_wsi.c` si compilano da Mesa, senza sostituti.
+  - Sostituti rimasti: i 15 segnaposto di libdrm_amdgpu in
+    `compat/mesa/amdgpu.c` (prototipi da `amdgpu.h`; rispondono `-ENOTSUP`,
+    quindi RADV non trova device) e `compat/mesa/cpu_model.c` (la tabella di
+    compiler-rt che `__builtin_cpu_supports` legge in addrlib, a zero).
+  - Tolto per ora il link di RADV in `stela.efi` (feature `radv`,
+    `stela-boot/build.rs`, `--radv` di `boot build`).
+  - Tenuta la patch Mesa `0027-accept-pipeline-stage.patch` dell'agente:
+    RADV accetta lo shader NIR che il backend Metal passa con
+    `VkPipelineShaderStageNirCreateInfoMESA`.
+
+  Verificato il 2026-11-17: `cargo xtask gpu radv --jobs 16` (690 oggetti;
+  il confronto `llvm-nm` con gli archivi NVK lascia scoperti solo i 25 ganci
+  `stela_libc_*` e i 49 simboli che mancano già a NVK, e nessun riferimento
+  weak che NVK definisce resta vuoto in RADV); `cargo xtask gpu nvk --jobs
+  16` (585 oggetti, test della libc passato); `cargo test` di xtask,
+  stela-driver-gpu e stela-linux; clippy di xtask e, per `stela-boot`, nelle
+  tre configurazioni UEFI; la build C UEFI di stela-driver-gpu; `cargo xtask
+  boot build --release --amdgpu --diagnostics`.
+- Resto della fase B, in ordine:
+  1. Client GPU comune: una feature `mesa` in `stela-boot` per le parti di
+     `engine/gpu` che servono a qualsiasi Mesa (i ganci `stela_libc_*` di
+     `client.rs`, `file.rs`, `stack.rs`, i campi di `Installed`, la pompa
+     del servizio), lasciando a `nvk` il servizio Metal (`gate.rs`,
+     `display.rs`, il kext) e le parti di nouveau (`waiter.rs`, i
+     `GETPARAM`). Poi tornano la feature `radv` e `--radv`, con `stela-mesa`
+     che linka gli archivi di `target/gpu/radv`: il linker fa da controllo.
+  2. libdrm_amdgpu vero per le 15 funzioni di `amdgpu.c`, sopra gli ioctl
+     `DRM_AMDGPU_*` (riferimento: i sorgenti MIT di libdrm,
+     `amdgpu_device.c`, `amdgpu_bo.c`, `amdgpu_vamgr.c`).
+  3. Gli ioctl e le mappature dei buffer verso l'amdgpu dell'ambiente Linux
+     (`control()` e `map()` di `client.rs` lo fanno per nouveau), con le
+     domande `AMDGPU_INFO` nel GPU check.
