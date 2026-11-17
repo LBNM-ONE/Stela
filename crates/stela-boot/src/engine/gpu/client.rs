@@ -89,6 +89,7 @@ impl LibcClock {
 const ENODEV: i64 = -19;
 const EFAULT: i64 = -14;
 const ENOMEM: i64 = -12;
+const EINVAL: i64 = -22;
 const EAGAIN: i64 = -11;
 
 /// `struct stela_libc_drm_device`.
@@ -368,11 +369,16 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 argument,
             } => client::control(fd, request, argument),
             Operation::Map { fd, offset, size } => {
-                let pages = size / PAGE as usize;
+                // Whole pages, as `mmap` maps a length that is not: RADV maps
+                // a buffer by its own size, such as 304 bytes.
+                let pages = size.div_ceil(PAGE as usize);
+                if pages == 0 {
+                    return EINVAL;
+                }
                 let Some(address) = gpu.window.reserve(pages) else {
                     return ENOMEM;
                 };
-                match client::map(fd, address, size, offset) {
+                match client::map(fd, address, pages * PAGE as usize, offset) {
                     Ok(mapping) => {
                         gpu.mappings.borrow_mut().insert(address, (mapping, pages));
                         MAPPINGS.fetch_add(1, Ordering::Relaxed);
@@ -1468,11 +1474,24 @@ extern "C" fn stela_libc_drm_ioctl(fd: c_int, request: c_ulong, argument: *mut c
 /// with the arguments of amdgpu's buffer creation and GPU address calls.
 #[cfg(feature = "diagnostics")]
 fn refused_call(fd: c_int, request: u32, argument: *mut c_void, result: i64) {
-    /// `DRM_AMDGPU_GEM_CREATE` and `DRM_AMDGPU_GEM_VA`, by type and number:
-    /// their sizes, and so their requests, change across uapi versions.
+    /// `DRM_AMDGPU_GEM_CREATE`, `DRM_AMDGPU_INFO` and `DRM_AMDGPU_GEM_VA`,
+    /// by type and number: their sizes, and so their requests, change across
+    /// uapi versions.
     const GEM_CREATE: u32 = 0x6440;
+    const INFO: u32 = 0x6445;
     const GEM_VA: u32 = 0x6448;
     let detail = match request & 0xffff {
+        INFO => {
+            // SAFETY: the caller's `struct drm_amdgpu_info`: the return
+            // pointer and size, the query, then its first two arguments.
+            let [_, query, arguments] = unsafe { argument.cast::<[u64; 3]>().read_unaligned() };
+            alloc::format!(
+                " query={:#x} arguments={:#x},{:#x}",
+                query >> 32,
+                arguments as u32,
+                arguments >> 32
+            )
+        }
         GEM_CREATE => {
             // SAFETY: the caller's `union drm_amdgpu_gem_create`, whose
             // request is four words.

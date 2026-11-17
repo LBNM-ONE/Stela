@@ -4,8 +4,9 @@
 //! CPU-visible VRAM created, mapped, written and read back, as
 //! `amdgpu_bo_alloc` and `amdgpu_bo_cpu_map` do. Each step logs a line before
 //! it runs, so a stall shows where it stopped, and a refusal ends that GPU's
-//! check, as the steps after it need it. When every GPU answered, RADV's own
-//! commands follow ([`vulkan`]).
+//! check, as the steps after it need it. Then commands Stela submits itself
+//! ([`submit`]), and when every GPU answered, RADV's own ([`vulkan`]).
+mod submit;
 mod vulkan;
 
 use super::{client, installed};
@@ -310,7 +311,9 @@ fn check(fd: c_int, minor: u32) -> Result<(), &'static str> {
     }
 
     buffer(fd, minor, "gtt", GTT, 0)?;
-    buffer(fd, minor, "vram", VRAM, CPU_ACCESS_REQUIRED)
+    buffer(fd, minor, "vram", VRAM, CPU_ACCESS_REQUIRED)?;
+    submit::submissions(fd, minor);
+    Ok(())
 }
 
 /// `AMDGPU_INFO`'s `query` into `answer`, with `arguments` for the queries
