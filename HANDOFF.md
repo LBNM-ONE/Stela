@@ -1081,6 +1081,25 @@ GPU check:
 - `GPU CHECK done` a 60,7 s e lo stop previsto. Nel log dopo lo stop ci sono
   righe di avvii vecchi: il file sulla chiavetta è un anello.
 
+**Nona prova (2026-11-17, immagine `e8a14fd37798e471`, `--release --radv
+--diagnostics`, commit `760edafb6`): RADV parte ma non crea il device
+fisico.** amdgpu e le chiamate DRM come nell'ottava (tutto passa, di nuovo
+`0 of 16384 words wrong` per i due buffer). Poi `GPU CHECK radv:
+constructors`, `instance` (riuscita) e `physical devices`: libdrm cerca
+`/usr/share/libdrm/amdgpu.ids` (assente), RADV scrive `WARNING: radv is not
+a conformant Vulkan implementation, testing use only.` (quindi la sua
+connessione ad amdgpu e le informazioni sulla GPU ci sono), e 3 ms dopo
+`physical devices refused: ERROR_INITIALIZATION_FAILED`, senza altro
+messaggio. Dal sorgente: dopo l'avviso `radv_physical_device_try_create`
+chiede `radv_device_get_cache_uuid`, che senza `RADV_BUILD_ID_OVERRIDE` usa
+`disk_cache_get_function_identifier`; senza `HAVE_DLADDR` (tolto come
+define dell'host) quella risponde sempre falso, e lo farebbe anche con
+`dladdr` di Stela, che risponde 0: RADV esce con «cannot generate UUID»,
+che Mesa manda solo ai messenger di debug (`vk_log.c`), per questo il log
+non lo mostra. Correzione nella decima prova: l'opzione Meson
+`-Dradv-build-id` con un ID fisso, e un messenger `VK_EXT_debug_utils` nel
+GPU check che scrive i messaggi di RADV nel log.
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1425,3 +1444,12 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   `done`. Uno stallo dopo `wait` vuol dire fence o interrupt; un rifiuto
   dice il passo e il `VkResult`. Anche le righe di RADV stesso (Mesa scrive
   su stderr, che va nel log) possono spiegare un rifiuto.
+- 2026-11-17, nona prova sul PC (vedi «Prova sul PC: risultati»): RADV si
+  avvia, crea l'istanza e apre la 9070 con libdrm, ma
+  `vkEnumeratePhysicalDevices` dà `ERROR_INITIALIZATION_FAILED`: senza un
+  build ID RADV non sa generare l'UUID della cache. Per la decima prova la
+  lane passa a Mesa `-Dradv-build-id` («Stela statically» in esadecimale,
+  fisso come quello di NVK), e il GPU check abilita `VK_EXT_debug_utils` con
+  un messenger che scrive ogni messaggio di RADV come `GPU CHECK radv:
+  driver …`. Immagine `--release --radv --diagnostics` di 50 MB; la prova si
+  fa come l'ottava.
