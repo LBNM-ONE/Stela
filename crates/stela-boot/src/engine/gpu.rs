@@ -12,6 +12,9 @@
 //! ([`pump_due`]), so other PEs do not spin on a lock while Linux runs and
 //! GPU completions are not starved. Nothing reserves a core, and a Linux
 //! environment with nothing to do costs the boot PE one comparison a slice.
+/// `--gpu-check`'s look at the DRM calls RADV makes.
+#[cfg(feature = "radv")]
+pub(super) mod check;
 #[cfg(feature = "mesa")]
 pub(super) mod client;
 #[cfg(feature = "nvk")]

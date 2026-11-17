@@ -2959,6 +2959,11 @@ fn start_devices(
                 let started = open_gpus(work, mmio, remappers, handoff, host_firmware, gpus);
                 if options.gpu_check {
                     output::arguments(format_args!("GPU CHECK started={started}\n"));
+                    // The calls RADV makes through libdrm, on the GPUs amdgpu bound.
+                    #[cfg(feature = "radv")]
+                    if started {
+                        gpu::check::amdgpu();
+                    }
                 } else if started {
                     let firmware = handoff
                         .screen

@@ -1178,8 +1178,17 @@ fn wait(gpu: &Installed, request: &Request, deadline: u64) {
 
 /// A file of the DRM node at `minor`.
 pub(super) fn open_node(minor: u32) -> Option<c_int> {
-    let fd = submit(Operation::Open(minor)) as c_int;
-    (fd >= 0).then_some(fd)
+    open(minor).ok()
+}
+
+/// A file of the DRM node at `minor`, or the negative errno of its opening.
+pub(super) fn open(minor: u32) -> Result<c_int, i64> {
+    let result = submit(Operation::Open(minor));
+    if result < 0 {
+        Err(result)
+    } else {
+        Ok(result as c_int)
+    }
 }
 
 /// The ioctl `request` on `fd`: zero or a negative errno.
