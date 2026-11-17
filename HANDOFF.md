@@ -1337,9 +1337,32 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   a quelli che chiede NVK); lane NVK (585 oggetti, test della libc passato);
   immagini debug `--radv` e NVK, release `--radv --diagnostics` e
   `--amdgpu --diagnostics`; clippy e test delle lane di xtask.
-- Resto della fase B: gli ioctl e le mappature dei buffer verso l'amdgpu
-  dell'ambiente Linux (`control()` e `map()` di `client.rs` lo fanno per
-  nouveau), con le domande `AMDGPU_INFO` nel GPU check. È il primo passo
-  che chiede prove sul PC: `amdgpu_device_initialize` apre il device con
-  `drmGetVersion`, un `dup` del fd e le domande `AMDGPU_INFO`, e
-  `amdgpu_bo_cpu_map` mappa i buffer con `GEM_MMAP` e `mmap` sul fd.
+- 2026-11-17, fase B, ultimo passo pronto per il PC. Nelle immagini `radv`
+  il GPU check, dopo `GPU CHECK started=true`, apre il nodo render di ogni
+  GPU legata da amdgpu (`engine/gpu/check.rs`, col client: `open()`,
+  `control()`, `map()`) e fa le chiamate che libdrm farà per RADV:
+  `DRM_IOCTL_VERSION`; `AMDGPU_INFO` con `ACCEL_WORKING`, `DEV_INFO`,
+  `VRAM_GTT`, e `HW_IP_COUNT` e `HW_IP_INFO` per gfx, compute e sdma; poi un
+  buffer da 64 KiB in GTT e uno in VRAM visibile alla CPU, con `GEM_CREATE`,
+  `GEM_MMAP`, la mappatura del client, la scrittura e la rilettura di un
+  motivo e `GEM_CLOSE`. Ogni passo scrive prima una riga
+  `GPU CHECK amdgpu 128: …`, così uno stallo mostra dove; un rifiuto scrive
+  l'errno e chiude il controllo di quella GPU. Numeri degli ioctl e layout
+  uapi verificati con un programma C sugli header di libdrm, e fissati con
+  assert in compilazione. Immagine: `cargo xtask boot build --release
+  --radv --diagnostics` (`stela-deploy.efi` del 2026-11-17, 32 MB).
+
+  Prova sul PC: con la chiavetta inserita,
+  `sudo target/release/stela update --efi
+  target/boot/x86_64-unknown-uefi/release/stela-deploy.efi`; poi di nuovo la
+  voce «GPU check» in `EFI/stela/choices.cfg` (la riga di macOS duplicata,
+  con `--gpu-check` in fondo); riavvio sulla chiavetta e voce GPU check; poi
+  da Ubuntu il log, con `target/release/stela log COPIA -o FILE` su una
+  copia di `EFI/stela/boot.log`. Le righe da leggere:
+  - `opening` senza `open refused`: aprire il nodo crea la VM del file, la
+    prima cosa che amdgpu fa passare dalle sue code; uno stallo qui indica
+    code o fence;
+  - `driver amdgpu 3.…`, `accel_working=1`, `device=0x7550`;
+  - le righe di gfx, compute e sdma, con `rings` diverso da zero;
+  - i due buffer, con `0 of 16384 words wrong`: la mappatura dei buffer
+    di amdgpu nell'ambiente Linux, l'incognita più grossa della fase B.
