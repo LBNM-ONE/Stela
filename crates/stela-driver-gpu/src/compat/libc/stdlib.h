@@ -37,6 +37,7 @@ int mkstemp(char *path);
 int setenv(const char *name, const char *value, int overwrite);
 int unsetenv(const char *name);
 char *realpath(const char *path, char *resolved);
+int system(const char *command);
 int atoi(const char *text);
 long atol(const char *text);
 double atof(const char *text);

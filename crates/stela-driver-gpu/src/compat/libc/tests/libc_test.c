@@ -18,7 +18,9 @@
 #include <string.h>
 #include <wchar.h>
 #include <time.h>
+#include <sys/inotify.h>
 #include <sys/time.h>
+#include <sys/utsname.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -279,6 +281,11 @@ static void test_system(void)
 	CHECK(opendir("/") == NULL);
 	struct passwd entry, *found = &entry;
 	CHECK(getpwuid_r(0, &entry, path, sizeof(path), &found) == 0 && found == NULL);
+	CHECK(system(NULL) == 0);
+	CHECK(system("true") == -1 && errno == ENOSYS);
+	CHECK(inotify_init1(IN_CLOEXEC) == -1 && errno == ENOSYS);
+	struct utsname kernel;
+	CHECK(uname(&kernel) == -1 && errno == ENOSYS);
 }
 
 static void test_wide(void)

@@ -183,6 +183,15 @@ int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max)
 	return count;
 }
 
+char *drmGetFormatModifierName(uint64_t modifier)
+{
+	char *name = malloc(19);
+	if (!name)
+		return NULL;
+	snprintf(name, 19, "0x%016llx", (unsigned long long)modifier);
+	return name;
+}
+
 int drmGetDeviceFromDevId(dev_t id, uint32_t flags, drmDevicePtr *device)
 {
 	(void)flags;
