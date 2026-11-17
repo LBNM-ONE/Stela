@@ -275,7 +275,8 @@ Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
 2. **amdgpu senza display**: bind della 9070, firmware caricato, ioctl
    `AMDGPU_INFO` che rispondono. Monitor sulla iGPU, console del firmware
    viva per i log. Bind e firmware: fatti il 2026-11-15 (settima prova in
-   «Prova sul PC: risultati»); gli ioctl `AMDGPU_INFO` restano da provare.
+   «Prova sul PC: risultati»); gli ioctl `AMDGPU_INFO` e la mappatura dei
+   buffer: provati il 2026-11-17 (ottava prova). Tappa chiusa.
 3. **Primo triangolo**: RADV su amdgpu, device Metal ammesso, suite Metal
    (`cargo xtask gpu metal-suite`).
 4. **Display**: DC e DMUB per pilotare le uscite della 9070. Metà del codice
@@ -1057,6 +1058,29 @@ prima della voce 1, che viene rifiutata). Dal log:
 - Il log sulla chiavetta si ferma a 182,8 s; l'ambiente Linux di amdgpu
   riceve gli interrupt della GPU (`gpu_interrupts=11 linux_irqs=11`).
 
+**Ottava prova (2026-11-17, immagine `dea73a4ef7851618`, `--release --radv
+--diagnostics`, commit `5b76284a8`): le chiamate di libdrm su amdgpu
+funzionano.** amdgpu prende la 9070 come nella settima (`GPU START
+claim_ms=130 linux_ms=51 probe_ms=333 total_ms=516`, nessun errore, gli
+stessi avvisi su spazio di configurazione esteso e atomiche PCIe), poi il
+GPU check:
+- `opening` → `version` in 8 ms: l'apertura del nodo render 128, con la VM
+  del file, riesce.
+- `driver amdgpu 3.64.0`, `accel_working=1`.
+- `device=0x7550 rev=0xc3 external_rev=0x51 family=152 shader_engines=4
+  active_cus=56 wave=32 vram_type=9 vram_bits=256 va=0x10000..0x800000000000
+  high_va=0xffff800000000000..0xffffffffffbf0000 va_alignment=0x1000
+  gart_page=0x1000`.
+- `vram=16240 MiB cpu_visible=254 MiB gtt=2329 MiB`: il BAR della VRAM è
+  di 256 MB (Resizable BAR spento), come dice amdgpu (`BAR=256M`).
+- gfx 12.0 con `rings=0x1`, compute 12.0 con `rings=0xf`, sdma 7.0 su due
+  istanze con `rings=0x3`.
+- Buffer da 64 KiB in GTT e in VRAM visibile: creazione, offset, mappatura
+  dal client, scrittura e rilettura con `0 of 16384 words wrong` per
+  entrambi; la rilettura della VRAM dal BAR prende 14 ms.
+- `GPU CHECK done` a 60,7 s e lo stop previsto. Nel log dopo lo stop ci sono
+  righe di avvii vecchi: il file sulla chiavetta è un anello.
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1245,8 +1269,9 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   Claude rivede i suoi commit prima di unirli a questo branch.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
   passi 1, 2 e 3. Il passo 4 è fatto, e il 2026-11-15 amdgpu ha preso la
-  9070 sul PC (settima prova in «Prova sul PC: risultati»): della tappa 2
-  del piano mancano gli ioctl `AMDGPU_INFO`. Sull'unione macOS si installa
+  9070 sul PC (settima prova in «Prova sul PC: risultati»); il 2026-11-17
+  l'ottava prova chiude la tappa 2 con gli ioctl `AMDGPU_INFO` e la
+  mappatura dei buffer. Sull'unione macOS si installa
   (34 minuti) e il 2026-11-16 si avvia con amdgpu che tiene la 9070, fino
   al single-user e oltre, senza device Metal. Il prossimo passo è la tappa
   3 (RADV e il device Metal), con le fasi B, C e D di «Piano a tappe
@@ -1366,3 +1391,14 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   - le righe di gfx, compute e sdma, con `rings` diverso da zero;
   - i due buffer, con `0 of 16384 words wrong`: la mappatura dei buffer
     di amdgpu nell'ambiente Linux, l'incognita più grossa della fase B.
+- 2026-11-17, ottava prova sul PC (vedi «Prova sul PC: risultati»): il GPU
+  check dell'immagine `--radv` apre il nodo render, ha risposta a tutte le
+  domande `AMDGPU_INFO`, e mappa, scrive e rilegge senza errori un buffer in
+  GTT e uno in VRAM. Le chiamate su cui poggia libdrm_amdgpu funzionano
+  nell'ambiente Linux: la fase B è chiusa, e con lei la tappa 2. Il prossimo
+  passo è la fase C: nel GPU check RADV crea istanza e device sulla 9070,
+  riempie un buffer con `vkCmdFillBuffer`, sottomette e rilegge. Serve far
+  partire il C di Mesa nell'immagine (`stela_constructors`, i thread del
+  client) e la strada dei comandi (`AMDGPU_CS`, fence, syncobj, interrupt),
+  che questa prova non tocca. Da tenere d'occhio: amdgpu usa BACO per il
+  runtime PM, e il BAR della VRAM è di 256 MB.
