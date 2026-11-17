@@ -1152,6 +1152,54 @@ write-combined dopo una barriera, poi sulla coda grafica. Così si distingue
 una GPU che legge male i comandi (mappature, cache, indirizzi GPU) da
 pacchetti di RADV che questo firmware non accetta.
 
+**Dodicesima prova (2026-11-17, immagine `125c0699b8316286`, commit
+`b1f9e43ed`): la GPU esegue i comandi in GTT cache-abile, non quelli in GTT
+write-combined, ed è lì che RADV mette i suoi.** amdgpu e le chiamate DRM
+come nell'ottava. I comandi scritti da Stela:
+- `compute cached: timed_out=0 word=0x4c455453 in 1570 us` e `gfx cached:
+  … in 1567 us`: contesto, indirizzi GPU, `AMDGPU_CS`, fence e interrupt
+  funzionano su entrambe le code, e la GPU scrive «STEL» dove deve.
+- `compute write-combined` e `compute write-combined fenced` (con `mfence`
+  prima della sottomissione): `*ERROR* Illegal opcode in command stream`,
+  reset di `comp_1.1.0`, `wait refused: -62`. Stessi otto dword sulla
+  stessa coda: cambia solo `AMDGPU_GEM_CREATE_CPU_GTT_USWC` sul buffer dei
+  comandi.
+- RADV: le mappature di meno di una pagina passano e
+  `OUT_OF_DEVICE_MEMORY` non c'è più; il riempimento CP DMA dà `Illegal
+  opcode` sia su compute (`comp_1.1.1`) sia sulla universale
+  (`gfx_0.0.0`), con `64 of 64 words wrong`. RADV chiede GTT write-combined
+  per i suoi buffer dei comandi (`RADEON_FLAG_GTT_WC` in
+  `radv_amdgpu_cs_bo_create`), quindi è lo stesso difetto.
+- I quattro `AMDGPU_INFO` rifiutati sono `HW_IP_COUNT` dei tipi 3, 4, 5 e 9
+  (UVD, VCE, UVD_ENC, VPE): blocchi che la 9070 non ha, per i quali amdgpu
+  risponde `-EINVAL` anche su Linux. Innocui.
+
+Causa, dal sorgente: con quel flag TTM alloca pagine `ttm_write_combined`,
+la CPU le mappa write-combined (`ttm_prot_from_caching`, che in Stela
+arriva alla voce PAT 5) e la GPU le legge senza snoop. Su Linux x86
+`ttm_pool_apply_caching` chiama `set_pages_array_wc()`, che svuota le cache
+della CPU di quelle pagine e cambia anche il tipo di memoria con cui il
+kernel le mappa; ma solo `#ifdef CONFIG_X86`, e il Linux di Stela non è
+compilato come x86 (`autoconf.h` ha `CONFIG_STELA` e `CONFIG_64BIT`). Le
+pagine restano con le righe write-back che l'azzeramento all'allocazione
+(`TTM_TT_FLAG_ZERO_ALLOC`) lascia nelle cache, e la GPU, che non fa snoop,
+non vede quello che le cache tengono.
+
+Per la tredicesima: la patch Linux 0202 fa rispondere falso a
+`drm_arch_can_wc_memory()` con `CONFIG_STELA`, come upstream per ARM, PPC
+e LoongArch; `amdgpu_bo_support_uswc` allora toglie il flag USWC a ogni
+BO, e la GTT di amdgpu resta cache-abile e con snoop
+(`AMDGPU_PTE_SNOOPED`), la configurazione che la dodicesima ha visto
+funzionare. Upstream fa lo stesso su x86 senza PAT. Costo: la GPU legge la
+GTT con snoop, un po' più lenta; la VRAM non cambia. Il GPU check
+sottomette i comandi di Stela in GTT cache-abile, in GTT chiesta
+write-combined (ora deve passare), nella stessa mappata oltre la L2
+(`AMDGPU_VM_MTYPE_UC`, come RADV mappa i suoi buffer dei comandi), e in
+VRAM visibile alla CPU con `MTYPE_UC`, dove RADV li mette quando conta il
+collegamento PCIe almeno da 3.0 x8 (`radv_amdgpu_cs_domain`); e la riga di
+`dev_info` scrive `pcie=gen…x…`, per sapere quale dei due percorsi prende
+RADV.
+
 ## Controlli sul PC (Linux)
 
 ```sh
@@ -1516,3 +1564,11 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   compute la GPU trova un opcode illegale nel buffer dei comandi di RADV.
   La dodicesima prova sottomette anche comandi scritti da Stela, in GTT
   cache-abile e write-combined, su compute e grafica.
+- 2026-11-17, dodicesima prova sul PC (vedi «Prova sul PC: risultati»): i
+  comandi scritti da Stela vanno, su compute e grafica, da GTT cache-abile
+  (sottomissione, fence e interrupt funzionano) ma non da GTT
+  write-combined, dove RADV mette i suoi: TTM cambia il tipo di memoria
+  delle pagine solo con `CONFIG_X86`. Per la tredicesima la patch Linux
+  0202 tiene la GTT di amdgpu cache-abile e con snoop, e il GPU check prova
+  anche i comandi in VRAM e scrive il collegamento PCIe. Immagine
+  `--release --radv --diagnostics`; la prova si fa come l'ottava.
