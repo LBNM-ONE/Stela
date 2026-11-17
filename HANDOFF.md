@@ -1297,17 +1297,31 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
   stela-driver-gpu e stela-linux; clippy di xtask e, per `stela-boot`, nelle
   tre configurazioni UEFI; la build C UEFI di stela-driver-gpu; `cargo xtask
   boot build --release --amdgpu --diagnostics`.
+- 2026-11-17, fase B, il client GPU è comune a NVK e RADV e RADV torna in
+  `stela.efi`. `stela-boot` ha la feature `mesa`, presa da `nvk` e da
+  `radv`: la danno `client.rs` (i ganci `stela_libc_*`), `file.rs`,
+  `stack.rs`, l'orologio, l'heap, le mappature, i thread e il servizio di
+  Mesa in `Installed`, la pompa delle chiamate e `relax` (spostato da
+  `gate.rs`). Restano di `nvk` il servizio Metal (`gate.rs`, `display.rs`,
+  il kext, le pipeline), i waiter di completamento e i `GETPARAM` di
+  nouveau. Le GPU che Mesa vede sono quelle legate dal driver Linux sotto il
+  driver Mesa linkato (`MESA_DRIVER`: nouveau per NVK, amdgpu per RADV).
+  `stela-mesa` linka un solo driver: `nvk` (con NAK e NIL) o `radv` (i suoi
+  archivi e quello di LLVM di NVK); `stela-boot` lo nomina con `use
+  stela_mesa as _`. `cargo xtask boot build --radv` compila la lane e
+  l'immagine con `radv`, che prende anche amdgpu. Nel link
+  (`/WHOLEARCHIVE:libstela-vulkan.a`) lld risolve ogni riferimento di RADV
+  con i ganci veri del client; poi `/OPT:REF` toglie il codice di RADV, che
+  niente chiama ancora: resterà quando il GPU check lo chiamerà (fase C).
+  Verificato: le immagini debug `--radv` e NVK, release `--radv
+  --diagnostics` e `--amdgpu --diagnostics`; clippy di `stela-boot` con
+  `radv` e nelle tre configurazioni standard (con `nvk` clippy si ferma sui
+  nomi in stile Mesa di NIL, codice Rust di Mesa che queste modifiche non
+  toccano); clippy di xtask.
 - Resto della fase B, in ordine:
-  1. Client GPU comune: una feature `mesa` in `stela-boot` per le parti di
-     `engine/gpu` che servono a qualsiasi Mesa (i ganci `stela_libc_*` di
-     `client.rs`, `file.rs`, `stack.rs`, i campi di `Installed`, la pompa
-     del servizio), lasciando a `nvk` il servizio Metal (`gate.rs`,
-     `display.rs`, il kext) e le parti di nouveau (`waiter.rs`, i
-     `GETPARAM`). Poi tornano la feature `radv` e `--radv`, con `stela-mesa`
-     che linka gli archivi di `target/gpu/radv`: il linker fa da controllo.
-  2. libdrm_amdgpu vero per le 15 funzioni di `amdgpu.c`, sopra gli ioctl
+  1. libdrm_amdgpu vero per le 15 funzioni di `amdgpu.c`, sopra gli ioctl
      `DRM_AMDGPU_*` (riferimento: i sorgenti MIT di libdrm,
      `amdgpu_device.c`, `amdgpu_bo.c`, `amdgpu_vamgr.c`).
-  3. Gli ioctl e le mappature dei buffer verso l'amdgpu dell'ambiente Linux
+  2. Gli ioctl e le mappature dei buffer verso l'amdgpu dell'ambiente Linux
      (`control()` e `map()` di `client.rs` lo fanno per nouveau), con le
      domande `AMDGPU_INFO` nel GPU check.
