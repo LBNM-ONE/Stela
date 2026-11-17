@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: LBNM-ONE <leonardo.bonomo009@gmail.com>
+Date: Mon, 16 Nov 2026 19:09:57 +0000
+Subject: [PATCH] radv: accept pipeline-stage NIR input
+
+Allow Stela's internal NIR pipeline extension to reach RADV without manufacturing SPIR-V.
+
+Checked: cargo xtask gpu radv --jobs 16
+
+Co-authored-by: Copilot App <223556219+Copilot@users.noreply.github.com>
+---
+ src/amd/vulkan/radv_pipeline.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index c73afe08e149f4fbdbce774fbe8afdfd24db54b1..9e84dcbe15cfdbc9b9de9d8c853fa7d49a43b3be 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -188,10 +188,12 @@ radv_pipeline_stage_init(VkPipelineCreateFlags2 pipeline_flags, const VkPipeline
+                          const struct radv_shader_stage_key *stage_key, struct radv_shader_stage *out_stage)
+ {
+    const VkShaderModuleCreateInfo *minfo = vk_find_struct_const(sinfo->pNext, SHADER_MODULE_CREATE_INFO);
++   const VkPipelineShaderStageNirCreateInfoMESA *nir_info =
++      vk_find_struct_const(sinfo->pNext, PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA);
+    const VkPipelineShaderStageModuleIdentifierCreateInfoEXT *iinfo =
+       vk_find_struct_const(sinfo->pNext, PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT);
+ 
+-   if (sinfo->module == VK_NULL_HANDLE && !minfo && !iinfo)
++   if (sinfo->module == VK_NULL_HANDLE && !minfo && !nir_info && !iinfo)
+       return;
+ 
+    memset(out_stage, 0, sizeof(*out_stage));
+@@ -212,6 +214,8 @@ radv_pipeline_stage_init(VkPipelineCreateFlags2 pipeline_flags, const VkPipeline
+ 
+       if (module->nir)
+          out_stage->internal_nir = module->nir;
++   } else if (nir_info) {
++      out_stage->internal_nir = nir_info->nir;
+    } else if (minfo) {
+       out_stage->spirv.data = (const char *)minfo->pCode;
+       out_stage->spirv.size = minfo->codeSize;
