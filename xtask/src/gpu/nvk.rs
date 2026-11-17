@@ -167,6 +167,11 @@ pub(super) struct Lane {
     pub(super) skipped: &'static [&'static str],
     /// Stela's stand-ins, under `compat/mesa`, built with the model unit's flags.
     pub(super) stand_ins: &'static [&'static str],
+    /// Other projects' sources the driver calls, under `third_party`, built
+    /// with the model unit's flags and [`Lane::source_defines`].
+    pub(super) sources: &'static [&'static str],
+    /// What those sources' own builds define.
+    pub(super) source_defines: &'static [&'static str],
     /// Sources Meson would generate that nothing here builds, by a part of
     /// their targets' names.
     pub(super) ungenerated: &'static [&'static str],
@@ -207,6 +212,8 @@ const NVK: Lane = Lane {
     whole_libraries: &WHOLE_LIBRARIES,
     skipped: &SKIPPED,
     stand_ins: &STAND_INS,
+    sources: &[],
+    source_defines: &[],
     ungenerated: &["nvkcl"],
     libdrm: &[],
     dropped_defines: &[],
@@ -787,6 +794,20 @@ fn units(
     for name in lane.stand_ins {
         let source = compat.join("mesa").join(format!("{name}.c"));
         units.push(model_unit(&source, name, &[]));
+    }
+    let defines: Vec<_> = lane
+        .source_defines
+        .iter()
+        .map(|define| format!("-D{define}"))
+        .collect();
+    for path in lane.sources {
+        let source = third_party(path);
+        let name = source
+            .file_stem()
+            .context("a source with no name")?
+            .to_string_lossy()
+            .into_owned();
+        units.push(model_unit(&source, &name, &defines));
     }
     let compiler = gpu().join("compiler");
     let added = [

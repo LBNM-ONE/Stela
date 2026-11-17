@@ -1,5 +1,13 @@
-# The libdrm and amdgpu API headers Mesa's AMD support code includes; no
-# library sources.
+# The libdrm and amdgpu API headers Mesa's AMD support code includes, and
+# the libdrm_amdgpu sources the RADV lane builds for its device, buffer and
+# GPU address calls.
 /*.h
 /include/drm/
 /amdgpu/*.h
+/amdgpu/amdgpu_asic_id.c
+/amdgpu/amdgpu_bo.c
+/amdgpu/amdgpu_cs.c
+/amdgpu/amdgpu_device.c
+/amdgpu/amdgpu_gpu_info.c
+/amdgpu/amdgpu_vamgr.c
+/amdgpu/handle_table.c

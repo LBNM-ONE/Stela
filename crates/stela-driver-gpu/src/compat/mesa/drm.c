@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* libdrm, as far as NVK reaches it: thin wrappers of DRM's ioctls, with the
- * entry points of xf86drm.h. Devices come from the host, not from /sys. */
+/* libdrm, as far as NVK and libdrm_amdgpu reach it: thin wrappers of DRM's
+ * ioctls, with the entry points of xf86drm.h. Devices come from the host, not
+ * from /sys. */
 #include <errno.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -202,6 +204,45 @@ int drmGetDeviceFromDevId(dev_t id, uint32_t flags, drmDevicePtr *device)
 	return *device ? 0 : -ENOMEM;
 }
 
+/* The host's nodes are render nodes: a smaller minor would be a primary's. */
+int drmGetNodeTypeFromFd(int fd)
+{
+	struct stat status;
+	if (fstat(fd, &status))
+		return -1;
+	if (major(status.st_rdev) != DRM_MAJOR) {
+		errno = EINVAL;
+		return -1;
+	}
+	return minor(status.st_rdev) >= RENDER_MINOR ? DRM_NODE_RENDER : DRM_NODE_PRIMARY;
+}
+
+/* The name the device's primary node would have, which libdrm_amdgpu
+ * compares to find a device it has already opened. */
+char *drmGetPrimaryDeviceNameFromFd(int fd)
+{
+	struct stat status;
+	if (fstat(fd, &status) || major(status.st_rdev) != DRM_MAJOR)
+		return NULL;
+	unsigned int number = minor(status.st_rdev);
+	if (number >= RENDER_MINOR)
+		number -= RENDER_MINOR;
+	char *name = NULL;
+	return asprintf(&name, "/dev/dri/card%u", number) < 0 ? NULL : name;
+}
+
+/* libdrm's debug messages, which it shows only when LIBGL_DEBUG asks. */
+void drmMsg(const char *format, ...)
+{
+	const char *debug = getenv("LIBGL_DEBUG");
+	if (!debug || !strstr(debug, "verbose"))
+		return;
+	va_list arguments;
+	va_start(arguments, format);
+	vfprintf(stderr, format, arguments);
+	va_end(arguments);
+}
+
 int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device)
 {
 	struct stat status;
@@ -351,6 +392,11 @@ int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points, uint32_t count
 		.flags = flags,
 	};
 	return drmIoctl(fd, DRM_IOCTL_SYNCOBJ_QUERY, &array);
+}
+
+int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t count)
+{
+	return drmSyncobjQuery2(fd, handles, points, count, 0);
 }
 
 int drmSyncobjTransfer(int fd, uint32_t destination, uint64_t destination_point, uint32_t source,

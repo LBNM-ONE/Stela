@@ -577,6 +577,41 @@ int getc(FILE *file)
 	return EOF;
 }
 
+ssize_t getdelim(char **line, size_t *size, int delimiter, FILE *file)
+{
+	if (!line || !size) {
+		errno = EINVAL;
+		return -1;
+	}
+	size_t length = 0;
+	for (int c; (c = getc(file)) != EOF;) {
+		if (!*line || length + 2 > *size) {
+			size_t grown = *size ? *size : 128;
+			while (grown < length + 2)
+				grown *= 2;
+			char *bigger = realloc(*line, grown);
+			if (!bigger) {
+				errno = ENOMEM;
+				return -1;
+			}
+			*line = bigger;
+			*size = grown;
+		}
+		(*line)[length++] = (char)c;
+		if (c == delimiter)
+			break;
+	}
+	if (!length)
+		return -1;
+	(*line)[length] = '\0';
+	return (ssize_t)length;
+}
+
+ssize_t getline(char **line, size_t *size, FILE *file)
+{
+	return getdelim(line, size, '\n', file);
+}
+
 void rewind(FILE *file)
 {
 	(void)file;

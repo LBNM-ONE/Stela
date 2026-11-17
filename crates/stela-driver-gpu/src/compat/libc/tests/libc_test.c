@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* The C library against the C standard's answers, as a static Linux program:
  * `cargo xtask gpu nvk` builds and runs it. */
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -87,6 +88,14 @@ static void test_formatting(void)
 	CHECK(stream_size == 3000);
 	CHECK(!memcmp(stream_bytes + 2997, "999", 3));
 	free(stream_bytes);
+
+	char *line = NULL;
+	size_t line_size = 0;
+	stream = open_memstream(&stream_bytes, &stream_size);
+	CHECK(getline(&line, &line_size, stream) == -1);
+	fclose(stream);
+	free(stream_bytes);
+	free(line);
 }
 
 static void test_parsing(void)
@@ -146,6 +155,7 @@ static void test_sorting(void)
 
 static void test_strings(void)
 {
+	CHECK(isblank(' ') && isblank('\t') && !isblank('\n') && !isblank('a'));
 	CHECK(strlen("abc") == 3);
 	CHECK(strcmp("a", "b") < 0);
 	CHECK(!strncmp("abcd", "abce", 3));

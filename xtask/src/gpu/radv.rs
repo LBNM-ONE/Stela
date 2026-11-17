@@ -1,8 +1,7 @@
 //! RADV, ACO and NIR for `stela.efi`, by the NVK lane's steps.
 //!
-//! The image does not link these archives yet: Mesa's calls into Stela
-//! (`stela_libc_*`) are answered by the GPU client only NVK's images build,
-//! and libdrm_amdgpu's, in `compat/mesa/amdgpu.c`, still refuse with ENOTSUP.
+//! `cargo xtask boot build --radv` links them with the GPU client that
+//! answers Mesa's calls into Stela (`stela_libc_*`); nothing starts RADV yet.
 use super::nvk::{self, Lane};
 use anyhow::Result;
 
@@ -37,7 +36,9 @@ pub(super) const OPTIONS: [&str; 21] = [
 /// build host's, but the image has none: RADV's units build as without one,
 /// and its ELF units stay out, which only LLVM's binaries need. Its device
 /// enables acceleration structures, so the host's glslang compiles the
-/// shaders that build them.
+/// shaders that build them. libdrm_amdgpu, which Mesa's `ac_linux_drm.c` still
+/// calls for devices, buffers and GPU addresses, is libdrm's own (MIT) over
+/// `compat/mesa/drm.c`; with no `amdgpu.ids` in the image it names no GPU.
 const RADV: Lane = Lane {
     name: "radv",
     options: &OPTIONS,
@@ -61,7 +62,24 @@ const RADV: Lane = Lane {
         "u_debug_stack",
         "wsi_common_display",
     ],
-    stand_ins: &["drm", "amdgpu", "cpu_model"],
+    stand_ins: &["drm", "cpu_model"],
+    sources: &[
+        "libdrm/amdgpu/amdgpu_asic_id.c",
+        "libdrm/amdgpu/amdgpu_bo.c",
+        "libdrm/amdgpu/amdgpu_cs.c",
+        "libdrm/amdgpu/amdgpu_device.c",
+        "libdrm/amdgpu/amdgpu_gpu_info.c",
+        "libdrm/amdgpu/amdgpu_vamgr.c",
+        "libdrm/amdgpu/handle_table.c",
+    ],
+    source_defines: &[
+        "HAVE_LIBDRM_ATOMIC_PRIMITIVES=1",
+        "AMDGPU_ASIC_ID_TABLE=\"/usr/share/libdrm/amdgpu.ids\"",
+        // Names the image's own amdgpu, the kernel driver, also defines; Mesa
+        // calls neither of libdrm's.
+        "amdgpu_bo_list_create=libdrm_amdgpu_bo_list_create",
+        "amdgpu_bo_set_metadata=libdrm_amdgpu_bo_set_metadata",
+    ],
     ungenerated: &[],
     libdrm: &["amdgpu"],
     dropped_defines: &["USE_LIBELF"],
